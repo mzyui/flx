@@ -58,7 +58,7 @@ pub struct Proxy {
     pub port: u16,
     pub country: Country,
     pub avg_response_time: f64,
-    pub protocols: Vec<Arc<Protocol>>,
+    pub types: Vec<Arc<Protocol>>,
 }
 
 impl Default for Proxy {
@@ -68,7 +68,7 @@ impl Default for Proxy {
             port: 0,
             country: Country::Unknown,
             avg_response_time: 0.0,
-            protocols: vec![],
+            types: vec![],
         }
     }
 }
@@ -80,7 +80,7 @@ impl Display for Proxy {
             "<Proxy {} {:.2}s [{}] {}:{}>",
             self.country,
             self.avg_response_time,
-            self.protocols
+            self.types
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -93,12 +93,12 @@ impl Display for Proxy {
 
 pub struct Source {
     pub url: Url,
-    pub default_protocols: Vec<Arc<Protocol>>,
+    pub default_types: Vec<Arc<Protocol>>,
 }
 
 impl Source {
-    pub fn new(url: &str, protocols: Vec<Protocol>) -> Self {
-        let protocols = if protocols.is_empty() {
+    pub fn new(url: &str, types: Vec<Protocol>) -> Self {
+        let types = if types.is_empty() {
             vec![
                 Arc::new(Protocol::Http(Anonymity::Unknown)),
                 Arc::new(Protocol::Https),
@@ -108,12 +108,12 @@ impl Source {
                 Arc::new(Protocol::Connect(80)),
             ]
         } else {
-            protocols.into_iter().map(Arc::new).collect()
+            types.into_iter().map(Arc::new).collect()
         };
 
         Self {
             url: Url::parse(url).unwrap(),
-            default_protocols: protocols,
+            default_types: types,
         }
     }
 
