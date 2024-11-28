@@ -11,7 +11,9 @@ async fn main() -> anyhow::Result<()> {
     f.use_default_providers();
     f.gather().await?;
 
-    #[cfg(feature = "log")]
-    log::info!("{:#?}", f.next());
+    for p in f.filter(|p| p.port == 80).take(2) {
+        println!("{:#?}", p);
+    }
+
     Ok(())
 }
