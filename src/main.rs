@@ -9,11 +9,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut f = ProxyFetcher::default();
     f.use_default_providers();
-    f.enforce_unique_ip(true);
     f.gather().await?;
 
     #[cfg(feature = "log")]
     log::info!("{:#?}", f.next());
-
     Ok(())
 }
