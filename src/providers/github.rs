@@ -57,12 +57,20 @@ impl IProxyTrait for GithubRepoProvider {
                     "proxifly/free-proxy-list/main/proxies/all/data.txt",
                 ),
             ),
+            Source::http(&self.githubusercontent("MuRongPIG/Proxy-Master/main/http.txt")),
+            Source::socks(
+                &self.githubusercontent("MuRongPIG/Proxy-Master/main/socks4.txt"),
+            ),
+            Source::http(&self.githubusercontent("zloi-user/hideip.me/main/http.txt")),
+            Source::http(&self.githubusercontent("zloi-user/hideip.me/main/https.txt")),
+            Source::socks(&self.githubusercontent("zloi-user/hideip.me/main/socks4.txt")),
+            Source::socks(&self.githubusercontent("zloi-user/hideip.me/main/socks5.txt")),
         ]
     }
 
     async fn scrape(
         &self, html: Html, tx: mpsc::SyncSender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_protocols: Vec<Arc<Protocol>>,
+        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
     ) -> anyhow::Result<()> {
         for line in html.html().lines() {
             let mut splited = line.trim().split(':');
@@ -71,7 +79,7 @@ impl IProxyTrait for GithubRepoProvider {
                     let proxy = Proxy {
                         ip,
                         port,
-                        protocols: default_protocols.clone(),
+                        types: default_types.clone(),
                         ..Default::default()
                     };
                     if !self.send(proxy, &tx, &counter) {

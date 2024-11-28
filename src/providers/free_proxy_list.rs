@@ -42,7 +42,7 @@ impl IProxyTrait for FreeProxyListProvider {
 
     async fn scrape(
         &self, html: Html, tx: mpsc::SyncSender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_protocols: Vec<Arc<Protocol>>,
+        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
     ) -> anyhow::Result<()> {
         if let Some(table) = html.select(&self.table).next() {
             for row in table.select(&self.row) {
@@ -52,7 +52,7 @@ impl IProxyTrait for FreeProxyListProvider {
                         let proxy = Proxy {
                             ip,
                             port,
-                            protocols: default_protocols.clone(),
+                            types: default_types.clone(),
                             ..Default::default()
                         };
                         if !self.send(proxy, &tx, &counter) {

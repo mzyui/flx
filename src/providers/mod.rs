@@ -21,7 +21,7 @@ pub trait IProxyTrait {
 
     async fn scrape(
         &self, html: Html, tx: mpsc::SyncSender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_protocols: Vec<Arc<Protocol>>,
+        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
     ) -> anyhow::Result<()>;
 
     fn send(
