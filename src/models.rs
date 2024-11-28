@@ -116,4 +116,24 @@ impl Source {
             default_protocols: protocols,
         }
     }
+
+    pub fn all(url: &str) -> Self {
+        Self::new(url, vec![])
+    }
+
+    pub fn http(url: &str) -> Self {
+        Self::new(
+            url,
+            vec![
+                Protocol::Http(Anonymity::Unknown),
+                Protocol::Https,
+                Protocol::Connect(80),
+                Protocol::Connect(25),
+            ],
+        )
+    }
+
+    pub fn socks(url: &str) -> Self {
+        Self::new(url, vec![Protocol::Socks4, Protocol::Socks5])
+    }
 }
