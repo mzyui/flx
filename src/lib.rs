@@ -1,4 +1,5 @@
 #![allow(unused, dead_code)]
+pub mod downloader;
 pub mod fetcher;
 pub mod models;
 pub mod providers;
