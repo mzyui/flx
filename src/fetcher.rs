@@ -9,12 +9,12 @@ use fake::{
     faker::internet::en::{IPv4, UserAgent},
     Fake,
 };
-use reqwest::ClientBuilder;
+use reqwest::{Client, ClientBuilder};
 use tokio::{task::JoinHandle, time};
 use tokio_task_pool::Pool;
 
 use crate::{
-    models::Proxy,
+    models::{Protocol, Proxy, Source},
     providers::{
         free_proxy_list::FreeProxyListProvider, github::GithubRepoProvider, IProxyTrait,
     },
@@ -25,6 +25,7 @@ pub struct ProxyFetcher {
     receiver: mpsc::Receiver<Option<Proxy>>,
     counter: Arc<AtomicUsize>,
     timer: time::Instant,
+    elapsed: Option<Duration>,
     providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>,
 
     enforce_unique_ip: bool,
@@ -39,11 +40,21 @@ impl Default for ProxyFetcher {
             receiver,
             counter: Arc::new(AtomicUsize::new(0)),
             timer: time::Instant::now(),
+            elapsed: None,
             providers: vec![],
             enforce_unique_ip: true,
             unique_ip: HashSet::new(),
         }
     }
+}
+
+async fn do_work(
+    provider: Arc<dyn IProxyTrait + Send + Sync>, client: Client, source: Arc<Source>,
+    tx: mpsc::SyncSender<Option<Proxy>>, counter: Arc<AtomicUsize>,
+) -> anyhow::Result<()> {
+    let html = provider.fetch(client, source.url.as_ref()).await?;
+    let protocols = source.default_protocols.clone();
+    provider.scrape(html, tx, counter, protocols).await
 }
 
 impl ProxyFetcher {
@@ -70,7 +81,10 @@ impl ProxyFetcher {
         }
 
         #[cfg(feature = "log")]
-        log::debug!("Searching proxies from {} available sources", tasks.len(),);
+        log::debug!(
+            "Proxy gather started. Collecting proxies from {} sources",
+            tasks.len(),
+        );
 
         let ua = UserAgent().fake::<&str>();
         let client = ClientBuilder::new()
@@ -84,7 +98,7 @@ impl ProxyFetcher {
         let sender = self.sender.clone();
 
         let handle = tokio::spawn(async move {
-            let pool = Pool::bounded(10);
+            let pool = Pool::bounded(20);
             for (source, provider) in tasks.iter() {
                 let source = Arc::clone(source);
                 let provider = Arc::clone(provider);
@@ -93,14 +107,13 @@ impl ProxyFetcher {
                 let client = client.clone();
                 let counter = Arc::clone(&counter);
                 pool.spawn(async move {
-                    if let Ok(html) = provider.fetch(&client, source.url.as_ref()).await {
-                        let protocols = source.default_protocols.clone();
-                        provider.scrape(html, &tx, &counter, protocols).await;
+                    if let Err(e) = do_work(provider, client, source, tx, counter).await {
+                        #[cfg(feature = "log")]
+                        log::error!("{}", e);
                     }
                 })
                 .await;
             }
-
             while pool.busy_permits().unwrap_or(0) != 0 {
                 time::sleep(Duration::from_millis(50)).await;
             }
@@ -112,16 +125,16 @@ impl ProxyFetcher {
 
 impl Drop for ProxyFetcher {
     fn drop(&mut self) {
+        self.sender.send(None).unwrap_or_default();
         #[cfg(feature = "log")]
         let total_proxies = self.counter.load(std::sync::atomic::Ordering::Acquire);
 
         #[cfg(feature = "log")]
         log::debug!(
             "Proxy gather completed in {:?}. {} proxies where found. ",
-            self.timer.elapsed(),
+            self.elapsed.unwrap_or(self.timer.elapsed()),
             total_proxies
         );
-        self.sender.send(None).unwrap_or_default();
     }
 }
 
@@ -142,6 +155,7 @@ impl Iterator for ProxyFetcher {
             }
             return Some(proxy);
         }
+        self.elapsed = Some(self.timer.elapsed());
         None
     }
 }
