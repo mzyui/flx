@@ -20,6 +20,7 @@ use crate::{
     },
 };
 
+
 pub struct ProxyFetcher {
     sender: mpsc::SyncSender<Option<Proxy>>,
     receiver: mpsc::Receiver<Option<Proxy>>,
@@ -27,9 +28,10 @@ pub struct ProxyFetcher {
     timer: time::Instant,
     elapsed: Option<Duration>,
     providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>,
-
-    enforce_unique_ip: bool,
     unique_ip: HashSet<(Ipv4Addr, u16)>,
+
+    // options
+    enforce_unique_ip: bool,
 }
 
 impl Default for ProxyFetcher {
@@ -53,8 +55,8 @@ async fn do_work(
     tx: mpsc::SyncSender<Option<Proxy>>, counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     let html = provider.fetch(client, source.url.as_ref()).await?;
-    let protocols = source.default_protocols.clone();
-    provider.scrape(html, tx, counter, protocols).await
+    let types = source.default_types.clone();
+    provider.scrape(html, tx, counter, types).await
 }
 
 impl ProxyFetcher {
@@ -98,7 +100,7 @@ impl ProxyFetcher {
         let sender = self.sender.clone();
 
         let handle = tokio::spawn(async move {
-            let pool = Pool::bounded(20);
+            let pool = Pool::bounded(25);
             for (source, provider) in tasks.iter() {
                 let source = Arc::clone(source);
                 let provider = Arc::clone(provider);
