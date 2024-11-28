@@ -32,53 +32,18 @@ impl Default for FreeProxyListProvider {
 impl IProxyTrait for FreeProxyListProvider {
     fn sources(&self) -> Vec<Source> {
         vec![
-            Source::new(
-                "https://www.sslproxies.org/",
-                vec![
-                    Protocol::Http(Anonymity::Unknown),
-                    Protocol::Https,
-                    Protocol::Connect(80),
-                    Protocol::Connect(25),
-                ],
-            ),
-            Source::new(
-                "https://free-proxy-list.net/uk-proxy.html",
-                vec![
-                    Protocol::Http(Anonymity::Unknown),
-                    Protocol::Https,
-                    Protocol::Connect(80),
-                    Protocol::Connect(25),
-                ],
-            ),
-            Source::new(
-                "https://www.us-proxy.org/",
-                vec![
-                    Protocol::Http(Anonymity::Unknown),
-                    Protocol::Https,
-                    Protocol::Connect(80),
-                    Protocol::Connect(25),
-                ],
-            ),
-            Source::new(
-                "https://free-proxy-list.net/",
-                vec![
-                    Protocol::Http(Anonymity::Unknown),
-                    Protocol::Https,
-                    Protocol::Connect(80),
-                    Protocol::Connect(25),
-                ],
-            ),
-            Source::new(
-                "https://socks-proxy.net/",
-                vec![Protocol::Socks4, Protocol::Socks5],
-            ),
+            Source::http("https://www.sslproxies.org/"),
+            Source::http("https://free-proxy-list.net/uk-proxy.html"),
+            Source::http("https://www.us-proxy.org/"),
+            Source::http("https://free-proxy-list.net/"),
+            Source::socks("https://socks-proxy.net/"),
         ]
     }
 
     async fn scrape(
-        &self, html: Html, tx: &mpsc::SyncSender<Option<Proxy>>,
-        counter: &Arc<AtomicUsize>, default_protocols: Vec<Arc<Protocol>>,
-    ) -> anyhow::Result<Vec<Source>> {
+        &self, html: Html, tx: mpsc::SyncSender<Option<Proxy>>,
+        counter: Arc<AtomicUsize>, default_protocols: Vec<Arc<Protocol>>,
+    ) -> anyhow::Result<()> {
         if let Some(table) = html.select(&self.table).next() {
             for row in table.select(&self.row) {
                 let mut col = row.select(&self.column).map(|i| i.inner_html());
@@ -90,13 +55,13 @@ impl IProxyTrait for FreeProxyListProvider {
                             protocols: default_protocols.clone(),
                             ..Default::default()
                         };
-                        if !self.send(proxy, tx, counter) {
+                        if !self.send(proxy, &tx, &counter) {
                             break;
                         };
                     }
                 }
             }
         }
-        Ok(vec![])
+        Ok(())
     }
 }
