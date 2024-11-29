@@ -1,7 +1,10 @@
 use std::{
     collections::HashSet,
     net::Ipv4Addr,
-    sync::{atomic::AtomicUsize, mpsc, Arc},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
     time::Duration,
 };
 
@@ -142,6 +145,35 @@ impl ProxyFetcher {
         });
         Ok(handle)
     }
+
+    pub fn get_one(&mut self) -> Option<Proxy> {
+        loop {
+            if let Some(mut proxy) = self.receiver.recv().ok()? {
+                if self.options.enforce_unique_ip {
+                    if self.unique_ip.insert((proxy.ip, proxy.port)) {
+                        proxy.geo = self.geoip.lookup(&proxy.ip);
+                        return Some(proxy);
+                    } else {
+                        self.counter.fetch_sub(1, Ordering::Relaxed);
+                    }
+                } else {
+                    return Some(proxy);
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for ProxyFetcher {
+    type Item = Proxy;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(proxy) = self.get_one() {
+            return Some(proxy);
+        }
+        self.elapsed = Some(self.timer.elapsed());
+        None
+    }
 }
 
 impl Drop for ProxyFetcher {
@@ -155,30 +187,5 @@ impl Drop for ProxyFetcher {
             self.elapsed.unwrap_or(self.timer.elapsed()),
             total_proxies
         );
-    }
-}
-
-impl Iterator for ProxyFetcher {
-    type Item = Proxy;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(mut proxy) = self.receiver.recv().unwrap_or_default() {
-            if self.options.enforce_unique_ip {
-                if !self.unique_ip.contains(&(proxy.ip, proxy.port)) {
-                    self.unique_ip.insert((proxy.ip, proxy.port));
-
-                    // updating geolocation data
-                    proxy.geo = self.geoip.lookup(&proxy.ip);
-                    return Some(proxy);
-                } else {
-                    self.counter
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    return self.next();
-                }
-            }
-            return Some(proxy);
-        }
-        self.elapsed = Some(self.timer.elapsed());
-        None
     }
 }
