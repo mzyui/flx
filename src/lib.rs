@@ -1,6 +1,6 @@
 #![allow(unused, dead_code)]
-pub mod downloader;
 pub mod fetcher;
+pub mod geoip;
 pub mod models;
 pub mod providers;
 
