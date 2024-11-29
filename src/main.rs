@@ -8,7 +8,7 @@ async fn main() -> anyhow::Result<()> {
     setup_log(log::LevelFilter::Debug)?;
 
     let opts = ProxyFetcherOptions::default();
-    let mut f = ProxyFetcher::new(opts);
+    let mut f = ProxyFetcher::new(opts).await?;
     f.use_default_providers();
     f.gather().await?;
 
