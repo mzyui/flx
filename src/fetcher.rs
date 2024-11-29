@@ -8,34 +8,33 @@ use std::{
     time::Duration,
 };
 
-use fake::{
-    faker::internet::en::{IPv4, UserAgent},
-    Fake,
-};
+use fake::{faker::internet::en::UserAgent, Fake};
 use reqwest::{Client, ClientBuilder};
 use tokio::{task::JoinHandle, time};
 use tokio_task_pool::Pool;
 
 use crate::{
     geoip::GeoIp,
-    models::{Protocol, Proxy, Source},
+    models::{Proxy, Source},
     providers::{
         free_proxy_list::FreeProxyListProvider, github::GithubRepoProvider, IProxyTrait,
     },
 };
 
+/// Options for configuring the proxy fetching process.
 pub struct ProxyFetcherOptions {
-    /// Ensure each proxy has unique IP, this will affect performance (default: true)
+    /// Ensure each proxy has a unique IP; affects performance (default: true).
     pub enforce_unique_ip: bool,
-    /// Maximum number of concurrency to process source url (default: 20)
+    /// Maximum number of concurrent requests to process source URLs (default: 20).
     pub concurrency_limit: usize,
-    /// Timeout in milliseconds (default: 3000)
+    /// Timeout for requests in milliseconds (default: 3000).
     pub request_timeout: u64,
-    /// Perform geo lookup for each proxy. this will affect performance (default: true)
+    /// Perform geo lookup for each proxy; affects performance (default: true).
     pub enable_geo_lookup: bool,
 }
 
 impl Default for ProxyFetcherOptions {
+    /// Provides default values for `ProxyFetcherOptions`.
     fn default() -> Self {
         Self {
             enforce_unique_ip: true,
@@ -46,6 +45,7 @@ impl Default for ProxyFetcherOptions {
     }
 }
 
+/// Responsible for fetching proxies from various sources.
 pub struct ProxyFetcher {
     sender: mpsc::Sender<Option<Proxy>>,
     receiver: mpsc::Receiver<Option<Proxy>>,
@@ -60,6 +60,7 @@ pub struct ProxyFetcher {
 }
 
 impl ProxyFetcher {
+    /// Initializes a new `ProxyFetcher` with the given options.
     pub async fn new(options: ProxyFetcherOptions) -> anyhow::Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let geoip = if options.enable_geo_lookup {
@@ -83,6 +84,7 @@ impl ProxyFetcher {
     }
 }
 
+/// Executes the work of fetching proxies from a given provider.
 async fn do_work(
     provider: Arc<dyn IProxyTrait + Send + Sync>, client: Client, source: Arc<Source>,
     tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
@@ -93,6 +95,7 @@ async fn do_work(
 }
 
 impl ProxyFetcher {
+    /// Adds default proxy providers to the fetcher.
     pub fn use_default_providers(&mut self) {
         self.providers = vec![
             Arc::new(FreeProxyListProvider::default()),
@@ -100,12 +103,15 @@ impl ProxyFetcher {
         ];
     }
 
+    /// Adds a custom proxy provider to the fetcher.
     pub fn add_provider(&mut self, provider: Arc<dyn IProxyTrait + Send + Sync>) {
         self.providers.push(provider);
     }
 
+    /// Gathers proxies from the configured providers.
     #[allow(unused_must_use)]
     pub async fn gather(&mut self) -> anyhow::Result<()> {
+        // Abort any ongoing gathering process if it exists.
         if let Some(handler) = &self.handler {
             handler.abort();
             self.handler = None;
@@ -132,6 +138,7 @@ impl ProxyFetcher {
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
             .build()?;
+
         let counter = self.counter.clone();
         counter.store(0, std::sync::atomic::Ordering::Relaxed);
         let sender = self.sender.clone();
@@ -154,6 +161,7 @@ impl ProxyFetcher {
                 })
                 .await;
             }
+            // Wait for all tasks in the pool to complete.
             while pool.busy_permits().unwrap_or(0) != 0 {
                 time::sleep(Duration::from_millis(50)).await;
             }
@@ -163,17 +171,19 @@ impl ProxyFetcher {
         Ok(())
     }
 
+    /// Creates an iterator for the fetched proxies.
     pub fn iter(&mut self) -> ProxyFetcherIter {
         ProxyFetcherIter { inner: self }
     }
 }
 
+/// Iterator for fetching proxies from the `ProxyFetcher`.
 pub struct ProxyFetcherIter<'a> {
     inner: &'a mut ProxyFetcher,
 }
 
 impl<'a> ProxyFetcherIter<'a> {
-    pub fn get_one(&mut self) -> Option<Proxy> {
+    fn get_one(&mut self) -> Option<Proxy> {
         while let Some(mut proxy) = self
             .inner
             .receiver
@@ -211,6 +221,7 @@ impl<'a> Iterator for ProxyFetcherIter<'a> {
 }
 
 impl Drop for ProxyFetcher {
+    /// Cleans up resources when `ProxyFetcher` is dropped.
     fn drop(&mut self) {
         self.sender.send(None).unwrap_or_default();
         if let Some(handler) = &self.handler {
@@ -221,7 +232,7 @@ impl Drop for ProxyFetcher {
         let total_proxies = self.counter.load(std::sync::atomic::Ordering::Acquire);
         #[cfg(feature = "log")]
         log::debug!(
-            "Proxy gather completed in {:?}. {} proxies where found. ",
+            "Proxy gather completed in {:?}. {} proxies were found.",
             self.elapsed.unwrap_or(self.timer.elapsed()),
             total_proxies
         );
