@@ -37,26 +37,20 @@ impl Display for Protocol {
     }
 }
 
-#[derive(Debug)]
-pub enum Country {
-    Unknown,
-    Id(String),
-}
-
-impl Display for Country {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unknown => write!(f, "--"),
-            Self::Id(id) => write!(f, "{}", id),
-        }
-    }
+#[derive(Debug, Default)]
+pub struct GeoData {
+    pub iso_code: Option<String>,
+    pub name: Option<String>,
+    pub region_iso_code: Option<String>,
+    pub region_name: Option<String>,
+    pub city_name: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct Proxy {
     pub ip: Ipv4Addr,
     pub port: u16,
-    pub country: Country,
+    pub geo: GeoData,
     pub avg_response_time: f64,
     pub types: Vec<Arc<Protocol>>,
 }
@@ -66,7 +60,7 @@ impl Default for Proxy {
         Self {
             ip: Ipv4Addr::new(0, 0, 0, 0),
             port: 0,
-            country: Country::Unknown,
+            geo: GeoData::default(),
             avg_response_time: 0.0,
             types: vec![],
         }
@@ -75,10 +69,15 @@ impl Default for Proxy {
 
 impl Display for Proxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(iso_code) = &self.geo.iso_code {
+            write!(f, "<Proxy {}", iso_code)?;
+        } else {
+            write!(f, "<Proxy --")?;
+        }
+
         write!(
             f,
-            "<Proxy {} {:.2}s [{}] {}:{}>",
-            self.country,
+            "{:.2}s [{}] {}:{}>",
             self.avg_response_time,
             self.types
                 .iter()
