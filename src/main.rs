@@ -12,9 +12,7 @@ async fn main() -> anyhow::Result<()> {
     f.use_default_providers();
     f.gather().await?;
 
-    for p in f.take(1) {
-        println!("{:#?}", p);
-    }
+    println!("{:#?}", f.get_one());
 
     Ok(())
 }
