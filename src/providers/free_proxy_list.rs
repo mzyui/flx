@@ -1,17 +1,15 @@
 use std::{
-    default,
     net::Ipv4Addr,
     sync::{atomic::AtomicUsize, mpsc, Arc},
 };
 
 use async_trait::async_trait;
-use fake::{faker::internet::en::IPv4, Fake};
-use reqwest::{Client, Url};
 use scraper::{Html, Selector};
 
 use super::IProxyTrait;
-use crate::models::{Anonymity, Protocol, Proxy, Source};
+use crate::models::{Protocol, Proxy, Source};
 
+/// A provider for fetching proxy lists from free-proxy-list.net product..
 pub struct FreeProxyListProvider {
     table: Selector,
     row: Selector,
@@ -30,6 +28,7 @@ impl Default for FreeProxyListProvider {
 
 #[async_trait]
 impl IProxyTrait for FreeProxyListProvider {
+    /// Returns a list of sources from which proxies can be fetched.
     fn sources(&self) -> Vec<Source> {
         vec![
             Source::http("https://www.sslproxies.org/"),
@@ -40,6 +39,7 @@ impl IProxyTrait for FreeProxyListProvider {
         ]
     }
 
+    /// Scrapes proxy information from the fetched HTML content.
     async fn scrape(
         &self, html: Html, tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
         default_types: Vec<Arc<Protocol>>,

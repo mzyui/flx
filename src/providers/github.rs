@@ -1,5 +1,4 @@
 use std::{
-    io::BufReader,
     net::Ipv4Addr,
     sync::{atomic::AtomicUsize, mpsc, Arc},
 };
@@ -8,11 +7,13 @@ use async_trait::async_trait;
 use scraper::Html;
 
 use super::IProxyTrait;
-use crate::models::{Anonymity, Protocol, Proxy, Source};
+use crate::models::{Protocol, Proxy, Source};
 
+/// A provider for fetching proxy lists from GitHub repositories.
 pub struct GithubRepoProvider;
 
 impl GithubRepoProvider {
+    /// Constructs a raw URL for accessing files in a GitHub repository.
     fn githubusercontent(&self, path: &str) -> String {
         format!("https://raw.githubusercontent.com/{}", path)
     }
@@ -20,6 +21,7 @@ impl GithubRepoProvider {
 
 #[async_trait]
 impl IProxyTrait for GithubRepoProvider {
+    /// Returns a list of sources from which proxies can be fetched.
     fn sources(&self) -> Vec<Source> {
         vec![
             Source::http(&self.githubusercontent("zevtyardt/proxy-list/main/http.txt")),
@@ -68,6 +70,7 @@ impl IProxyTrait for GithubRepoProvider {
         ]
     }
 
+    /// Scrapes proxy information from the fetched HTML content.
     async fn scrape(
         &self, html: Html, tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
         default_types: Vec<Arc<Protocol>>,
