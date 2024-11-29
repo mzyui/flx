@@ -35,8 +35,8 @@ impl Display for Progress {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}: {} Downloading GeoLite2-City.mmdb: {:.2}%",
-            module_path!().bright_blue(),
+            "{} {} Downloading GeoLite2-City.mmdb: {:.2}%",
+            format!("{}:", module_path!()).bright_blue(),
             "INFO".bright_blue(),
             (self.progress.load(Ordering::Relaxed) as f64 / self.max) * 100.0
         )
