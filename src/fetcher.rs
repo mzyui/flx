@@ -20,23 +20,39 @@ use crate::{
     },
 };
 
+pub struct ProxyFetcherOptions {
+    /// Ensure each proxy has unique IP, this will affect performance (default: true)
+    pub enforce_unique_ip: bool,
+    /// Maximum number of concurrency to process source url (default: 25)
+    pub concurrency_limit: usize,
+    /// Timeout in milliseconds (default: 3000)
+    pub request_timeout: u64,
+}
+
+impl Default for ProxyFetcherOptions {
+    fn default() -> Self {
+        Self {
+            enforce_unique_ip: true,
+            concurrency_limit: 25,
+            request_timeout: 3000,
+        }
+    }
+}
 
 pub struct ProxyFetcher {
-    sender: mpsc::SyncSender<Option<Proxy>>,
+    sender: mpsc::Sender<Option<Proxy>>,
     receiver: mpsc::Receiver<Option<Proxy>>,
     counter: Arc<AtomicUsize>,
     timer: time::Instant,
     elapsed: Option<Duration>,
     providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>,
     unique_ip: HashSet<(Ipv4Addr, u16)>,
-
-    // options
-    enforce_unique_ip: bool,
+    options: ProxyFetcherOptions,
 }
 
-impl Default for ProxyFetcher {
-    fn default() -> Self {
-        let (sender, receiver) = mpsc::sync_channel(1024);
+impl ProxyFetcher {
+    pub fn new(options: ProxyFetcherOptions) -> Self {
+        let (sender, receiver) = mpsc::channel();
         Self {
             sender,
             receiver,
@@ -44,15 +60,15 @@ impl Default for ProxyFetcher {
             timer: time::Instant::now(),
             elapsed: None,
             providers: vec![],
-            enforce_unique_ip: true,
             unique_ip: HashSet::new(),
+            options,
         }
     }
 }
 
 async fn do_work(
     provider: Arc<dyn IProxyTrait + Send + Sync>, client: Client, source: Arc<Source>,
-    tx: mpsc::SyncSender<Option<Proxy>>, counter: Arc<AtomicUsize>,
+    tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     let html = provider.fetch(client, source.url.as_ref()).await?;
     let types = source.default_types.clone();
@@ -67,9 +83,8 @@ impl ProxyFetcher {
         ];
     }
 
-    /// Ensure each proxy has unique IP, this will affect performance (default: true)
-    pub fn enforce_unique_ip(&mut self, value: bool) {
-        self.enforce_unique_ip = value;
+    pub fn add_provider(&mut self, provider: Arc<dyn IProxyTrait + Send + Sync>) {
+        self.providers.push(provider);
     }
 
     #[allow(unused_must_use)]
@@ -90,7 +105,7 @@ impl ProxyFetcher {
 
         let ua = UserAgent().fake::<&str>();
         let client = ClientBuilder::new()
-            .timeout(Duration::from_secs(3))
+            .timeout(Duration::from_millis(self.options.request_timeout))
             .user_agent(ua)
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
@@ -99,8 +114,9 @@ impl ProxyFetcher {
         counter.store(0, std::sync::atomic::Ordering::Relaxed);
         let sender = self.sender.clone();
 
+        let concurrency_limit = self.options.concurrency_limit;
         let handle = tokio::spawn(async move {
-            let pool = Pool::bounded(25);
+            let pool = Pool::bounded(concurrency_limit);
             for (source, provider) in tasks.iter() {
                 let source = Arc::clone(source);
                 let provider = Arc::clone(provider);
@@ -130,7 +146,6 @@ impl Drop for ProxyFetcher {
         self.sender.send(None).unwrap_or_default();
         #[cfg(feature = "log")]
         let total_proxies = self.counter.load(std::sync::atomic::Ordering::Acquire);
-
         #[cfg(feature = "log")]
         log::debug!(
             "Proxy gather completed in {:?}. {} proxies where found. ",
@@ -145,7 +160,7 @@ impl Iterator for ProxyFetcher {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(proxy) = self.receiver.recv().unwrap_or_default() {
-            if self.enforce_unique_ip {
+            if self.options.enforce_unique_ip {
                 if !self.unique_ip.contains(&(proxy.ip, proxy.port)) {
                     self.unique_ip.insert((proxy.ip, proxy.port));
                     return Some(proxy);
