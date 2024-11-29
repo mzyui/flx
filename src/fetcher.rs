@@ -14,6 +14,7 @@ use tokio::{task::JoinHandle, time};
 use tokio_task_pool::Pool;
 
 use crate::{
+    geoip::GeoIp,
     models::{Protocol, Proxy, Source},
     providers::{
         free_proxy_list::FreeProxyListProvider, github::GithubRepoProvider, IProxyTrait,
@@ -45,24 +46,26 @@ pub struct ProxyFetcher {
     counter: Arc<AtomicUsize>,
     timer: time::Instant,
     elapsed: Option<Duration>,
+    geoip: GeoIp,
     providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>,
     unique_ip: HashSet<(Ipv4Addr, u16)>,
     options: ProxyFetcherOptions,
 }
 
 impl ProxyFetcher {
-    pub fn new(options: ProxyFetcherOptions) -> Self {
+    pub async fn new(options: ProxyFetcherOptions) -> anyhow::Result<Self> {
         let (sender, receiver) = mpsc::channel();
-        Self {
+        Ok(Self {
             sender,
             receiver,
             counter: Arc::new(AtomicUsize::new(0)),
             timer: time::Instant::now(),
             elapsed: None,
+            geoip: GeoIp::new().await?,
             providers: vec![],
             unique_ip: HashSet::new(),
             options,
-        }
+        })
     }
 }
 
@@ -159,10 +162,13 @@ impl Iterator for ProxyFetcher {
     type Item = Proxy;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(proxy) = self.receiver.recv().unwrap_or_default() {
+        if let Some(mut proxy) = self.receiver.recv().unwrap_or_default() {
             if self.options.enforce_unique_ip {
                 if !self.unique_ip.contains(&(proxy.ip, proxy.port)) {
                     self.unique_ip.insert((proxy.ip, proxy.port));
+
+                    // updating geolocation data
+                    proxy.geo = self.geoip.lookup(&proxy.ip);
                     return Some(proxy);
                 } else {
                     self.counter
