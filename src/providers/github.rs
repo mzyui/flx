@@ -69,8 +69,8 @@ impl IProxyTrait for GithubRepoProvider {
     }
 
     async fn scrape(
-        &self, html: Html, tx: mpsc::SyncSender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
+        &self, html: Html, tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
+        default_types: Vec<Arc<Protocol>>,
     ) -> anyhow::Result<()> {
         for line in html.html().lines() {
             let mut splited = line.trim().split(':');

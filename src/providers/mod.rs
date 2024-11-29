@@ -20,13 +20,12 @@ pub trait IProxyTrait {
     }
 
     async fn scrape(
-        &self, html: Html, tx: mpsc::SyncSender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
+        &self, html: Html, tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
+        default_types: Vec<Arc<Protocol>>,
     ) -> anyhow::Result<()>;
 
     fn send(
-        &self, proxy: Proxy, tx: &mpsc::SyncSender<Option<Proxy>>,
-        counter: &Arc<AtomicUsize>,
+        &self, proxy: Proxy, tx: &mpsc::Sender<Option<Proxy>>, counter: &Arc<AtomicUsize>,
     ) -> bool {
         if tx.send(Some(proxy)).is_ok() {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
