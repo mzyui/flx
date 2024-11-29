@@ -1,15 +1,19 @@
 use std::{fmt::Display, net::Ipv4Addr, sync::Arc};
-
 use reqwest::Url;
 
+/// Represents the level of anonymity of a proxy.
 #[derive(Debug, PartialEq)]
 pub enum Anonymity {
+    /// Elite anonymity: No IP address or headers are leaked.
     Elite,
+    /// Transparent anonymity: Original IP address is visible.
     Transparent,
+    /// Anonymous anonymity: Some headers may be leaked, but IP is hidden.
     Anonymous,
-    Unknown,
+    Unknown
 }
 
+/// Represents different protocols that a proxy can support.
 #[derive(Debug, PartialEq)]
 pub enum Protocol {
     Http(Anonymity),
@@ -28,7 +32,6 @@ impl Display for Protocol {
                 Anonymity::Transparent => write!(f, "HTTP: Transparent"),
                 Anonymity::Anonymous => write!(f, "HTTP: Anonymous"),
             },
-
             Self::Https => write!(f, "HTTPS"),
             Self::Socks4 => write!(f, "SOCKS4"),
             Self::Socks5 => write!(f, "SOCKS5"),
@@ -37,6 +40,7 @@ impl Display for Protocol {
     }
 }
 
+/// Contains geographical data related to a proxy.
 #[derive(Debug, Default)]
 pub struct GeoData {
     pub iso_code: Option<String>,
@@ -46,6 +50,7 @@ pub struct GeoData {
     pub city_name: Option<String>,
 }
 
+/// Represents a proxy with its details.
 #[derive(Debug)]
 pub struct Proxy {
     pub ip: Ipv4Addr,
@@ -77,7 +82,7 @@ impl Display for Proxy {
 
         write!(
             f,
-            "{:.2}s [{}] {}:{}>",
+            " {:.2}s [{}] {}:{}>",
             self.avg_response_time,
             self.types
                 .iter()
@@ -90,12 +95,17 @@ impl Display for Proxy {
     }
 }
 
+/// Represents a source of proxy information, such as a URL and default protocol types.
 pub struct Source {
+    /// URL of the proxy source.
     pub url: Url,
+    /// Default protocol types for the source.
     pub default_types: Vec<Arc<Protocol>>,
 }
 
 impl Source {
+    /// Creates a new `Source` with a specified URL and protocol types.
+    /// If no types are provided, defaults to common protocols.
     pub fn new(url: &str, types: Vec<Protocol>) -> Self {
         let types = if types.is_empty() {
             vec![
@@ -116,10 +126,12 @@ impl Source {
         }
     }
 
+    /// Creates a `Source` with default common protocols.
     pub fn all(url: &str) -> Self {
         Self::new(url, vec![])
     }
 
+    /// Creates a `Source` with default types for HTTP protocols.
     pub fn http(url: &str) -> Self {
         Self::new(
             url,
@@ -132,6 +144,7 @@ impl Source {
         )
     }
 
+    /// Creates a `Source` with default types for SOCKS protocols.
     pub fn socks(url: &str) -> Self {
         Self::new(url, vec![Protocol::Socks4, Protocol::Socks5])
     }
