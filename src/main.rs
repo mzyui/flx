@@ -1,21 +1,35 @@
-use fluxy::fetcher::{ProxyFetcher, ProxyFetcherOptions};
 #[cfg(feature = "log")]
 use fluxy::setup_log;
+use fluxy::{
+    fetcher::ProxyFetcher,
+    models::{Protocol, ProxyFetcherConfig, ProxyFilter},
+};
 use tokio::runtime;
 
 fn main() -> anyhow::Result<()> {
     #[cfg(feature = "log")]
     setup_log(log::LevelFilter::Debug)?;
 
-    let runtime = runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()?;
 
     runtime.block_on(async {
-        let opts = ProxyFetcherOptions::default();
-        let mut f = ProxyFetcher::new(opts).await?;
-        f.use_default_providers();
+        let config = ProxyFetcherConfig {
+            filters: ProxyFilter {
+                countries: vec!["ID".into()],
+                types: vec![Protocol::Https],
+            },
+            ..Default::default()
+        };
+
+        let mut f = ProxyFetcher::new(config).await?;
         f.gather().await?;
 
-        println!("{:#?}", f.iter().take(56).count());
+        for p in f.iter().take(50) {
+            println!("{}", p);
+        }
         Ok(())
     })
 }
