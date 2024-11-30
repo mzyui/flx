@@ -1,4 +1,5 @@
 use std::{fmt::Display, net::Ipv4Addr, sync::Arc};
+
 use reqwest::Url;
 
 /// Represents the level of anonymity of a proxy.
@@ -10,7 +11,7 @@ pub enum Anonymity {
     Transparent,
     /// Anonymous anonymity: Some headers may be leaked, but IP is hidden.
     Anonymous,
-    Unknown
+    Unknown,
 }
 
 /// Represents different protocols that a proxy can support.
@@ -147,5 +148,66 @@ impl Source {
     /// Creates a `Source` with default types for SOCKS protocols.
     pub fn socks(url: &str) -> Self {
         Self::new(url, vec![Protocol::Socks4, Protocol::Socks5])
+    }
+}
+
+/// Options to filter proxy output
+#[derive(Default)]
+pub struct ProxyFilter {
+    /// Filter proxies by ISO country code, if empty skip filtering. (optional)
+    pub countries: Vec<String>,
+    /// Filter proxies by protocol, if protocol is http ignore anonymity. if empty skip filtering (optional)
+    pub types: Vec<Protocol>,
+}
+
+impl ProxyFilter {
+    /// Ensure each proxy complies with the country's ISO code selection.
+    pub fn is_country_match(&self, proxy: &Proxy) -> bool {
+        if self.countries.is_empty() {
+            return true;
+        }
+        proxy
+            .geo
+            .iso_code
+            .as_ref()
+            .map(|iso| self.countries.contains(iso))
+            .unwrap_or(false)
+    }
+
+    /// Ensure each proxy complies with the selected protocol type.
+    pub fn is_types_match(&self, proxy: &Proxy) -> bool {
+        if self.types.is_empty() {
+            return true;
+        }
+        proxy
+            .types
+            .iter()
+            .any(|protocol| self.types.contains(protocol))
+    }
+}
+
+/// Options for configuring the proxy fetching process.
+pub struct ProxyFetcherConfig {
+    /// Ensure each proxy has a unique IP; affects performance (default: true).
+    pub enforce_unique_ip: bool,
+    /// Maximum number of concurrent requests to process source URLs (default: 20).
+    pub concurrency_limit: usize,
+    /// Timeout for requests in milliseconds (default: 3000).
+    pub request_timeout: u64,
+    /// Perform geo lookup for each proxy; affects performance (default: true).
+    pub enable_geo_lookup: bool,
+    /// Filter proxies based on given option
+    pub filters: ProxyFilter,
+}
+
+impl Default for ProxyFetcherConfig {
+    fn default() -> Self {
+        Self {
+            enforce_unique_ip: true,
+            concurrency_limit: 20,
+            request_timeout: 3000,
+            enable_geo_lookup: true,
+            filters: ProxyFilter::default(),
+        }
     }
 }
