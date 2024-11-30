@@ -47,7 +47,7 @@ impl Display for Progress {
 impl Drop for Progress {
     fn drop(&mut self) {
         log::debug!(
-            "Finished downloading GeoLite2-City.mmdb in {:?}",
+            "Finished downloading GeoLite2-City.mmdb in {:?}.",
             self.timer.elapsed()
         );
     }
@@ -65,7 +65,7 @@ fn data_dir() -> anyhow::Result<PathBuf> {
         Ok(dir)
     } else {
         #[cfg(feature = "log")]
-        log::warn!("Failed to get local data directory, using current directory instead");
+        log::warn!("Failed to get local data directory, using current directory instead.");
         Ok(current_dir().unwrap_or_default())
     }
 }
@@ -121,7 +121,7 @@ impl GeoIp {
 
         if !mmdb_path.exists() {
             #[cfg(feature = "log")]
-            log::debug!("Geolite2-city.mmdb does not exist, downloading");
+            log::debug!("Geolite2-city.mmdb does not exist, downloading.");
             download_database(&mmdb_path).await?;
         }
         match Reader::open_readfile(&mmdb_path) {
