@@ -9,33 +9,35 @@
 - **Performance Optimization**: A commitment to continuous speed and efficiency improvements.
 - **User-Friendly Customization**: Designed for simplicity and ease of customization for all users.
 
-### Progress 🔄
+#### Example 📝
 
-On the first use, Fluxy automatically downloads **maxminddb** for geo lookup purposes.
+In the example below, Fluxy is used to search for 500 unchecked proxies with the specified config:
 
-```sh
-fluxy::fetcher: DEBUG Proxy gather started. Collecting proxies from 26 sources
-Some(
-    Proxy {
-        ip: 147.75.101.247,
-        port: 80,
-        geo: GeoData {
-            iso_code: Some("NL"),
-            name: Some("The Netherlands"),
-            region_iso_code: Some("NH"),
-            region_name: Some("North Holland"),
-            city_name: Some("Amsterdam"),
-        },
-        avg_response_time: 0.0,
-        types: [
-            Http(Unknown),
-            Https,
-            Connect(80),
-            Connect(25),
-        ],
+```rust
+let config = ProxyFetcherConfig {
+    filters: ProxyFilter {
+        countries: vec!["ID".into()],
+        types: vec![Protocol::Https],
     },
-)
-fluxy::fetcher: DEBUG Proxy gather completed in 106.19664ms. 433 proxies were found.
+    ..Default::default()
+};
 ```
 
-Fluxy can discover a proxy in less than **150 ms** (specifically, **106.19664 ms**). ⚡
+#### Debug Output 🖥️
+
+> [!NOTE]
+> On the first use, Fluxy automatically downloads **maxminddb** for geo lookup purposes.
+
+Here's the debug output showing the proxy gathering process:
+
+```sh
+fluxy::fetcher: DEBUG Proxy gather started. Collecting proxies from 26 sources.
+<Proxy ID 0.00s [HTTP, HTTPS, CONNECT:80, CONNECT:25] 14.102.155.202:8080>
+<Proxy ID 0.00s [HTTP, HTTPS, CONNECT:80, CONNECT:25] 27.50.29.82:8080>
+...
+<Proxy ID 0.00s [HTTP, HTTPS, CONNECT:80, CONNECT:25] 36.67.99.31:7023>
+<Proxy ID 0.00s [HTTP, HTTPS, CONNECT:80, CONNECT:25] 36.91.135.141:40>
+fluxy::fetcher: DEBUG Proxy gather completed in 132.21904ms. 733 proxies were found.
+```
+
+Fluxy can discover a proxy in less than **150 ms** (specifically, **132.21904 ms**). ⚡
