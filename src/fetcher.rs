@@ -15,35 +15,11 @@ use tokio_task_pool::Pool;
 
 use crate::{
     geoip::GeoIp,
-    models::{Proxy, Source},
+    models::{Proxy, ProxyFetcherConfig, Source},
     providers::{
         free_proxy_list::FreeProxyListProvider, github::GithubRepoProvider, IProxyTrait,
     },
 };
-
-/// Options for configuring the proxy fetching process.
-pub struct ProxyFetcherOptions {
-    /// Ensure each proxy has a unique IP; affects performance (default: true).
-    pub enforce_unique_ip: bool,
-    /// Maximum number of concurrent requests to process source URLs (default: 20).
-    pub concurrency_limit: usize,
-    /// Timeout for requests in milliseconds (default: 3000).
-    pub request_timeout: u64,
-    /// Perform geo lookup for each proxy; affects performance (default: true).
-    pub enable_geo_lookup: bool,
-}
-
-impl Default for ProxyFetcherOptions {
-    /// Provides default values for `ProxyFetcherOptions`.
-    fn default() -> Self {
-        Self {
-            enforce_unique_ip: true,
-            concurrency_limit: 20,
-            request_timeout: 3000,
-            enable_geo_lookup: true,
-        }
-    }
-}
 
 /// Responsible for fetching proxies from various sources.
 pub struct ProxyFetcher {
@@ -56,18 +32,22 @@ pub struct ProxyFetcher {
     providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>,
     unique_ip: HashSet<(Ipv4Addr, u16)>,
     handler: Option<JoinHandle<()>>,
-    options: ProxyFetcherOptions,
+    config: ProxyFetcherConfig,
 }
 
 impl ProxyFetcher {
-    /// Initializes a new `ProxyFetcher` with the given options.
-    pub async fn new(options: ProxyFetcherOptions) -> anyhow::Result<Self> {
+    /// Initializes a new `ProxyFetcher` with the given config.
+    pub async fn new(config: ProxyFetcherConfig) -> anyhow::Result<Self> {
         let (sender, receiver) = mpsc::channel();
-        let geoip = if options.enable_geo_lookup {
+        let geoip = if config.enable_geo_lookup {
             Some(GeoIp::new().await?)
         } else {
             None
         };
+        let providers: Vec<Arc<dyn IProxyTrait + Send + Sync>> = vec![
+            Arc::new(FreeProxyListProvider::default()),
+            Arc::new(GithubRepoProvider),
+        ];
 
         Ok(Self {
             sender,
@@ -77,9 +57,9 @@ impl ProxyFetcher {
             elapsed: None,
             geoip,
             handler: None,
-            providers: vec![],
+            providers,
             unique_ip: HashSet::new(),
-            options,
+            config,
         })
     }
 }
@@ -95,14 +75,6 @@ async fn do_work(
 }
 
 impl ProxyFetcher {
-    /// Adds default proxy providers to the fetcher.
-    pub fn use_default_providers(&mut self) {
-        self.providers = vec![
-            Arc::new(FreeProxyListProvider::default()),
-            Arc::new(GithubRepoProvider),
-        ];
-    }
-
     /// Adds a custom proxy provider to the fetcher.
     pub fn add_provider(&mut self, provider: Arc<dyn IProxyTrait + Send + Sync>) {
         self.providers.push(provider);
@@ -127,13 +99,13 @@ impl ProxyFetcher {
 
         #[cfg(feature = "log")]
         log::debug!(
-            "Proxy gather started. Collecting proxies from {} sources",
+            "Proxy gather started. Collecting proxies from {} sources.",
             tasks.len(),
         );
 
         let ua = UserAgent().fake::<&str>();
         let client = ClientBuilder::new()
-            .timeout(Duration::from_millis(self.options.request_timeout))
+            .timeout(Duration::from_millis(self.config.request_timeout))
             .user_agent(ua)
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
@@ -143,7 +115,7 @@ impl ProxyFetcher {
         counter.store(0, std::sync::atomic::Ordering::Relaxed);
         let sender = self.sender.clone();
 
-        let concurrency_limit = self.options.concurrency_limit;
+        let concurrency_limit = self.config.concurrency_limit;
         let handler = tokio::spawn(async move {
             let pool = Pool::bounded(concurrency_limit);
             for (source, provider) in tasks.iter() {
@@ -156,7 +128,7 @@ impl ProxyFetcher {
                 pool.spawn(async move {
                     if let Err(e) = do_work(provider, client, source, tx, counter).await {
                         #[cfg(feature = "log")]
-                        log::error!("{}", e);
+                        log::error!("{}.", e);
                     }
                 })
                 .await;
@@ -171,6 +143,40 @@ impl ProxyFetcher {
         Ok(())
     }
 
+    /// Retrieves one proxy from the receiver. Applying geo lookup is enabled.
+    pub fn get_one(&mut self) -> Option<Proxy> {
+        while let Some(mut proxy) = self
+            .receiver
+            .recv_timeout(Duration::from_millis(3000))
+            .ok()?
+        {
+            if !self.config.filters.is_types_match(&proxy) {
+                self.counter.fetch_sub(1, Ordering::Relaxed);
+                continue;
+            }
+
+            if let Some(geoip) = &self.geoip {
+                proxy.geo = geoip.lookup(&proxy.ip);
+                if !self.config.filters.is_country_match(&proxy) {
+                    self.counter.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
+            if self.config.enforce_unique_ip {
+                if self.unique_ip.insert((proxy.ip, proxy.port)) {
+                    return Some(proxy);
+                } else {
+                    self.counter.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
+            } else {
+                return Some(proxy);
+            }
+        }
+        None
+    }
+
     /// Creates an iterator for the fetched proxies.
     pub fn iter(&mut self) -> ProxyFetcherIter {
         ProxyFetcherIter { inner: self }
@@ -182,37 +188,13 @@ pub struct ProxyFetcherIter<'a> {
     inner: &'a mut ProxyFetcher,
 }
 
-impl<'a> ProxyFetcherIter<'a> {
-    fn get_one(&mut self) -> Option<Proxy> {
-        while let Some(mut proxy) = self
-            .inner
-            .receiver
-            .recv_timeout(Duration::from_millis(3000))
-            .ok()?
-        {
-            if let Some(geoip) = &self.inner.geoip {
-                proxy.geo = geoip.lookup(&proxy.ip);
-            }
+impl ProxyFetcherIter<'_> {}
 
-            if self.inner.options.enforce_unique_ip {
-                if self.inner.unique_ip.insert((proxy.ip, proxy.port)) {
-                    return Some(proxy);
-                } else {
-                    self.inner.counter.fetch_sub(1, Ordering::Relaxed);
-                }
-            } else {
-                return Some(proxy);
-            }
-        }
-        None
-    }
-}
-
-impl<'a> Iterator for ProxyFetcherIter<'a> {
+impl Iterator for ProxyFetcherIter<'_> {
     type Item = Proxy;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(proxy) = self.get_one() {
+        if let Some(proxy) = self.inner.get_one() {
             return Some(proxy);
         }
         self.inner.elapsed = Some(self.inner.timer.elapsed());
