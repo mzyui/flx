@@ -8,8 +8,13 @@ use std::{
     time::Duration,
 };
 
-use fake::{faker::internet::en::UserAgent, Fake};
-use reqwest::{Client, ClientBuilder};
+use http_body_util::Empty;
+use hyper::body::Bytes;
+use hyper_tls::HttpsConnector;
+use hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::TokioExecutor,
+};
 use tokio::{task::JoinHandle, time};
 use tokio_task_pool::Pool;
 
@@ -66,10 +71,13 @@ impl ProxyFetcher {
 
 /// Executes the work of fetching proxies from a given provider.
 async fn do_work(
-    provider: Arc<dyn IProxyTrait + Send + Sync>, client: Client, source: Arc<Source>,
-    tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
+    provider: Arc<dyn IProxyTrait + Send + Sync>,
+    client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
+    source: Arc<Source>, tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
-    let html = provider.fetch(client, source.url.as_ref()).await?;
+    let html = provider
+        .fetch(client, &source.url.to_string(), source.timeout)
+        .await?;
     let types = source.default_types.clone();
     provider.scrape(html, tx, counter, types).await
 }
@@ -99,36 +107,32 @@ impl ProxyFetcher {
 
         #[cfg(feature = "log")]
         log::debug!(
-            "Proxy gather started. Collecting proxies from {} sources.",
+            "Proxy gather started. Collecting proxies from {} sources",
             tasks.len(),
         );
-
-        let ua = UserAgent().fake::<&str>();
-        let client = ClientBuilder::new()
-            .timeout(Duration::from_millis(self.config.request_timeout))
-            .user_agent(ua)
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .build()?;
 
         let counter = self.counter.clone();
         counter.store(0, std::sync::atomic::Ordering::Relaxed);
         let sender = self.sender.clone();
 
+        let client = Arc::new(
+            Client::builder(TokioExecutor::new())
+                .build::<_, Empty<Bytes>>(HttpsConnector::new()),
+        );
         let concurrency_limit = self.config.concurrency_limit;
         let handler = tokio::spawn(async move {
             let pool = Pool::bounded(concurrency_limit);
             for (source, provider) in tasks.iter() {
                 let source = Arc::clone(source);
                 let provider = Arc::clone(provider);
-
+                let client = Arc::clone(&client);
                 let tx = sender.clone();
-                let client = client.clone();
                 let counter = Arc::clone(&counter);
                 pool.spawn(async move {
+                    let url = source.url.to_string();
                     if let Err(e) = do_work(provider, client, source, tx, counter).await {
                         #[cfg(feature = "log")]
-                        log::error!("{}.", e);
+                        log::error!("{}: {}", url, e);
                     }
                 })
                 .await;
@@ -214,7 +218,7 @@ impl Drop for ProxyFetcher {
         let total_proxies = self.counter.load(std::sync::atomic::Ordering::Acquire);
         #[cfg(feature = "log")]
         log::debug!(
-            "Proxy gather completed in {:?}. {} proxies were found.",
+            "Proxy gather completed in {:?}. {} proxies were found",
             self.elapsed.unwrap_or(self.timer.elapsed()),
             total_proxies
         );
