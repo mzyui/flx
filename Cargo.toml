@@ -22,8 +22,6 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1"] }
 http-body-util = "0.1.2"
 hyper-tls = "0.6.0"
-native-tls = "0.2.12"
-tokio-native-tls = "0.3.1"
 httparse = "1.9.5"
 
 [lib]
