@@ -10,8 +10,8 @@ pub mod models;
 /// Module containing different proxy providers.
 pub mod providers;
 
-/// Module for validating proxy data and configurations.
-pub mod validator;
+/// Low level custom client based on hyper to perform simple http requests.
+pub mod client;
 
 #[cfg(feature = "log")]
 /// Sets up logging for the application with the specified log level.
