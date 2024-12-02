@@ -11,16 +11,19 @@ use std::{
 #[cfg(feature = "progress_bar")]
 use colored::Colorize;
 use fake::{faker::internet::en::UserAgent, Fake};
-use futures_util::StreamExt;
+use http_body_util::{BodyExt, Empty};
+use hyper::{body::Bytes, Request};
+use hyper_tls::HttpsConnector;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use maxminddb::{geoip2::City, Reader};
-use reqwest::ClientBuilder;
 #[cfg(feature = "progress_bar")]
 use status_line::StatusLine;
 use tokio::time;
 
 use crate::models::GeoData;
 
-const GEOLITE_ENDPOINT_URL: &str = "https://git.io/GeoLite2-City.mmdb";
+const GEOLITE_ENDPOINT_URL: &str =
+    "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb";
 
 #[cfg(feature = "progress_bar")]
 /// Struct to manage and display progress for downloading the GeoLite2 database.
@@ -47,7 +50,7 @@ impl Display for Progress {
 impl Drop for Progress {
     fn drop(&mut self) {
         log::debug!(
-            "Finished downloading GeoLite2-City.mmdb in {:?}.",
+            "Finished downloading GeoLite2-City.mmdb in {:?}",
             self.timer.elapsed()
         );
     }
@@ -65,20 +68,25 @@ fn data_dir() -> anyhow::Result<PathBuf> {
         Ok(dir)
     } else {
         #[cfg(feature = "log")]
-        log::warn!("Failed to get local data directory, using current directory instead.");
+        log::warn!("Failed to get local data directory, using current directory instead");
         Ok(current_dir().unwrap_or_default())
     }
 }
 
 /// Downloads the GeoLite2 database from the specified endpoint if it does not exist.
 pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
-    let client = ClientBuilder::new()
-        .user_agent(UserAgent().fake::<&str>())
-        .build()?;
+    let https_connector = HttpsConnector::new();
+    let client = Client::builder(TokioExecutor::new()).build(https_connector);
 
-    let response = client.get(GEOLITE_ENDPOINT_URL).send().await?;
+    let req = Request::builder()
+        .uri(GEOLITE_ENDPOINT_URL)
+        .header(hyper::header::USER_AGENT, UserAgent().fake::<&str>())
+        .body(Empty::<Bytes>::new())?;
+    let mut response = client.request(req).await?;
+
     #[cfg(feature = "progress_bar")]
-    let max = if let Some(length) = response.headers().get("content-length") {
+    let max = if let Some(length) = response.headers().get(hyper::header::CONTENT_LENGTH)
+    {
         length.to_str().map(|v| v.parse::<f64>().unwrap_or(0.0))?
     } else {
         0.0
@@ -98,12 +106,13 @@ pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
         .append(true)
         .open(mmdb_path)?;
 
-    let mut stream = response.bytes_stream();
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?;
-        #[cfg(feature = "progress_bar")]
-        status.progress.fetch_add(chunk.len(), Ordering::Relaxed);
-        file.write_all(&chunk)?;
+    while let Some(next) = response.frame().await {
+        let frame = next?;
+        if let Some(chunk) = frame.data_ref() {
+            #[cfg(feature = "progress_bar")]
+            status.progress.fetch_add(chunk.len(), Ordering::Relaxed);
+            file.write_all(chunk)?;
+        }
     }
     Ok(())
 }
@@ -121,7 +130,7 @@ impl GeoIp {
 
         if !mmdb_path.exists() {
             #[cfg(feature = "log")]
-            log::debug!("Geolite2-city.mmdb does not exist, downloading.");
+            log::debug!("Geolite2-city.mmdb does not exist, downloading");
             download_database(&mmdb_path).await?;
         }
         match Reader::open_readfile(&mmdb_path) {
