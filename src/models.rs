@@ -1,6 +1,6 @@
-use std::{fmt::Display, net::Ipv4Addr, sync::Arc};
+use std::{fmt::Display, net::Ipv4Addr, str::FromStr, sync::Arc, time::Duration};
 
-use reqwest::Url;
+use hyper::Uri;
 
 /// Represents the level of anonymity of a proxy.
 #[derive(Debug, PartialEq)]
@@ -42,7 +42,7 @@ impl Display for Protocol {
 }
 
 /// Contains geographical data related to a proxy.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct GeoData {
     pub iso_code: Option<String>,
     pub name: Option<String>,
@@ -52,13 +52,29 @@ pub struct GeoData {
 }
 
 /// Represents a proxy with its details.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Proxy {
     pub ip: Ipv4Addr,
     pub port: u16,
     pub geo: GeoData,
-    pub avg_response_time: f64,
+    pub runtimes: Vec<f64>,
     pub types: Vec<Arc<Protocol>>,
+}
+
+impl Proxy {
+    /// Calculate the average proxy response time
+    pub fn avg_response_time(&self) -> f64 {
+        if self.runtimes.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = self.runtimes.iter().sum();
+        sum / self.runtimes.len() as f64
+    }
+
+    /// Return proxy in <ip>:<port> format
+    pub fn as_text(&self) -> String {
+        format!("{}:{}", self.ip, self.port)
+    }
 }
 
 impl Default for Proxy {
@@ -67,7 +83,7 @@ impl Default for Proxy {
             ip: Ipv4Addr::new(0, 0, 0, 0),
             port: 0,
             geo: GeoData::default(),
-            avg_response_time: 0.0,
+            runtimes: vec![],
             types: vec![],
         }
     }
@@ -84,7 +100,7 @@ impl Display for Proxy {
         write!(
             f,
             " {:.2}s [{}] {}:{}>",
-            self.avg_response_time,
+            self.avg_response_time(),
             self.types
                 .iter()
                 .map(ToString::to_string)
@@ -99,9 +115,11 @@ impl Display for Proxy {
 /// Represents a source of proxy information, such as a URL and default protocol types.
 pub struct Source {
     /// URL of the proxy source.
-    pub url: Url,
+    pub url: Uri,
     /// Default protocol types for the source.
     pub default_types: Vec<Arc<Protocol>>,
+    /// Time before giving up.
+    pub timeout: Duration,
 }
 
 impl Source {
@@ -122,8 +140,9 @@ impl Source {
         };
 
         Self {
-            url: Url::parse(url).unwrap(),
+            url: Uri::from_str(url).unwrap(),
             default_types: types,
+            timeout: Duration::from_secs(3),
         }
     }
 
