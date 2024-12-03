@@ -44,25 +44,29 @@ impl Display for Protocol {
 /// Contains geographical data related to a proxy.
 #[derive(Debug, Default, Clone)]
 pub struct GeoData {
-    pub iso_code: Option<String>,
-    pub name: Option<String>,
-    pub region_iso_code: Option<String>,
-    pub region_name: Option<String>,
-    pub city_name: Option<String>,
+    pub iso_code: Option<String>,        // ISO country code.
+    pub name: Option<String>,            // Country name.
+    pub region_iso_code: Option<String>, // ISO code for the region.
+    pub region_name: Option<String>,     // Name of the region.
+    pub city_name: Option<String>,       // Name of the city.
 }
 
 /// Represents a proxy with its details.
 #[derive(Debug, Clone)]
 pub struct Proxy {
-    pub ip: Ipv4Addr,
-    pub port: u16,
-    pub geo: GeoData,
-    pub runtimes: Vec<f64>,
-    pub types: Vec<Arc<Protocol>>,
+    pub ip: Ipv4Addr,              // IP address of the proxy.
+    pub port: u16,                 // Port number of the proxy.
+    pub geo: GeoData,              // Geographical data associated with the proxy.
+    pub runtimes: Vec<f64>,        // Response times for the proxy.
+    pub types: Vec<Arc<Protocol>>, // Supported protocols for the proxy.
 }
 
 impl Proxy {
-    /// Calculate the average proxy response time
+    /// Calculates the average proxy response time.
+    ///
+    /// # Returns
+    ///
+    /// The average response time as a `f64`. Returns 0.0 if no runtimes are recorded.
     pub fn avg_response_time(&self) -> f64 {
         if self.runtimes.is_empty() {
             return 0.0;
@@ -71,7 +75,11 @@ impl Proxy {
         sum / self.runtimes.len() as f64
     }
 
-    /// Return proxy in <ip>:<port> format
+    /// Returns the proxy in `<ip>:<port>` format.
+    ///
+    /// # Returns
+    ///
+    /// A `String` representing the proxy address.
     pub fn as_text(&self) -> String {
         format!("{}:{}", self.ip, self.port)
     }
@@ -118,13 +126,22 @@ pub struct Source {
     pub url: Uri,
     /// Default protocol types for the source.
     pub default_types: Vec<Arc<Protocol>>,
-    /// Time before giving up.
+    /// Time before giving up on a request.
     pub timeout: Duration,
 }
 
 impl Source {
     /// Creates a new `Source` with a specified URL and protocol types.
     /// If no types are provided, defaults to common protocols.
+    ///
+    /// # Arguments
+    ///
+    /// * `url`: The URL of the proxy source.
+    /// * `types`: A vector of `Protocol` types.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `Source`.
     pub fn new(url: &str, types: Vec<Protocol>) -> Self {
         let types = if types.is_empty() {
             vec![
@@ -147,11 +164,27 @@ impl Source {
     }
 
     /// Creates a `Source` with default common protocols.
+    ///
+    /// # Arguments
+    ///
+    /// * `url`: The URL of the proxy source.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `Source` with common protocols.
     pub fn all(url: &str) -> Self {
         Self::new(url, vec![])
     }
 
     /// Creates a `Source` with default types for HTTP protocols.
+    ///
+    /// # Arguments
+    ///
+    /// * `url`: The URL of the proxy source.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `Source` with HTTP protocol types.
     pub fn http(url: &str) -> Self {
         Self::new(
             url,
@@ -165,22 +198,38 @@ impl Source {
     }
 
     /// Creates a `Source` with default types for SOCKS protocols.
+    ///
+    /// # Arguments
+    ///
+    /// * `url`: The URL of the proxy source.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `Source` with SOCKS protocol types.
     pub fn socks(url: &str) -> Self {
         Self::new(url, vec![Protocol::Socks4, Protocol::Socks5])
     }
 }
 
-/// Options to filter proxy output
+/// Options to filter proxy output.
 #[derive(Default)]
 pub struct ProxyFilter {
-    /// Filter proxies by ISO country code, if empty skip filtering. (optional)
+    /// Filter proxies by ISO country code; if empty, skip filtering (optional).
     pub countries: Vec<String>,
-    /// Filter proxies by protocol, if protocol is http ignore anonymity. if empty skip filtering (optional)
+    /// Filter proxies by protocol; if empty, skip filtering (optional).
     pub types: Vec<Protocol>,
 }
 
 impl ProxyFilter {
-    /// Ensure each proxy complies with the country's ISO code selection.
+    /// Checks if a proxy complies with the specified country ISO code selection.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy`: The `Proxy` to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the proxy matches the country filter, `false` otherwise.
     pub fn is_country_match(&self, proxy: &Proxy) -> bool {
         if self.countries.is_empty() {
             return true;
@@ -193,7 +242,15 @@ impl ProxyFilter {
             .unwrap_or(false)
     }
 
-    /// Ensure each proxy complies with the selected protocol type.
+    /// Checks if a proxy complies with the selected protocol type.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy`: The `Proxy` to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the proxy matches the protocol filter, `false` otherwise.
     pub fn is_types_match(&self, proxy: &Proxy) -> bool {
         if self.types.is_empty() {
             return true;
@@ -206,7 +263,7 @@ impl ProxyFilter {
 }
 
 /// Options for configuring the proxy fetching process.
-pub struct ProxyFetcherConfig {
+pub struct ProxyConfig {
     /// Ensure each proxy has a unique IP; affects performance (default: true).
     pub enforce_unique_ip: bool,
     /// Maximum number of concurrent requests to process source URLs (default: 20).
@@ -215,11 +272,11 @@ pub struct ProxyFetcherConfig {
     pub request_timeout: u64,
     /// Perform geo lookup for each proxy; affects performance (default: true).
     pub enable_geo_lookup: bool,
-    /// Filter proxies based on given option
+    /// Filter proxies based on the given options.
     pub filters: ProxyFilter,
 }
 
-impl Default for ProxyFetcherConfig {
+impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             enforce_unique_ip: true,
