@@ -20,7 +20,7 @@ use tokio_task_pool::Pool;
 
 use crate::{
     geoip::GeoIp,
-    models::{Proxy, ProxyFetcherConfig, Source},
+    models::{Proxy, ProxyConfig, Source},
     providers::{
         free_proxy_list::FreeProxyListProvider, github::GithubRepoProvider, IProxyTrait,
     },
@@ -28,21 +28,29 @@ use crate::{
 
 /// Responsible for fetching proxies from various sources.
 pub struct ProxyFetcher {
-    sender: mpsc::Sender<Option<Proxy>>,
-    receiver: mpsc::Receiver<Option<Proxy>>,
-    counter: Arc<AtomicUsize>,
-    timer: time::Instant,
-    elapsed: Option<Duration>,
-    geoip: Option<GeoIp>,
-    providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>,
-    unique_ip: HashSet<(Ipv4Addr, u16)>,
-    handler: Option<JoinHandle<()>>,
-    config: ProxyFetcherConfig,
+    sender: mpsc::Sender<Option<Proxy>>, // Channel sender for passing proxies.
+    receiver: mpsc::Receiver<Option<Proxy>>, // Channel receiver for receiving proxies.
+    counter: Arc<AtomicUsize>, // Counter for tracking the number of fetched proxies.
+    timer: time::Instant,      // Timer for measuring elapsed time.
+    elapsed: Option<Duration>, // Duration of the fetcher operation.
+    geoip: Option<GeoIp>,      // Optional GeoIP instance for location lookups.
+    providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>, // List of proxy providers.
+    unique_ip: HashSet<(Ipv4Addr, u16)>, // Set to track unique IPs.
+    handler: Option<JoinHandle<()>>, // Handle for the fetching task.
+    config: ProxyConfig,       // Configuration for the proxy fetcher.
 }
 
 impl ProxyFetcher {
-    /// Initializes a new `ProxyFetcher` with the given config.
-    pub async fn new(config: ProxyFetcherConfig) -> anyhow::Result<Self> {
+    /// Starts a new `ProxyFetcher` with the given configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: The configuration for the proxy fetcher.
+    ///
+    /// # Returns
+    ///
+    /// A result containing the initialized `ProxyFetcher`.
+    pub async fn gather(config: ProxyConfig) -> anyhow::Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let geoip = if config.enable_geo_lookup {
             Some(GeoIp::new().await?)
@@ -54,7 +62,7 @@ impl ProxyFetcher {
             Arc::new(GithubRepoProvider),
         ];
 
-        Ok(Self {
+        let mut fles = Self {
             sender,
             receiver,
             counter: Arc::new(AtomicUsize::new(0)),
@@ -65,7 +73,9 @@ impl ProxyFetcher {
             providers,
             unique_ip: HashSet::new(),
             config,
-        })
+        };
+        fles.start().await?;
+        Ok(fles)
     }
 }
 
@@ -84,13 +94,17 @@ async fn do_work(
 
 impl ProxyFetcher {
     /// Adds a custom proxy provider to the fetcher.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider`: The provider to add.
     pub fn add_provider(&mut self, provider: Arc<dyn IProxyTrait + Send + Sync>) {
         self.providers.push(provider);
     }
 
     /// Gathers proxies from the configured providers.
     #[allow(unused_must_use)]
-    pub async fn gather(&mut self) -> anyhow::Result<()> {
+    async fn start(&mut self) -> anyhow::Result<()> {
         // Abort any ongoing gathering process if it exists.
         if let Some(handler) = &self.handler {
             handler.abort();
@@ -147,7 +161,13 @@ impl ProxyFetcher {
         Ok(())
     }
 
-    /// Retrieves one proxy from the receiver. Applying geo lookup is enabled.
+    /// Retrieves one proxy from the receiver.
+    ///
+    /// If geo lookup is enabled, it will apply geographic filtering.
+    ///
+    /// # Returns
+    ///
+    /// An optional `Proxy` if one is available, otherwise `None`.
     pub fn get_one(&mut self) -> Option<Proxy> {
         while let Some(mut proxy) = self
             .receiver
@@ -182,6 +202,10 @@ impl ProxyFetcher {
     }
 
     /// Creates an iterator for the fetched proxies.
+    ///
+    /// # Returns
+    ///
+    /// An iterator over the proxies.
     pub fn iter(&mut self) -> ProxyFetcherIter {
         ProxyFetcherIter { inner: self }
     }
@@ -192,11 +216,14 @@ pub struct ProxyFetcherIter<'a> {
     inner: &'a mut ProxyFetcher,
 }
 
-impl ProxyFetcherIter<'_> {}
-
 impl Iterator for ProxyFetcherIter<'_> {
     type Item = Proxy;
 
+    /// Retrieves the next proxy from the fetcher.
+    ///
+    /// # Returns
+    ///
+    /// An optional `Proxy` if available, otherwise `None`.
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(proxy) = self.inner.get_one() {
             return Some(proxy);
