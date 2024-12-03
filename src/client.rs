@@ -18,18 +18,36 @@ use tokio::{
 
 use crate::models::Proxy;
 
+/// A struct representing a client that connects to a proxy server.
 #[derive(Debug)]
 pub struct ProxyClient {
-    pub proxy: Proxy,
-    timer: time::Instant,
+    pub proxy: Proxy,     // The proxy configuration to connect through.
+    timer: time::Instant, // The timeout for connection operations.
 }
 
 impl ProxyClient {
+    /// Creates a new instance of `ProxyClient`.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy`: The `Proxy` configuration to be used.
+    /// * `timeout`: The duration after which a connection attempt will time out.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `ProxyClient`.
     pub fn new(proxy: Proxy, timeout: Duration) -> Self {
         let timer = time::Instant::now() + timeout;
         Self { proxy, timer }
     }
 
+    /// Connects to the proxy server.
+    ///
+    /// This method establishes a TCP connection to the proxy server defined in the `ProxyClient`.
+    ///
+    /// # Returns
+    ///
+    /// A `TcpStream` if the connection is successful, or an error if it fails.
     async fn connect(&mut self) -> anyhow::Result<TcpStream> {
         let time_start = time::Instant::now();
         self.log_trace("Connecting to server");
@@ -43,11 +61,35 @@ impl ProxyClient {
         Ok(result)
     }
 
+    /// Generates a CONNECT request to be sent to the proxy server.
+    ///
+    /// # Arguments
+    ///
+    /// * `host`: The host to connect to through the proxy.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<u8>` containing the raw bytes of the CONNECT request.
     fn generate_connect_request(&self, host: &str) -> Vec<u8> {
         let data = format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
         data.as_bytes().to_vec()
     }
 
+    /// Sends a request through the proxy.
+    ///
+    /// This method handles the connection and the HTTP request to the specified endpoint.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `B`: The type of the request body, which must implement `Body` and be `Debug` and `Send`.
+    ///
+    /// # Arguments
+    ///
+    /// * `req`: The HTTP request to send.
+    ///
+    /// # Returns
+    ///
+    /// A `Response<Incoming>` if the request is successful, or an error if it fails.
     pub async fn send_request<B>(
         &mut self, req: Request<B>,
     ) -> anyhow::Result<Response<Incoming>>
@@ -58,6 +100,7 @@ impl ProxyClient {
     {
         let mut stream = self.connect().await?;
 
+        // Check if the request uses HTTPS
         if req
             .uri()
             .scheme()
@@ -117,6 +160,11 @@ impl ProxyClient {
         Ok(response)
     }
 
+    /// Logs a trace message.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg`: The message to log.
     pub fn log_trace<S>(&self, msg: S)
     where
         S: Display,
@@ -125,6 +173,11 @@ impl ProxyClient {
         log::trace!("{}: {}", self.proxy.as_text(), msg);
     }
 
+    /// Logs an error message.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg`: The message to log as an error.
     pub fn log_error<S>(&self, msg: S)
     where
         S: Display,
