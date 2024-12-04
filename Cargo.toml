@@ -14,6 +14,7 @@ async-trait = "0.1.83"
 scraper = { version = "0.21.0", default-features = false, features = ["atomic"] }
 status-line = { version = "0.2.0", optional = true }
 colored = { version = "2.1.0", optional = true }
+clap = { version = "4.5.22", optional = true, features = ["derive"] }
 directories = "5.0.1"
 maxminddb = "0.24.0"
 
@@ -26,7 +27,7 @@ httparse = "1.9.5"
 serde_json = "1.0.133"
 native-tls = "0.2.12"
 tokio-native-tls = "0.3.1"
-proxy = "0.1.0"
+crossbeam-channel = "0.5.13"
 
 [lib]
 path = "src/lib.rs"
@@ -35,6 +36,7 @@ path = "src/lib.rs"
 name = "fluxy"
 
 [features]
-default = ["log", "progress_bar"]
+default = ["log", "progress_bar", "clap"]
 log = ["stderrlog", "dep:log"]
 progress_bar = ["colored", "status-line"]
+clap = ["dep:clap"]
