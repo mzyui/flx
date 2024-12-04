@@ -3,7 +3,7 @@ use std::{
     net::Ipv4Addr,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc,
+        Arc,
     },
     time::Duration,
 };
@@ -22,14 +22,15 @@ use crate::{
     geoip::GeoIp,
     models::{Proxy, ProxyConfig, Source},
     providers::{
-        free_proxy_list::FreeProxyListProvider, github::GithubRepoProvider, IProxyTrait,
+        free_proxy_list::FreeProxyListProvider, github::GithubRepoProvider,
+        proxyscrape::ProxyscrapeProvider, IProxyTrait,
     },
 };
 
 /// Responsible for fetching proxies from various sources.
 pub struct ProxyFetcher {
-    sender: mpsc::Sender<Option<Proxy>>, // Channel sender for passing proxies.
-    receiver: mpsc::Receiver<Option<Proxy>>, // Channel receiver for receiving proxies.
+    sender: crossbeam_channel::Sender<Option<Proxy>>, // Channel sender for passing proxies.
+    receiver: crossbeam_channel::Receiver<Option<Proxy>>, // Channel receiver for receiving proxies.
     counter: Arc<AtomicUsize>, // Counter for tracking the number of fetched proxies.
     timer: time::Instant,      // Timer for measuring elapsed time.
     elapsed: Option<Duration>, // Duration of the fetcher operation.
@@ -51,7 +52,8 @@ impl ProxyFetcher {
     ///
     /// A result containing the initialized `ProxyFetcher`.
     pub async fn gather(config: ProxyConfig) -> anyhow::Result<Self> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        //        let (sender, receiver) = mpsc::channel();
         let geoip = if config.enable_geo_lookup {
             Some(GeoIp::new().await?)
         } else {
@@ -60,6 +62,7 @@ impl ProxyFetcher {
         let providers: Vec<Arc<dyn IProxyTrait + Send + Sync>> = vec![
             Arc::new(FreeProxyListProvider::default()),
             Arc::new(GithubRepoProvider),
+            Arc::new(ProxyscrapeProvider),
         ];
 
         let mut fles = Self {
@@ -83,7 +86,8 @@ impl ProxyFetcher {
 async fn do_work(
     provider: Arc<dyn IProxyTrait + Send + Sync>,
     client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
-    source: Arc<Source>, tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
+    source: Arc<Source>, tx: crossbeam_channel::Sender<Option<Proxy>>,
+    counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     let html = provider
         .fetch(client, &source.url.to_string(), source.timeout)
@@ -169,11 +173,7 @@ impl ProxyFetcher {
     ///
     /// An optional `Proxy` if one is available, otherwise `None`.
     pub fn get_one(&mut self) -> Option<Proxy> {
-        while let Some(mut proxy) = self
-            .receiver
-            .recv_timeout(Duration::from_millis(3000))
-            .ok()?
-        {
+        while let Some(mut proxy) = self.receiver.recv().ok()? {
             if !self.config.filters.is_types_match(&proxy) {
                 self.counter.fetch_sub(1, Ordering::Relaxed);
                 continue;
