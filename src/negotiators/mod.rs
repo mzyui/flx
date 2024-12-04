@@ -1,10 +1,14 @@
-pub mod http;
-pub mod https;
+mod http;
+mod https;
+mod socks4;
 
 use std::fmt::Display;
 
 use async_trait::async_trait;
+pub use http::HttpNegotiator;
+pub use https::HttpsNegotiator;
 use hyper::Uri;
+pub use socks4::Socks4Negotiator;
 use tokio::net::TcpStream;
 
 use crate::models::Proxy;
