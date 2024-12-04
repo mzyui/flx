@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    sync::{atomic::AtomicUsize, mpsc, Arc},
+    sync::{atomic::AtomicUsize, Arc},
     time::Duration,
 };
 
@@ -17,6 +17,7 @@ use crate::models::{Protocol, Proxy, Source};
 
 pub mod free_proxy_list;
 pub mod github;
+pub mod proxyscrape;
 
 /// Trait defining the behavior of proxy providers.
 #[async_trait]
@@ -96,8 +97,8 @@ pub trait IProxyTrait {
     ///
     /// A result indicating success or failure of the scraping operation.
     async fn scrape(
-        &self, html: Html, tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
-        default_types: Vec<Arc<Protocol>>,
+        &self, html: Html, tx: crossbeam_channel::Sender<Option<Proxy>>,
+        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
     ) -> anyhow::Result<()>;
 
     /// Sends a found proxy through the provided channel and updates the counter.
@@ -112,7 +113,8 @@ pub trait IProxyTrait {
     ///
     /// `true` if the proxy was sent successfully, `false` otherwise.
     fn send(
-        &self, proxy: Proxy, tx: &mpsc::Sender<Option<Proxy>>, counter: &Arc<AtomicUsize>,
+        &self, proxy: Proxy, tx: &crossbeam_channel::Sender<Option<Proxy>>,
+        counter: &Arc<AtomicUsize>,
     ) -> bool {
         if tx.send(Some(proxy)).is_ok() {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // Increment the counter
