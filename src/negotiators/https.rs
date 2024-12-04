@@ -44,8 +44,8 @@ impl NegotiatorTrait for HttpsNegotiator {
             stream.write_all(connect.as_bytes()).await?;
             proxy.runtimes.push(time_start.elapsed().as_secs_f64());
 
-            let mut buf = [0; 1024 * 4];
-            stream.read(&mut buf).await?;
+            let mut buf = [0; 64];
+            stream.read_exact(&mut buf).await?;
 
             let mut header = [httparse::EMPTY_HEADER; 32];
             let mut response = httparse::Response::new(&mut header);
