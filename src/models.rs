@@ -264,13 +264,13 @@ impl ProxyFilter {
 
 /// Options for configuring the proxy fetching process.
 pub struct ProxyConfig {
-    /// Ensure each proxy has a unique IP; affects performance (default: true).
+    /// Ensure each proxy has a unique IP; affects performance.
     pub enforce_unique_ip: bool,
-    /// Maximum number of concurrent requests to process source URLs (default: 20).
+    /// Maximum number of concurrent requests to process source URLs.
     pub concurrency_limit: usize,
-    /// Timeout for requests in milliseconds (default: 3000).
+    /// Timeout for requests in milliseconds.
     pub request_timeout: u64,
-    /// Perform geo lookup for each proxy; affects performance (default: true).
+    /// Perform geo lookup for each proxy; affects performance.
     pub enable_geo_lookup: bool,
     /// Filter proxies based on the given options.
     pub filters: ProxyFilter,
@@ -280,7 +280,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             enforce_unique_ip: true,
-            concurrency_limit: 20,
+            concurrency_limit: 5,
             request_timeout: 3000,
             enable_geo_lookup: true,
             filters: ProxyFilter::default(),
