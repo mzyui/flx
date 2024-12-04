@@ -1,10 +1,13 @@
 pub mod client;
-pub mod fetcher;
+mod fetcher;
 pub mod geoip;
 pub mod models;
 pub mod negotiators;
 pub mod providers;
-pub mod validator;
+mod validator;
+
+pub use fetcher::ProxyFetcher;
+pub use validator::ProxyValidator;
 
 /// Sets up logging for the application.
 ///
