@@ -1,6 +1,9 @@
+
 use crate::models::Proxy;
 
 pub struct ProxyValidator<I: Iterator> {
+    // sender: mpsc::SyncSender<I::Item>,
+    // receiver: mpsc::Receiver<I::Item>,
     iterable: I,
 }
 
