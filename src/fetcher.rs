@@ -22,8 +22,7 @@ use crate::{
     geoip::GeoIp,
     models::{Proxy, ProxyConfig, Source},
     providers::{
-        free_proxy_list::FreeProxyListProvider, github::GithubRepoProvider,
-        proxyscrape::ProxyscrapeProvider, IProxyTrait,
+        FreeProxyListProvider, GithubRepoProvider, IProxyTrait, ProxyscrapeProvider,
     },
 };
 
