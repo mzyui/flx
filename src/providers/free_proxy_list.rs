@@ -1,6 +1,6 @@
 use std::{
     net::Ipv4Addr,
-    sync::{atomic::AtomicUsize, mpsc, Arc},
+    sync::{atomic::AtomicUsize, Arc},
 };
 
 use async_trait::async_trait;
@@ -41,8 +41,8 @@ impl IProxyTrait for FreeProxyListProvider {
 
     /// Scrapes proxy information from the fetched HTML content.
     async fn scrape(
-        &self, html: Html, tx: mpsc::Sender<Option<Proxy>>, counter: Arc<AtomicUsize>,
-        default_types: Vec<Arc<Protocol>>,
+        &self, html: Html, tx: crossbeam_channel::Sender<Option<Proxy>>,
+        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
     ) -> anyhow::Result<()> {
         if let Some(table) = html.select(&self.table).next() {
             for row in table.select(&self.row) {
