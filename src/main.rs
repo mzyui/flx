@@ -4,10 +4,9 @@ use std::{sync::Arc, time::Duration};
 use fluxy::setup_log;
 use fluxy::{
     client::ProxyClient,
-    fetcher::ProxyFetcher,
     models::{Protocol, ProxyConfig},
-    negotiators::https::HttpsNegotiator,
-    validator::ProxyValidator,
+    negotiators::HttpsNegotiator,
+    ProxyFetcher, ProxyValidator,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Bytes, Request};
