@@ -15,9 +15,13 @@ use tokio::time;
 
 use crate::models::{Protocol, Proxy, Source};
 
-pub mod free_proxy_list;
-pub mod github;
-pub mod proxyscrape;
+mod free_proxy_list;
+mod github;
+mod proxyscrape;
+
+pub use free_proxy_list::FreeProxyListProvider;
+pub use github::GithubRepoProvider;
+pub use proxyscrape::ProxyscrapeProvider;
 
 /// Trait defining the behavior of proxy providers.
 #[async_trait]
