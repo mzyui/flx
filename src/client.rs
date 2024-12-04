@@ -54,7 +54,9 @@ impl ProxyClient {
     }
 
     pub async fn send_with_tls<B>(
-        &mut self, req: Request<B>, stream: TcpStream,
+        &mut self,
+        req: Request<B>,
+        stream: TcpStream,
     ) -> anyhow::Result<Response<Incoming>>
     where
         B: Body + 'static + Debug + Send,
@@ -98,7 +100,9 @@ impl ProxyClient {
     }
 
     pub async fn send_without_tls<B>(
-        &mut self, req: Request<B>, stream: TcpStream,
+        &mut self,
+        req: Request<B>,
+        stream: TcpStream,
     ) -> anyhow::Result<Response<Incoming>>
     where
         B: Body + 'static + Debug + Send,
@@ -146,7 +150,9 @@ impl ProxyClient {
     ///
     /// A `Response<Incoming>` if the request is successful, or an error if it fails.
     pub async fn send_request<B, N>(
-        &mut self, req: Request<B>, negotiator: Arc<N>,
+        &mut self,
+        req: Request<B>,
+        negotiator: Arc<N>,
     ) -> anyhow::Result<Response<Incoming>>
     where
         B: Body + 'static + Debug + Send,
