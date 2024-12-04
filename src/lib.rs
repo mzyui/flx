@@ -2,6 +2,7 @@ pub mod client;
 pub mod fetcher;
 pub mod geoip;
 pub mod models;
+pub mod negotiators;
 pub mod providers;
 pub mod validator;
 
