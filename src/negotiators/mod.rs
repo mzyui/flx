@@ -17,7 +17,10 @@ use crate::models::Proxy;
 pub trait NegotiatorTrait {
     #[allow(unused_variables)]
     async fn negotiate(
-        &self, stream: &mut TcpStream, proxy: &mut Proxy, uri: &Uri,
+        &self,
+        stream: &mut TcpStream,
+        proxy: &mut Proxy,
+        uri: &Uri,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -54,6 +57,3 @@ pub trait NegotiatorTrait {
         }
     }
 }
-
-//
-//
