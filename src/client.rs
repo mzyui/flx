@@ -169,7 +169,7 @@ impl ProxyClient {
             anyhow::bail!("Failed to negotiate: {}", e);
         }
 
-        if negotiator.with_tls() {
+        if negotiator.with_tls() || req.uri().scheme_str().unwrap_or("") == "https" {
             self.send_with_tls(req, stream).await
         } else {
             self.send_without_tls(req, stream).await
