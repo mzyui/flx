@@ -6,7 +6,7 @@ use fluxy::setup_log;
 use fluxy::{
     client::ProxyClient,
     models::{Proxy, ProxyConfig},
-    negotiators::Socks4Negotiator,
+    negotiators::*,
     ProxyFetcher, ProxyValidator,
 };
 use http_body_util::{BodyExt, Full};
@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
 
     runtime.block_on(async {
         let config = ProxyConfig {
-            concurrency_limit: 10,
+            concurrency_limit: 5,
             ..Default::default()
         };
 
@@ -36,7 +36,6 @@ fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let (proxy, res): (Proxy, Response<Incoming>) = receiver.recv().unwrap();
 
-            println!("{}", proxy);
             let status = res.status();
             println!("Response: {}", status);
             println!("Headers: {:#?}", res.headers());
@@ -46,6 +45,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|v| serde_json::to_string_pretty(&v).unwrap_or("Empty".into()))
                 .unwrap_or(String::from_utf8_lossy(&d).to_string());
             println!("Body: {}", v);
+            println!("{}", proxy);
 
             std::process::exit(0);
         });
@@ -63,7 +63,7 @@ fn main() -> anyhow::Result<()> {
                         .body(Full::<Bytes>::from(""))?;
                     match timeout(
                         Duration::from_secs(5),
-                        client.send_request(req.clone(), Arc::new(Socks4Negotiator)),
+                        client.send_request(req.clone(), Arc::new(Socks5Negotiator)),
                     )
                     .await
                     {
@@ -85,9 +85,9 @@ fn main() -> anyhow::Result<()> {
                 .await;
         }
 
-            while pool.busy_permits().unwrap_or(0) != 0 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+        while pool.busy_permits().unwrap_or(0) != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         Ok(())
     })
