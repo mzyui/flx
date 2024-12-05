@@ -5,6 +5,7 @@ use byteorder_pack::PackTo;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -28,10 +29,14 @@ impl NegotiatorTrait for Socks4Negotiator {
         data.pack_to::<BigEndian, _>(&mut cursor)?;
         let packet = cursor.into_inner();
 
+        let time_start = Instant::now();
         stream.write_all(&packet).await?;
+        proxy.runtimes.push(time_start.elapsed().as_secs_f64());
 
         let mut response = [0u8; 8];
+        let time_start = Instant::now();
         stream.read_exact(&mut response).await?;
+        proxy.runtimes.push(time_start.elapsed().as_secs_f64());
         let mut response = response.as_slice();
 
         if response.read_u8().await? != 0 {

@@ -1,6 +1,7 @@
 mod http;
 mod https;
 mod socks4;
+mod socks5;
 
 use std::fmt::Display;
 
@@ -9,6 +10,7 @@ pub use http::HttpNegotiator;
 pub use https::HttpsNegotiator;
 use hyper::Uri;
 pub use socks4::Socks4Negotiator;
+pub use socks5::Socks5Negotiator;
 use tokio::net::TcpStream;
 
 use crate::models::Proxy;
