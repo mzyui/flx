@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-        for proxy in validated_proxy {
+        for proxy in validated_proxy.take(1) {
             println!("{}", proxy.as_json()?);
         }
         Ok(())
