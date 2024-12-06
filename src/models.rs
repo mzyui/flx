@@ -41,6 +41,12 @@ impl Display for Protocol {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Type {
+    pub protocol: Arc<Protocol>,
+    pub checked: bool,
+}
+
 /// Contains geographical data related to a proxy.
 #[derive(Debug, Default, Clone)]
 pub struct GeoData {
@@ -54,11 +60,11 @@ pub struct GeoData {
 /// Represents a proxy with its details.
 #[derive(Debug, Clone)]
 pub struct Proxy {
-    pub ip: Ipv4Addr,              // IP address of the proxy.
-    pub port: u16,                 // Port number of the proxy.
-    pub geo: GeoData,              // Geographical data associated with the proxy.
-    pub runtimes: Vec<f64>,        // Response times for the proxy.
-    pub types: Vec<Arc<Protocol>>, // Supported protocols for the proxy.
+    pub ip: Ipv4Addr,       // IP address of the proxy.
+    pub port: u16,          // Port number of the proxy.
+    pub geo: GeoData,       // Geographical data associated with the proxy.
+    pub runtimes: Vec<f64>, // Response times for the proxy.
+    pub types: Vec<Type>,   // Supported protocols for the proxy.
 }
 
 impl Proxy {
@@ -111,7 +117,12 @@ impl Display for Proxy {
             self.avg_response_time(),
             self.types
                 .iter()
-                .map(ToString::to_string)
+                .map_while(|type_| {
+                    if type_.checked {
+                        return Some(type_.protocol.to_string());
+                    }
+                    None
+                })
                 .collect::<Vec<_>>()
                 .join(", "),
             self.ip,
@@ -211,59 +222,8 @@ impl Source {
     }
 }
 
-/// Options to filter proxy output.
-#[derive(Default)]
-pub struct ProxyFilter {
-    /// Filter proxies by ISO country code; if empty, skip filtering (optional).
-    pub countries: Vec<String>,
-    /// Filter proxies by protocol; if empty, skip filtering (optional).
-    pub types: Vec<Protocol>,
-}
-
-impl ProxyFilter {
-    /// Checks if a proxy complies with the specified country ISO code selection.
-    ///
-    /// # Arguments
-    ///
-    /// * `proxy`: The `Proxy` to check.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the proxy matches the country filter, `false` otherwise.
-    pub fn is_country_match(&self, proxy: &Proxy) -> bool {
-        if self.countries.is_empty() {
-            return true;
-        }
-        proxy
-            .geo
-            .iso_code
-            .as_ref()
-            .map(|iso| self.countries.contains(iso))
-            .unwrap_or(false)
-    }
-
-    /// Checks if a proxy complies with the selected protocol type.
-    ///
-    /// # Arguments
-    ///
-    /// * `proxy`: The `Proxy` to check.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the proxy matches the protocol filter, `false` otherwise.
-    pub fn is_types_match(&self, proxy: &Proxy) -> bool {
-        if self.types.is_empty() {
-            return true;
-        }
-        proxy
-            .types
-            .iter()
-            .any(|protocol| self.types.contains(protocol))
-    }
-}
-
 /// Options for configuring the proxy fetching process.
-pub struct ProxyConfig {
+pub struct ProxyFetcherConfig {
     /// Ensure each proxy has a unique IP; affects performance.
     pub enforce_unique_ip: bool,
     /// Maximum number of concurrent requests to process source URLs.
@@ -272,18 +232,38 @@ pub struct ProxyConfig {
     pub request_timeout: u64,
     /// Perform geo lookup for each proxy; affects performance.
     pub enable_geo_lookup: bool,
-    /// Filter proxies based on the given options.
-    pub filters: ProxyFilter,
+    /// Filter proxies by ISO country code; if empty, skip filtering (optional).
+    pub countries: Vec<String>,
 }
 
-impl Default for ProxyConfig {
+impl Default for ProxyFetcherConfig {
     fn default() -> Self {
         Self {
             enforce_unique_ip: true,
             concurrency_limit: 5,
             request_timeout: 3000,
             enable_geo_lookup: true,
-            filters: ProxyFilter::default(),
+            countries: Vec::new(),
+        }
+    }
+}
+
+/// Options for configuring the proxy validating process.
+pub struct ProxyValidatorConfig {
+    /// Maximum number of conccurent process.
+    pub concurrency_limit: usize,
+    /// Timeout for requests in milliseconds.
+    pub request_timeout: u64,
+    /// Filter proxies by protocol; if empty, skip filtering (optional).
+    pub types: Vec<Protocol>,
+}
+
+impl Default for ProxyValidatorConfig {
+    fn default() -> Self {
+        Self {
+            concurrency_limit: 500,
+            request_timeout: 3000,
+            types: Vec::new(),
         }
     }
 }
