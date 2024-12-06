@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use scraper::{Html, Selector};
 
 use super::IProxyTrait;
-use crate::models::{Protocol, Proxy, Source};
+use crate::models::{Proxy, Source, Type};
 
 /// A provider for fetching proxy lists from free-proxy-list.net product..
 pub struct FreeProxyListProvider {
@@ -41,8 +41,11 @@ impl IProxyTrait for FreeProxyListProvider {
 
     /// Scrapes proxy information from the fetched HTML content.
     async fn scrape(
-        &self, html: Html, tx: crossbeam_channel::Sender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
+        &self,
+        html: Html,
+        tx: crossbeam_channel::Sender<Option<Proxy>>,
+        counter: Arc<AtomicUsize>,
+        default_types: Vec<Type>,
     ) -> anyhow::Result<()> {
         if let Some(table) = html.select(&self.table).next() {
             for row in table.select(&self.row) {

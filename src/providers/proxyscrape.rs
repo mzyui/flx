@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use scraper::Html;
 
 use super::IProxyTrait;
-use crate::models::{Protocol, Proxy, Source};
+use crate::models::{Proxy, Source, Type};
 
 /// A provider for fetching proxy lists from proxyscrape.com.
 pub struct ProxyscrapeProvider;
@@ -23,8 +23,11 @@ impl IProxyTrait for ProxyscrapeProvider {
 
     /// Scrapes proxy information from the fetched HTML content.
     async fn scrape(
-        &self, html: Html, tx: crossbeam_channel::Sender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
+        &self,
+        html: Html,
+        tx: crossbeam_channel::Sender<Option<Proxy>>,
+        counter: Arc<AtomicUsize>,
+        default_types: Vec<Type>,
     ) -> anyhow::Result<()> {
         for line in html.html().lines() {
             let mut splited = line.trim().split(':');

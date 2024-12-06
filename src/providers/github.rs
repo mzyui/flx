@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use scraper::Html;
 
 use super::IProxyTrait;
-use crate::models::{Protocol, Proxy, Source};
+use crate::models::{Proxy, Source, Type};
 
 /// A provider for fetching proxy lists from GitHub repositories.
 pub struct GithubRepoProvider;
@@ -25,44 +25,24 @@ impl IProxyTrait for GithubRepoProvider {
     fn sources(&self) -> Vec<Source> {
         vec![
             Source::http(&self.githubusercontent("zevtyardt/proxy-list/main/http.txt")),
-            Source::socks(
-                &self.githubusercontent("zevtyardt/proxy-list/main/socks4.txt"),
-            ),
-            Source::socks(
-                &self.githubusercontent("zevtyardt/proxy-list/main/socks5.txt"),
-            ),
+            Source::socks(&self.githubusercontent("zevtyardt/proxy-list/main/socks4.txt")),
+            Source::socks(&self.githubusercontent("zevtyardt/proxy-list/main/socks5.txt")),
             Source::http(&self.githubusercontent("TheSpeedX/SOCKS-List/master/http.txt")),
-            Source::socks(
-                &self.githubusercontent("TheSpeedX/SOCKS-List/master/socks4.txt"),
-            ),
-            Source::socks(
-                &self.githubusercontent("TheSpeedX/SOCKS-List/master/socks5.txt"),
-            ),
-            Source::http(
-                &self.githubusercontent("monosans/proxy-list/main/proxies/http.txt"),
-            ),
-            Source::socks(
-                &self.githubusercontent("monosans/proxy-list/main/proxies/socks4.txt"),
-            ),
-            Source::socks(
-                &self.githubusercontent("monosans/proxy-list/main/proxies/socks5.txt"),
-            ),
-            Source::socks(
-                &self.githubusercontent("hookzof/socks5_list/master/proxy.txt"),
-            ),
+            Source::socks(&self.githubusercontent("TheSpeedX/SOCKS-List/master/socks4.txt")),
+            Source::socks(&self.githubusercontent("TheSpeedX/SOCKS-List/master/socks5.txt")),
+            Source::http(&self.githubusercontent("monosans/proxy-list/main/proxies/http.txt")),
+            Source::socks(&self.githubusercontent("monosans/proxy-list/main/proxies/socks4.txt")),
+            Source::socks(&self.githubusercontent("monosans/proxy-list/main/proxies/socks5.txt")),
+            Source::socks(&self.githubusercontent("hookzof/socks5_list/master/proxy.txt")),
             Source::http(&self.githubusercontent("mmpx12/proxy-list/master/http.txt")),
             Source::http(&self.githubusercontent("mmpx12/proxy-list/master/https.txt")),
             Source::socks(&self.githubusercontent("mmpx12/proxy-list/master/socks4.txt")),
             Source::socks(&self.githubusercontent("mmpx12/proxy-list/master/socks5.txt")),
             Source::all(
-                &self.githubusercontent(
-                    "proxifly/free-proxy-list/main/proxies/all/data.txt",
-                ),
+                &self.githubusercontent("proxifly/free-proxy-list/main/proxies/all/data.txt"),
             ),
             Source::http(&self.githubusercontent("MuRongPIG/Proxy-Master/main/http.txt")),
-            Source::socks(
-                &self.githubusercontent("MuRongPIG/Proxy-Master/main/socks4.txt"),
-            ),
+            Source::socks(&self.githubusercontent("MuRongPIG/Proxy-Master/main/socks4.txt")),
             Source::http(&self.githubusercontent("zloi-user/hideip.me/main/http.txt")),
             Source::http(&self.githubusercontent("zloi-user/hideip.me/main/https.txt")),
             Source::socks(&self.githubusercontent("zloi-user/hideip.me/main/socks4.txt")),
@@ -72,8 +52,11 @@ impl IProxyTrait for GithubRepoProvider {
 
     /// Scrapes proxy information from the fetched HTML content.
     async fn scrape(
-        &self, html: Html, tx: crossbeam_channel::Sender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
+        &self,
+        html: Html,
+        tx: crossbeam_channel::Sender<Option<Proxy>>,
+        counter: Arc<AtomicUsize>,
+        default_types: Vec<Type>,
     ) -> anyhow::Result<()> {
         for line in html.html().lines() {
             let mut splited = line.trim().split(':');
