@@ -1,9 +1,10 @@
 use std::{fmt::Display, net::Ipv4Addr, str::FromStr, sync::Arc, time::Duration};
 
 use hyper::Uri;
+use serde::{ser::SerializeSeq, Serialize, Serializer};
 
 /// Represents the level of anonymity of a proxy.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 pub enum Anonymity {
     /// Elite anonymity: No IP address or headers are leaked.
     Elite,
@@ -15,7 +16,7 @@ pub enum Anonymity {
 }
 
 /// Represents different protocols that a proxy can support.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 pub enum Protocol {
     Http(Anonymity),
     Https,
@@ -47,8 +48,17 @@ pub struct Type {
     pub checked: bool,
 }
 
+impl Type {
+    pub fn new(protocol: Protocol) -> Self {
+        Self {
+            protocol: Arc::new(protocol),
+            checked: false,
+        }
+    }
+}
+
 /// Contains geographical data related to a proxy.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct GeoData {
     pub iso_code: Option<String>,        // ISO country code.
     pub name: Option<String>,            // Country name.
@@ -57,14 +67,27 @@ pub struct GeoData {
     pub city_name: Option<String>,       // Name of the city.
 }
 
+fn serialize_types<S>(types: &Vec<Type>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut seq = serializer.serialize_seq(Some(types.len()))?;
+    for type_ in types {
+        seq.serialize_element(&*type_.protocol)?;
+    }
+    seq.end()
+}
+
 /// Represents a proxy with its details.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Proxy {
-    pub ip: Ipv4Addr,       // IP address of the proxy.
-    pub port: u16,          // Port number of the proxy.
-    pub geo: GeoData,       // Geographical data associated with the proxy.
+    pub ip: Ipv4Addr, // IP address of the proxy.
+    pub port: u16,    // Port number of the proxy.
+    pub geo: GeoData, // Geographical data associated with the proxy.
+    #[serde(skip_serializing)]
     pub runtimes: Vec<f64>, // Response times for the proxy.
-    pub types: Vec<Type>,   // Supported protocols for the proxy.
+    #[serde(serialize_with = "serialize_types")]
+    pub types: Vec<Type>, // Supported protocols for the proxy.
 }
 
 impl Proxy {
@@ -88,6 +111,10 @@ impl Proxy {
     /// A `String` representing the proxy address.
     pub fn as_text(&self) -> String {
         format!("{}:{}", self.ip, self.port)
+    }
+
+    pub fn as_json(&self) -> anyhow::Result<String, serde_json::Error> {
+        serde_json::to_string(self)
     }
 }
 
