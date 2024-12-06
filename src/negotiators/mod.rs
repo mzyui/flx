@@ -15,9 +15,21 @@ use tokio::net::TcpStream;
 
 use crate::models::Proxy;
 
+/// Trait defining the negotiation behavior for different proxy types.
 #[async_trait]
 pub trait NegotiatorTrait {
-    #[allow(unused_variables)]
+    /// Negotiates a connection with the proxy.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream`: The TCP stream to negotiate.
+    /// * `proxy`: The proxy being used for the negotiation.
+    /// * `uri`: The URI to be accessed through the proxy.
+    ///
+    /// # Returns
+    ///
+    /// A result indicating success or failure of the negotiation.
+    #[allow(unused_variables)] // Allows unused variables for trait methods.
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
@@ -27,6 +39,11 @@ pub trait NegotiatorTrait {
         Ok(())
     }
 
+    /// Determines if the negotiator requires TLS.
+    ///
+    /// # Returns
+    ///
+    /// A boolean indicating whether TLS is required.
     fn with_tls(&self) -> bool {
         false
     }
@@ -35,6 +52,7 @@ pub trait NegotiatorTrait {
     ///
     /// # Arguments
     ///
+    /// * `proxy`: The proxy associated with the log message.
     /// * `msg`: The message to log.
     fn log_trace<S>(&self, proxy: &Proxy, msg: S)
     where
@@ -48,6 +66,7 @@ pub trait NegotiatorTrait {
     ///
     /// # Arguments
     ///
+    /// * `proxy`: The proxy associated with the error message.
     /// * `msg`: The message to log as an error.
     fn log_error<S>(&self, proxy: &Proxy, msg: S)
     where

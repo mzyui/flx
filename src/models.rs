@@ -12,6 +12,7 @@ pub enum Anonymity {
     Transparent,
     /// Anonymous anonymity: Some headers may be leaked, but IP is hidden.
     Anonymous,
+    /// Anonymity is unknown.
     Unknown,
 }
 
@@ -28,7 +29,7 @@ pub enum Protocol {
 impl Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Http(anonimity) => match anonimity {
+            Self::Http(anon) => match anon {
                 Anonymity::Unknown => write!(f, "HTTP"),
                 Anonymity::Elite => write!(f, "HTTP: Elite"),
                 Anonymity::Transparent => write!(f, "HTTP: Transparent"),
@@ -42,13 +43,15 @@ impl Display for Protocol {
     }
 }
 
+/// Represents a type of proxy with its protocol and checked status.
 #[derive(Debug, Clone)]
-pub struct Type {
-    pub protocol: Arc<Protocol>,
-    pub checked: bool,
+pub struct ProxyType {
+    pub protocol: Arc<Protocol>, // The protocol of the proxy.
+    pub checked: bool,           // Indicates if the proxy has been checked.
 }
 
-impl Type {
+impl ProxyType {
+    /// Creates a new `ProxyType` with the specified protocol.
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol: Arc::new(protocol),
@@ -67,13 +70,14 @@ pub struct GeoData {
     pub city_name: Option<String>,       // Name of the city.
 }
 
-fn serialize_types<S>(types: &Vec<Type>, serializer: S) -> Result<S::Ok, S::Error>
+/// Serializes a vector of `ProxyType` into a sequence.
+fn serialize_proxy_types<S>(types: &Vec<ProxyType>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     let mut seq = serializer.serialize_seq(Some(types.len()))?;
-    for type_ in types {
-        seq.serialize_element(&*type_.protocol)?;
+    for proxy_type in types {
+        seq.serialize_element(&*proxy_type.protocol)?;
     }
     seq.end()
 }
@@ -84,10 +88,10 @@ pub struct Proxy {
     pub ip: Ipv4Addr, // IP address of the proxy.
     pub port: u16,    // Port number of the proxy.
     pub geo: GeoData, // Geographical data associated with the proxy.
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing)] // Exclude from serialization.
     pub runtimes: Vec<f64>, // Response times for the proxy.
-    #[serde(serialize_with = "serialize_types")]
-    pub types: Vec<Type>, // Supported protocols for the proxy.
+    #[serde(serialize_with = "serialize_proxy_types")] // Custom serialization for types.
+    pub types: Vec<ProxyType>, // Supported protocols for the proxy.
 }
 
 impl Proxy {
@@ -113,8 +117,13 @@ impl Proxy {
         format!("{}:{}", self.ip, self.port)
     }
 
-    pub fn as_json(&self) -> anyhow::Result<String, serde_json::Error> {
-        serde_json::to_string(self)
+    /// Converts the proxy details to JSON format.
+    ///
+    /// # Returns
+    ///
+    /// A result containing the JSON string or an error.
+    pub fn as_json(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(Into::into)
     }
 }
 
@@ -144,11 +153,12 @@ impl Display for Proxy {
             self.avg_response_time(),
             self.types
                 .iter()
-                .map_while(|type_| {
-                    if type_.checked {
-                        return Some(type_.protocol.to_string());
+                .filter_map(|proxy_type| {
+                    if proxy_type.checked {
+                        Some(proxy_type.protocol.to_string())
+                    } else {
+                        None
                     }
-                    None
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -160,17 +170,13 @@ impl Display for Proxy {
 
 /// Represents a source of proxy information, such as a URL and default protocol types.
 pub struct Source {
-    /// URL of the proxy source.
-    pub url: Uri,
-    /// Default protocol types for the source.
-    pub default_types: Vec<Arc<Protocol>>,
-    /// Time before giving up on a request.
-    pub timeout: Duration,
+    pub url: Uri,                          // URL of the proxy source.
+    pub default_types: Vec<Arc<Protocol>>, // Default protocol types for the source.
+    pub timeout: Duration,                 // Time before giving up on a request.
 }
 
 impl Source {
     /// Creates a new `Source` with a specified URL and protocol types.
-    /// If no types are provided, defaults to common protocols.
     ///
     /// # Arguments
     ///
@@ -251,16 +257,11 @@ impl Source {
 
 /// Options for configuring the proxy fetching process.
 pub struct ProxyFetcherConfig {
-    /// Ensure each proxy has a unique IP; affects performance.
-    pub enforce_unique_ip: bool,
-    /// Maximum number of concurrent requests to process source URLs.
-    pub concurrency_limit: usize,
-    /// Timeout for requests in milliseconds.
-    pub request_timeout: u64,
-    /// Perform geo lookup for each proxy; affects performance.
-    pub enable_geo_lookup: bool,
-    /// Filter proxies by ISO country code; if empty, skip filtering (optional).
-    pub countries: Vec<String>,
+    pub enforce_unique_ip: bool, // Ensure each proxy has a unique IP; affects performance.
+    pub concurrency_limit: usize, // Maximum number of concurrent requests to process source URLs.
+    pub request_timeout: u64,    // Timeout for requests in milliseconds.
+    pub enable_geo_lookup: bool, // Perform geo lookup for each proxy; affects performance.
+    pub countries: Vec<String>, // Filter proxies by ISO country code; if empty, skip filtering (optional).
 }
 
 impl Default for ProxyFetcherConfig {
@@ -277,12 +278,9 @@ impl Default for ProxyFetcherConfig {
 
 /// Options for configuring the proxy validating process.
 pub struct ProxyValidatorConfig {
-    /// Maximum number of conccurent process.
-    pub concurrency_limit: usize,
-    /// Timeout for requests in milliseconds.
-    pub request_timeout: u64,
-    /// Filter proxies by protocol; if empty, skip filtering (optional).
-    pub types: Vec<Protocol>,
+    pub concurrency_limit: usize, // Maximum number of concurrent processes.
+    pub request_timeout: u64,     // Timeout for requests in milliseconds.
+    pub types: Vec<Protocol>, // Filter proxies by protocol; if empty, skip filtering (optional).
 }
 
 impl Default for ProxyValidatorConfig {

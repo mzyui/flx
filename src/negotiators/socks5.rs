@@ -13,56 +13,72 @@ use crate::models::Proxy;
 
 use super::NegotiatorTrait;
 
+/// A negotiator for SOCKS5 proxies.
 pub struct Socks5Negotiator;
 
 #[async_trait]
 impl NegotiatorTrait for Socks5Negotiator {
+    /// Negotiates a connection with the SOCKS5 proxy.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream`: The TCP stream to negotiate.
+    /// * `proxy`: The proxy being used for the negotiation.
+    /// * `_uri`: The URI to be accessed through the proxy (not used for SOCKS5).
+    ///
+    /// # Returns
+    ///
+    /// A result indicating success or failure of the negotiation.
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
         proxy: &mut Proxy,
         _uri: &hyper::Uri,
     ) -> anyhow::Result<()> {
-        let packet = [5, 1, 0];
+        // Prepare the initial SOCKS5 handshake packet
+        let handshake_packet = [5, 1, 0]; // Version, number of methods, no authentication
 
-        let time_start = Instant::now();
-        stream.write_all(&packet).await?;
-        proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        let start_time = Instant::now();
+        stream.write_all(&handshake_packet).await?;
+        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
 
-        let mut buf = [0; 2];
-        let time_start = Instant::now();
-        stream.read_exact(&mut buf).await?;
-        proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        // Read the response from the SOCKS5 server
+        let mut response_buf = [0; 2];
+        let start_time = Instant::now();
+        stream.read_exact(&mut response_buf).await?;
+        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
 
-        if buf[0] != 0x05 {
+        if response_buf[0] != 0x05 {
             anyhow::bail!("InvalidData: invalid response version");
         }
-        if buf[1] == 0xff {
-            // TODO: Add support for socks5 auth
-            anyhow::bail!("PermissionDenied: auth is required");
+        if response_buf[1] == 0xff {
+            // TODO: Support for SOCKS5 authentication
+            anyhow::bail!("PermissionDenied: authentication is required");
         }
-        if buf[1] != 0x00 {
+        if response_buf[1] != 0x00 {
             anyhow::bail!("InvalidData: invalid response data");
         }
 
+        // Prepare the SOCKS5 connection request packet
         let data = (5u8, 1u8, 0u8, 1u8, proxy.ip.octets(), proxy.port);
-        let mut buf = Cursor::new(Vec::new());
-        data.pack_to::<BigEndian, _>(&mut buf)?;
-        let packet = buf.into_inner();
+        let mut cursor = Cursor::new(Vec::new());
+        data.pack_to::<BigEndian, _>(&mut cursor)?;
+        let connection_packet = cursor.into_inner();
 
-        let time_start = Instant::now();
-        stream.write_all(&packet).await?;
-        proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        let start_time = Instant::now();
+        stream.write_all(&connection_packet).await?;
+        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
 
-        let mut buf = [0; 10];
-        let time_start = Instant::now();
-        stream.read_exact(&mut buf).await?;
-        proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        // Read the response for the connection request
+        let mut response_buf = [0; 10];
+        let start_time = Instant::now();
+        stream.read_exact(&mut response_buf).await?;
+        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
 
-        if buf[0] != 0x05 {
+        if response_buf[0] != 0x05 {
             anyhow::bail!("InvalidData: invalid response version");
         }
-        if buf[1] != 0x00 {
+        if response_buf[1] != 0x00 {
             anyhow::bail!("InvalidData: invalid response data");
         }
 

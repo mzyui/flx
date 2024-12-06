@@ -38,10 +38,6 @@ pub struct Cli {
     )]
     pub log_level: String,
 
-    /// Skip version checking.
-    #[arg(long)]
-    pub skip_version_check: bool,
-
     /// Subcommands available for the proxy application.
     #[command(subcommand)]
     pub command: Commands,

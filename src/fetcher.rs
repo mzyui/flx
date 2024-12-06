@@ -20,7 +20,7 @@ use tokio_task_pool::Pool;
 
 use crate::{
     geoip::GeoIp,
-    models::{Proxy, ProxyFetcherConfig, Source, Type},
+    models::{Proxy, ProxyFetcherConfig, ProxyType, Source},
     providers::{FreeProxyListProvider, GithubRepoProvider, IProxyTrait, ProxyscrapeProvider},
 };
 
@@ -33,7 +33,7 @@ pub struct ProxyFetcher {
     elapsed: Option<Duration>, // Duration of the fetcher operation.
     geoip: Option<GeoIp>,      // Optional GeoIP instance for location lookups.
     providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>, // List of proxy providers.
-    unique_ip: HashSet<(Ipv4Addr, u16)>, // Set to track unique IPs.
+    unique_ips: HashSet<(Ipv4Addr, u16)>, // Set to track unique IPs.
     handler: Option<JoinHandle<()>>, // Handle for the fetching task.
     config: ProxyFetcherConfig, // Configuration for the proxy fetcher.
 }
@@ -50,19 +50,19 @@ impl ProxyFetcher {
     /// A result containing the initialized `ProxyFetcher`.
     pub async fn gather(config: ProxyFetcherConfig) -> anyhow::Result<Self> {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        //        let (sender, receiver) = mpsc::channel();
         let geoip = if config.enable_geo_lookup {
             Some(GeoIp::new().await?)
         } else {
             None
         };
+
         let providers: Vec<Arc<dyn IProxyTrait + Send + Sync>> = vec![
             Arc::new(FreeProxyListProvider::default()),
             Arc::new(GithubRepoProvider),
             Arc::new(ProxyscrapeProvider),
         ];
 
-        let mut fles = Self {
+        let mut fetcher = Self {
             sender,
             receiver,
             counter: Arc::new(AtomicUsize::new(0)),
@@ -71,11 +71,12 @@ impl ProxyFetcher {
             geoip,
             handler: None,
             providers,
-            unique_ip: HashSet::new(),
+            unique_ips: HashSet::new(),
             config,
         };
-        fles.start().await?;
-        Ok(fles)
+
+        fetcher.start().await?;
+        Ok(fetcher)
     }
 }
 
@@ -90,16 +91,16 @@ async fn do_work(
     let html = provider
         .fetch(client, &source.url.to_string(), source.timeout)
         .await?;
-    let types = source
+    let proxy_types = source
         .default_types
         .clone()
         .into_iter()
-        .map(|protocol| Type {
+        .map(|protocol| ProxyType {
             protocol,
             checked: false,
         })
         .collect();
-    provider.scrape(html, tx, counter, types).await
+    provider.scrape(html, tx, counter, proxy_types).await
 }
 
 impl ProxyFetcher {
@@ -131,18 +132,19 @@ impl ProxyFetcher {
 
         #[cfg(feature = "log")]
         log::debug!(
-            "Proxy gather started. Collecting proxies from {} sources",
+            "Proxy gathering started. Collecting proxies from {} sources",
             tasks.len(),
         );
 
         let counter = self.counter.clone();
-        counter.store(0, std::sync::atomic::Ordering::Relaxed);
+        counter.store(0, Ordering::Relaxed);
         let sender = self.sender.clone();
 
         let client = Arc::new(
             Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new()),
         );
         let concurrency_limit = self.config.concurrency_limit;
+
         let handler = tokio::spawn(async move {
             let pool = Pool::bounded(concurrency_limit);
             for (source, provider) in tasks.iter() {
@@ -166,6 +168,7 @@ impl ProxyFetcher {
             }
             sender.send(None).unwrap_or_default();
         });
+
         self.handler = Some(handler);
         Ok(())
     }
@@ -187,7 +190,7 @@ impl ProxyFetcher {
                         .geo
                         .iso_code
                         .clone()
-                        .map(|f| self.config.countries.contains(&f))
+                        .map(|code| self.config.countries.contains(&code))
                         .unwrap_or(false)
                 {
                     self.counter.fetch_sub(1, Ordering::Relaxed);
@@ -196,7 +199,7 @@ impl ProxyFetcher {
             }
 
             if self.config.enforce_unique_ip {
-                if self.unique_ip.insert((proxy.ip, proxy.port)) {
+                if self.unique_ips.insert((proxy.ip, proxy.port)) {
                     return Some(proxy);
                 } else {
                     self.counter.fetch_sub(1, Ordering::Relaxed);
@@ -236,10 +239,10 @@ impl Drop for ProxyFetcher {
         }
 
         #[cfg(feature = "log")]
-        let total_proxies = self.counter.load(std::sync::atomic::Ordering::Acquire);
+        let total_proxies = self.counter.load(Ordering::Acquire);
         #[cfg(feature = "log")]
         log::debug!(
-            "Proxy gather completed in {:?}. {} proxies were found",
+            "Proxy gathering completed in {:?}. {} proxies were found",
             self.elapsed.unwrap_or(self.timer.elapsed()),
             total_proxies
         );

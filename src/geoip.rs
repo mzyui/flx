@@ -94,11 +94,11 @@ pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
         .uri(GEOLITE_ENDPOINT_URL)
         .header(hyper::header::USER_AGENT, UserAgent().fake::<&str>())
         .body(Empty::<Bytes>::new())?;
+
     let mut response = client.request(req).await?;
 
     #[cfg(feature = "progress_bar")]
-    let max = if let Some(length) = response.headers().get(hyper::header::CONTENT_LENGTH)
-    {
+    let max_size = if let Some(length) = response.headers().get(hyper::header::CONTENT_LENGTH) {
         length.to_str().map(|v| v.parse::<f64>().unwrap_or(0.0))?
     } else {
         0.0
@@ -108,14 +108,15 @@ pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
     let status = StatusLine::new(Progress {
         progress: AtomicUsize::new(0),
         timer: time::Instant::now(),
-        max,
+        max: max_size,
     });
     #[cfg(feature = "progress_bar")]
     status.progress.fetch_add(0, Ordering::Relaxed);
 
     let mut file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(true)
+        .write(true)
         .open(mmdb_path)?;
 
     while let Some(next) = response.frame().await {
@@ -149,6 +150,7 @@ impl GeoIp {
             log::debug!("Geolite2-city.mmdb does not exist, downloading");
             download_database(&mmdb_path).await?;
         }
+
         match Reader::open_readfile(&mmdb_path) {
             Ok(reader) => Ok(Self { reader }),
             Err(e) => {
@@ -208,8 +210,7 @@ impl GeoIp {
             if let Some(division) = subdivisions.first() {
                 geodata.region_iso_code = division.iso_code.map(ToString::to_string);
                 if let Some(division_names) = &division.names {
-                    geodata.region_name =
-                        division_names.get("en").map(ToString::to_string);
+                    geodata.region_name = division_names.get("en").map(ToString::to_string);
                 }
             }
         }

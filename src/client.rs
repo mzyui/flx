@@ -15,10 +15,10 @@ use tokio::{net::TcpStream, time};
 
 use crate::{models::Proxy, negotiators::NegotiatorTrait};
 
-/// A struct representing a client that connects to a proxy server.
+/// Represents a client that connects to a proxy server.
 #[derive(Debug)]
 pub struct ProxyClient {
-    pub proxy: Proxy, // The proxy configuration to connect through.
+    pub proxy: Proxy, // The proxy configuration for the connection.
 }
 
 impl ProxyClient {
@@ -35,24 +35,34 @@ impl ProxyClient {
         Self { proxy }
     }
 
-    /// Connects to the proxy server.
-    ///
-    /// This method establishes a TCP connection to the proxy server defined in the `ProxyClient`.
+    /// Establishes a TCP connection to the proxy server.
     ///
     /// # Returns
     ///
     /// A `TcpStream` if the connection is successful, or an error if it fails.
     async fn connect(&mut self) -> anyhow::Result<TcpStream> {
-        let time_start = time::Instant::now();
+        let start_time = time::Instant::now();
         self.log_trace("Starting TCP connection");
-        let result = TcpStream::connect(self.proxy.as_text()).await?;
-        let elapsed = time_start.elapsed();
-        self.log_trace(format!("Connected in {:?}", elapsed));
-        self.proxy.runtimes.push(elapsed.as_secs_f64());
 
-        Ok(result)
+        let tcp_stream = TcpStream::connect(self.proxy.as_text()).await?;
+
+        let elapsed_time = start_time.elapsed();
+        self.log_trace(format!("Connected in {:?}", elapsed_time));
+        self.proxy.runtimes.push(elapsed_time.as_secs_f64());
+
+        Ok(tcp_stream)
     }
 
+    /// Sends a request over TLS through the proxy.
+    ///
+    /// # Arguments
+    ///
+    /// * `req`: The HTTP request to send.
+    /// * `stream`: The TCP stream to use for the connection.
+    ///
+    /// # Returns
+    ///
+    /// A `Response<Incoming>` if the request is successful, or an error if it fails.
     pub async fn send_with_tls<B>(
         &mut self,
         req: Request<B>,
@@ -64,22 +74,23 @@ impl ProxyClient {
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         self.log_trace("Starting TLS connection");
-        let time_start = time::Instant::now();
-        let config = TlsConnector::builder()
+        let start_time = time::Instant::now();
+
+        let tls_connector = TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .build()?;
-        let connector = tokio_native_tls::TlsConnector::from(config);
+        let connector = tokio_native_tls::TlsConnector::from(tls_connector);
 
         let tls_stream = connector
             .connect(&self.proxy.ip.to_string(), stream)
             .await?;
-        self.proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        self.proxy.runtimes.push(start_time.elapsed().as_secs_f64());
         self.log_trace("TLS connection established successfully");
 
-        let time_start = time::Instant::now();
+        let start_time = time::Instant::now();
         let io = TokioIo::new(tls_stream);
         let (mut sender, conn) = handshake(io).await?;
-        self.proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        self.proxy.runtimes.push(start_time.elapsed().as_secs_f64());
 
         let addr = self.proxy.as_text();
         let handler = tokio::task::spawn(async move {
@@ -91,14 +102,25 @@ impl ProxyClient {
             }
         });
 
-        self.log_trace(format!("Sending a {:?}", req));
-        let time_start = time::Instant::now();
+        self.log_trace(format!("Sending request: {:?}", req));
+        let start_time = time::Instant::now();
         let response = sender.send_request(req).await?;
-        self.proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        self.proxy.runtimes.push(start_time.elapsed().as_secs_f64());
         handler.abort();
+
         Ok(response)
     }
 
+    /// Sends a request without TLS through the proxy.
+    ///
+    /// # Arguments
+    ///
+    /// * `req`: The HTTP request to send.
+    /// * `stream`: The TCP stream to use for the connection.
+    ///
+    /// # Returns
+    ///
+    /// A `Response<Incoming>` if the request is successful, or an error if it fails.
     pub async fn send_without_tls<B>(
         &mut self,
         req: Request<B>,
@@ -109,10 +131,10 @@ impl ProxyClient {
         B::Data: Send,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
-        let time_start = time::Instant::now();
+        let start_time = time::Instant::now();
         let io = TokioIo::new(stream);
         let (mut sender, conn) = handshake(io).await?;
-        self.proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        self.proxy.runtimes.push(start_time.elapsed().as_secs_f64());
 
         let addr = self.proxy.as_text();
         let handler = tokio::task::spawn(async move {
@@ -124,27 +146,28 @@ impl ProxyClient {
             }
         });
 
-        self.log_trace(format!("Sending a {:?}", req));
-        let time_start = time::Instant::now();
+        self.log_trace(format!("Sending request: {:?}", req));
+        let start_time = time::Instant::now();
         let response = sender.send_request(req).await?;
-        self.proxy.runtimes.push(time_start.elapsed().as_secs_f64());
+        self.proxy.runtimes.push(start_time.elapsed().as_secs_f64());
         handler.abort();
+
         Ok(response)
     }
 
     /// Sends a request through the proxy.
     ///
-    /// This method handles the connection and the HTTP request to the specified endpoint.
+    /// This method manages the connection and the HTTP request to the specified endpoint.
     ///
     /// # Type Parameters
     ///
-    /// * `B`: The type of the request body, which must implement `Body` and be `Debug` and `Send`.
-    /// * `N`: The Type of negotiator that will be called before making an http request, Which must implement NegotiatorTrait and Sync
+    /// * `B`: The type of the request body, which must implement `Body`, and be `Debug` and `Send`.
+    /// * `N`: The negotiator type that will be called before making the HTTP request, which must implement `NegotiatorTrait` and `Sync`.
     ///
     /// # Arguments
     ///
     /// * `req`: The HTTP request to send.
-    /// * `negotiator`: Function to negotiate with proxy server
+    /// * `negotiator`: An optional function to negotiate with the proxy server.
     ///
     /// # Returns
     ///
@@ -161,8 +184,8 @@ impl ProxyClient {
         N: NegotiatorTrait + Sync,
     {
         let mut stream = self.connect().await?;
+        let mut use_tls = false;
 
-        let mut send_with_tls = false;
         if let Some(negotiator) = negotiator {
             if let Err(e) = negotiator
                 .negotiate(&mut stream, &mut self.proxy, req.uri())
@@ -170,10 +193,10 @@ impl ProxyClient {
             {
                 anyhow::bail!("Failed to negotiate: {}", e);
             }
-            send_with_tls = negotiator.with_tls();
+            use_tls = negotiator.with_tls();
         }
 
-        if send_with_tls || req.uri().scheme_str().unwrap_or("") == "https" {
+        if use_tls || req.uri().scheme_str().unwrap_or("") == "https" {
             self.send_with_tls(req, stream).await
         } else {
             self.send_without_tls(req, stream).await

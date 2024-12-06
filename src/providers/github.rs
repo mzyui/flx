@@ -7,13 +7,21 @@ use async_trait::async_trait;
 use scraper::Html;
 
 use super::IProxyTrait;
-use crate::models::{Proxy, Source, Type};
+use crate::models::{Proxy, ProxyType, Source};
 
 /// A provider for fetching proxy lists from GitHub repositories.
 pub struct GithubRepoProvider;
 
 impl GithubRepoProvider {
     /// Constructs a raw URL for accessing files in a GitHub repository.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`: The path to the file in the GitHub repository.
+    ///
+    /// # Returns
+    ///
+    /// A formatted string representing the raw GitHub URL.
     fn githubusercontent(&self, path: &str) -> String {
         format!("https://raw.githubusercontent.com/{}", path)
     }
@@ -22,6 +30,10 @@ impl GithubRepoProvider {
 #[async_trait]
 impl IProxyTrait for GithubRepoProvider {
     /// Returns a list of sources from which proxies can be fetched.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `Source` objects representing the proxy sources.
     fn sources(&self) -> Vec<Source> {
         vec![
             Source::http(&self.githubusercontent("zevtyardt/proxy-list/main/http.txt")),
@@ -51,17 +63,28 @@ impl IProxyTrait for GithubRepoProvider {
     }
 
     /// Scrapes proxy information from the fetched HTML content.
+    ///
+    /// # Arguments
+    ///
+    /// * `html`: The HTML document containing proxy information.
+    /// * `tx`: The channel to send found proxies.
+    /// * `counter`: A counter to track the number of proxies found.
+    /// * `default_types`: Default protocol types for the proxies.
+    ///
+    /// # Returns
+    ///
+    /// A result indicating success or failure of the scraping operation.
     async fn scrape(
         &self,
         html: Html,
         tx: crossbeam_channel::Sender<Option<Proxy>>,
         counter: Arc<AtomicUsize>,
-        default_types: Vec<Type>,
+        default_types: Vec<ProxyType>,
     ) -> anyhow::Result<()> {
         for line in html.html().lines() {
-            let mut splited = line.trim().split(':');
-            if let Some(Ok(ip)) = splited.next().map(|f| f.parse::<Ipv4Addr>()) {
-                if let Some(Ok(port)) = splited.next().map(|f| f.parse::<u16>()) {
+            let mut parts = line.trim().split(':');
+            if let (Some(ip_str), Some(port_str)) = (parts.next(), parts.next()) {
+                if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
                     let proxy = Proxy {
                         ip,
                         port,
@@ -69,12 +92,11 @@ impl IProxyTrait for GithubRepoProvider {
                         ..Default::default()
                     };
                     if !self.send(proxy, &tx, &counter) {
-                        break;
-                    };
+                        break; // Stop if sending fails
+                    }
                 }
             }
         }
-
         Ok(())
     }
 }

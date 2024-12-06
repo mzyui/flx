@@ -13,7 +13,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use scraper::Html;
 use tokio::time;
 
-use crate::models::{Proxy, Source, Type};
+use crate::models::{Proxy, ProxyType, Source};
 
 mod free_proxy_list;
 mod github;
@@ -35,7 +35,7 @@ pub trait IProxyTrait {
 
     /// Fetches the HTML content from the specified URL.
     ///
-    /// This method handles redirects and accumulates the HTML content from all the frames.
+    /// This method handles redirects and accumulates the HTML content from all frames.
     ///
     /// # Arguments
     ///
@@ -55,13 +55,14 @@ pub trait IProxyTrait {
         let mut urls = VecDeque::new();
         urls.push_back((url.to_string(), None)); // Initialize with the first URL
 
-        let ua = UserAgent().fake::<&str>(); // Generate a fake user agent
-
+        let user_agent = UserAgent().fake::<&str>(); // Generate a fake user agent
         let mut content = String::new(); // To accumulate HTML content
+
         while let Some((url, previous_url)) = urls.pop_front() {
             let mut req = Request::builder()
                 .uri(&url)
-                .header(hyper::header::USER_AGENT, ua);
+                .header(hyper::header::USER_AGENT, user_agent);
+
             if let Some(previous_url) = previous_url {
                 req = req.header(hyper::header::REFERER, previous_url); // Set the referer if available
             }
@@ -81,8 +82,7 @@ pub trait IProxyTrait {
             while let Some(next) = response.frame().await {
                 let frame = next?;
                 if let Some(chunk) = frame.data_ref() {
-                    let chunk_str = String::from_utf8_lossy(chunk);
-                    content.push_str(&chunk_str); // Append chunk to content
+                    content.push_str(&String::from_utf8_lossy(chunk)); // Append chunk to content
                 }
             }
         }
@@ -106,7 +106,7 @@ pub trait IProxyTrait {
         html: Html,
         tx: crossbeam_channel::Sender<Option<Proxy>>,
         counter: Arc<AtomicUsize>,
-        default_types: Vec<Type>,
+        default_types: Vec<ProxyType>,
     ) -> anyhow::Result<()>;
 
     /// Sends a found proxy through the provided channel and updates the counter.
