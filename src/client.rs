@@ -152,7 +152,7 @@ impl ProxyClient {
     pub async fn send_request<B, N>(
         &mut self,
         req: Request<B>,
-        negotiator: Arc<N>,
+        negotiator: Option<Arc<N>>,
     ) -> anyhow::Result<Response<Incoming>>
     where
         B: Body + 'static + Debug + Send,
@@ -162,14 +162,18 @@ impl ProxyClient {
     {
         let mut stream = self.connect().await?;
 
-        if let Err(e) = negotiator
-            .negotiate(&mut stream, &mut self.proxy, req.uri())
-            .await
-        {
-            anyhow::bail!("Failed to negotiate: {}", e);
+        let mut send_with_tls = false;
+        if let Some(negotiator) = negotiator {
+            if let Err(e) = negotiator
+                .negotiate(&mut stream, &mut self.proxy, req.uri())
+                .await
+            {
+                anyhow::bail!("Failed to negotiate: {}", e);
+            }
+            send_with_tls = negotiator.with_tls();
         }
 
-        if negotiator.with_tls() || req.uri().scheme_str().unwrap_or("") == "https" {
+        if send_with_tls || req.uri().scheme_str().unwrap_or("") == "https" {
             self.send_with_tls(req, stream).await
         } else {
             self.send_without_tls(req, stream).await
