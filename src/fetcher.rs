@@ -20,10 +20,8 @@ use tokio_task_pool::Pool;
 
 use crate::{
     geoip::GeoIp,
-    models::{Proxy, ProxyConfig, Source},
-    providers::{
-        FreeProxyListProvider, GithubRepoProvider, IProxyTrait, ProxyscrapeProvider,
-    },
+    models::{Proxy, ProxyFetcherConfig, Source, Type},
+    providers::{FreeProxyListProvider, GithubRepoProvider, IProxyTrait, ProxyscrapeProvider},
 };
 
 /// Responsible for fetching proxies from various sources.
@@ -37,7 +35,7 @@ pub struct ProxyFetcher {
     providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>, // List of proxy providers.
     unique_ip: HashSet<(Ipv4Addr, u16)>, // Set to track unique IPs.
     handler: Option<JoinHandle<()>>, // Handle for the fetching task.
-    config: ProxyConfig,       // Configuration for the proxy fetcher.
+    config: ProxyFetcherConfig, // Configuration for the proxy fetcher.
 }
 
 impl ProxyFetcher {
@@ -50,7 +48,7 @@ impl ProxyFetcher {
     /// # Returns
     ///
     /// A result containing the initialized `ProxyFetcher`.
-    pub async fn gather(config: ProxyConfig) -> anyhow::Result<Self> {
+    pub async fn gather(config: ProxyFetcherConfig) -> anyhow::Result<Self> {
         let (sender, receiver) = crossbeam_channel::unbounded();
         //        let (sender, receiver) = mpsc::channel();
         let geoip = if config.enable_geo_lookup {
@@ -85,13 +83,22 @@ impl ProxyFetcher {
 async fn do_work(
     provider: Arc<dyn IProxyTrait + Send + Sync>,
     client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
-    source: Arc<Source>, tx: crossbeam_channel::Sender<Option<Proxy>>,
+    source: Arc<Source>,
+    tx: crossbeam_channel::Sender<Option<Proxy>>,
     counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     let html = provider
         .fetch(client, &source.url.to_string(), source.timeout)
         .await?;
-    let types = source.default_types.clone();
+    let types = source
+        .default_types
+        .clone()
+        .into_iter()
+        .map(|protocol| Type {
+            protocol,
+            checked: false,
+        })
+        .collect();
     provider.scrape(html, tx, counter, types).await
 }
 
@@ -133,8 +140,7 @@ impl ProxyFetcher {
         let sender = self.sender.clone();
 
         let client = Arc::new(
-            Client::builder(TokioExecutor::new())
-                .build::<_, Empty<Bytes>>(HttpsConnector::new()),
+            Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new()),
         );
         let concurrency_limit = self.config.concurrency_limit;
         let handler = tokio::spawn(async move {
@@ -173,14 +179,17 @@ impl ProxyFetcher {
     /// An optional `Proxy` if one is available, otherwise `None`.
     pub fn get_one(&mut self) -> Option<Proxy> {
         while let Some(mut proxy) = self.receiver.recv().ok()? {
-            if !self.config.filters.is_types_match(&proxy) {
-                self.counter.fetch_sub(1, Ordering::Relaxed);
-                continue;
-            }
-
             if let Some(geoip) = &self.geoip {
                 proxy.geo = geoip.lookup(&proxy.ip);
-                if !self.config.filters.is_country_match(&proxy) {
+
+                if !self.config.countries.is_empty()
+                    && !proxy
+                        .geo
+                        .iso_code
+                        .clone()
+                        .map(|f| self.config.countries.contains(&f))
+                        .unwrap_or(false)
+                {
                     self.counter.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
@@ -199,23 +208,9 @@ impl ProxyFetcher {
         }
         None
     }
-
-    /// Creates an iterator for the fetched proxies.
-    ///
-    /// # Returns
-    ///
-    /// An iterator over the proxies.
-    pub fn iter(&mut self) -> ProxyFetcherIter {
-        ProxyFetcherIter { inner: self }
-    }
 }
 
-/// Iterator for fetching proxies from the `ProxyFetcher`.
-pub struct ProxyFetcherIter<'a> {
-    inner: &'a mut ProxyFetcher,
-}
-
-impl Iterator for ProxyFetcherIter<'_> {
+impl Iterator for ProxyFetcher {
     type Item = Proxy;
 
     /// Retrieves the next proxy from the fetcher.
@@ -224,10 +219,10 @@ impl Iterator for ProxyFetcherIter<'_> {
     ///
     /// An optional `Proxy` if available, otherwise `None`.
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(proxy) = self.inner.get_one() {
+        if let Some(proxy) = self.get_one() {
             return Some(proxy);
         }
-        self.inner.elapsed = Some(self.inner.timer.elapsed());
+        self.elapsed = Some(self.timer.elapsed());
         None
     }
 }
