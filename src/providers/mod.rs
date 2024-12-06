@@ -13,7 +13,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use scraper::Html;
 use tokio::time;
 
-use crate::models::{Protocol, Proxy, Source};
+use crate::models::{Proxy, Source, Type};
 
 mod free_proxy_list;
 mod github;
@@ -47,8 +47,10 @@ pub trait IProxyTrait {
     ///
     /// A result containing the parsed HTML document or an error if the fetch fails.
     async fn fetch(
-        &self, client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
-        url: &str, timeout: Duration,
+        &self,
+        client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
+        url: &str,
+        timeout: Duration,
     ) -> anyhow::Result<Html> {
         let mut urls = VecDeque::new();
         urls.push_back((url.to_string(), None)); // Initialize with the first URL
@@ -66,8 +68,7 @@ pub trait IProxyTrait {
 
             // Send the request and await the response with a timeout
             let mut response =
-                time::timeout(timeout, client.request(req.body(Empty::<Bytes>::new())?))
-                    .await??;
+                time::timeout(timeout, client.request(req.body(Empty::<Bytes>::new())?)).await??;
 
             // Handle possible redirects
             if let Some(redirect) = response.headers().get(hyper::header::LOCATION) {
@@ -101,8 +102,11 @@ pub trait IProxyTrait {
     ///
     /// A result indicating success or failure of the scraping operation.
     async fn scrape(
-        &self, html: Html, tx: crossbeam_channel::Sender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>, default_types: Vec<Arc<Protocol>>,
+        &self,
+        html: Html,
+        tx: crossbeam_channel::Sender<Option<Proxy>>,
+        counter: Arc<AtomicUsize>,
+        default_types: Vec<Type>,
     ) -> anyhow::Result<()>;
 
     /// Sends a found proxy through the provided channel and updates the counter.
@@ -117,7 +121,9 @@ pub trait IProxyTrait {
     ///
     /// `true` if the proxy was sent successfully, `false` otherwise.
     fn send(
-        &self, proxy: Proxy, tx: &crossbeam_channel::Sender<Option<Proxy>>,
+        &self,
+        proxy: Proxy,
+        tx: &crossbeam_channel::Sender<Option<Proxy>>,
         counter: &Arc<AtomicUsize>,
     ) -> bool {
         if tx.send(Some(proxy)).is_ok() {
