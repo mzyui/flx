@@ -1,3 +1,5 @@
+pub mod models;
+
 use std::{
     env::current_dir,
     fmt::{Display, Formatter},
@@ -16,11 +18,10 @@ use hyper::{body::Bytes, Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use maxminddb::{geoip2::City, Reader};
+use models::GeoData;
 #[cfg(feature = "progress_bar")]
 use status_line::StatusLine;
 use tokio::time;
-
-use crate::models::GeoData;
 
 const GEOLITE_ENDPOINT_URL: &str =
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb";
@@ -131,16 +132,16 @@ pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
 }
 
 /// Manages the GeoIP database and provides lookup functionality.
-pub struct GeoIp {
+pub struct GeoLookup {
     reader: Reader<Vec<u8>>, // Reader for the GeoLite2 database.
 }
 
-impl GeoIp {
-    /// Creates a new instance of `GeoIp`, downloading the GeoLite2 database if necessary.
+impl GeoLookup {
+    /// Creates a new instance of `GeoLookup`, downloading the GeoLite2 database if necessary.
     ///
     /// # Returns
     ///
-    /// A result containing the initialized `GeoIp` instance.
+    /// A result containing the initialized `GeoLookup` instance.
     pub async fn new() -> anyhow::Result<Self> {
         let mut mmdb_path = data_dir()?;
         mmdb_path.set_file_name("geolite2-city.mmdb");

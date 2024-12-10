@@ -2,23 +2,111 @@ use std::{
     error::Error,
     fmt::{Debug, Display},
     sync::Arc,
+    time::Duration,
 };
 
+use fake::{faker::internet::en::UserAgent, Fake};
+use http_body_util::{BodyExt, Empty};
 use hyper::{
-    body::{Body, Incoming},
+    body::{Body, Bytes, Incoming},
     client::conn::http1::handshake,
+    header::USER_AGENT,
     Request, Response,
 };
 use hyper_util::rt::TokioIo;
 use native_tls::TlsConnector;
-use tokio::{net::TcpStream, time};
+use tokio::{
+    net::TcpStream,
+    time::{self, timeout},
+};
 
-use crate::{models::Proxy, negotiators::NegotiatorTrait};
+use crate::{
+    negotiators::{HttpNegotiator, NegotiatorTrait},
+    proxy::models::{Anonymity, Protocol, Proxy},
+};
+
+static HTTP_JUDGES: [&str; 10] = [
+    "http://azenv.net/",
+    "http://httpheader.net/azenv.php",
+    "http://httpbin.org/get?show_env",
+    "http://mojeip.net.pl/asdfa/azenv.php",
+    "http://proxyjudge.us",
+    "http://pascal.hoez.free.fr/azenv.php",
+    "http://www.9ravens.com/env.cgi",
+    "http://www3.wind.ne.jp/hassii/env.cgi",
+    "http://shinh.org/env.cgi",
+    "http://www2t.biglobe.ne.jp/~take52/test/env.cgi",
+];
+static HTTPS_JUDGES: [&str; 4] = [
+    "https://httpbin.org/get?show_env",
+    "https://www.proxyjudge.info",
+    "https://www.proxy-listen.de/azenv.php",
+    "https://httpheader.net/azenv.php",
+];
+static SMTP_JUDGES: [&str; 2] = ["smtp://smtp.gmail.com", "smtp://aspmx.l.google.com"];
 
 /// Represents a client that connects to a proxy server.
-#[derive(Debug)]
 pub struct ProxyClient {
     pub proxy: Proxy, // The proxy configuration for the connection.
+    max_attempts: usize,
+    timeout: u64,
+}
+
+impl ProxyClient {
+    pub async fn try_http(&mut self) -> anyhow::Result<Option<Anonymity>> {
+        for (attempt, judge) in HTTP_JUDGES.into_iter().cycle().enumerate() {
+            let ua = UserAgent().fake::<&str>();
+            let req = Request::builder()
+                .uri(judge)
+                .header(USER_AGENT, ua)
+                .body(Empty::<Bytes>::new())?;
+
+            let result = timeout(
+                Duration::from_secs(self.timeout),
+                self.send_request(req, Some(HttpNegotiator)),
+            )
+            .await;
+
+            if let Ok(Ok(response)) = result {
+                if !response.status().is_success() {
+                    return Ok(None);
+                }
+                let mut content = String::new();
+                for (k, v) in response.headers() {
+                    content.push_str(k.as_str());
+                    content.push_str(": ");
+                    content.push_str(v.to_str()?);
+                    content.push('\n');
+                }
+                content.push_str("\n\n");
+                if let Ok(bytes) = response.collect().await.map(|body| body.to_bytes()) {
+                    let body = String::from_utf8_lossy(&bytes);
+                    content.push_str(&body);
+                }
+                println!("{}", content);
+            }
+
+            if attempt + 1 >= self.max_attempts {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn check_all(&mut self) {
+        while let Some(proxytype) = self.proxy.types.pop() {
+            match proxytype.protocol {
+                Protocol::Http(_) => {
+                    self.try_http().await;
+                }
+                Protocol::Https => {}
+                Protocol::Socks4 => {}
+                Protocol::Socks5 => {}
+                Protocol::Connect(_) => {}
+                _ => {}
+            }
+        }
+    }
 }
 
 impl ProxyClient {
@@ -32,7 +120,19 @@ impl ProxyClient {
     ///
     /// A new instance of `ProxyClient`.
     pub fn new(proxy: Proxy) -> Self {
-        Self { proxy }
+        Self {
+            proxy,
+            max_attempts: 1,
+            timeout: 3,
+        }
+    }
+
+    pub fn set_max_attempts(&mut self, max_attempts: usize) {
+        self.max_attempts = max_attempts;
+    }
+
+    pub fn set_timeout(&mut self, timeout: u64) {
+        self.timeout = timeout;
     }
 
     /// Establishes a TCP connection to the proxy server.
@@ -175,7 +275,7 @@ impl ProxyClient {
     pub async fn send_request<B, N>(
         &mut self,
         req: Request<B>,
-        negotiator: Option<Arc<N>>,
+        negotiator: Option<N>,
     ) -> anyhow::Result<Response<Incoming>>
     where
         B: Body + 'static + Debug + Send,

@@ -9,7 +9,7 @@ use tokio::{
     time::Instant,
 };
 
-use crate::models::Proxy;
+use crate::proxy::models::Proxy;
 
 use super::NegotiatorTrait;
 

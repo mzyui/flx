@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use hyper::Uri;
 
 use super::NegotiatorTrait;
-use crate::models::Proxy;
+use crate::proxy::models::Proxy;
 
 /// A negotiator for SOCKS4 proxies.
 pub struct Socks4Negotiator;

@@ -1,17 +1,36 @@
+mod config;
+
 use std::time::Duration;
 
-use tokio::{task::JoinHandle, time};
+use tokio::{task::JoinHandle, time::Timeout};
 use tokio_task_pool::Pool;
 
-use crate::models::{Anonymity, Protocol, Proxy, ProxyValidatorConfig};
+pub use config::Config;
+
+use crate::{
+    proxy::client::ProxyClient,
+    proxy::models::{Anonymity, Protocol, Proxy},
+    utils::my_ip,
+};
 
 pub struct ProxyValidator {
+    sender: crossbeam_channel::Sender<Option<Proxy>>,
     receiver: crossbeam_channel::Receiver<Option<Proxy>>,
     handler: JoinHandle<()>,
 }
+async fn do_work(
+    proxy: Proxy,
+    sender: crossbeam_channel::Sender<Option<Proxy>>,
+    max_attempts: usize,
+) {
+    let mut proxy_client = ProxyClient::new(proxy);
+    proxy_client.check_all().await;
+    sender.send(Some(proxy_client.proxy)).unwrap_or_default();
+}
 
 impl ProxyValidator {
-    pub async fn validate<I>(proxy_source: I, config: ProxyValidatorConfig) -> anyhow::Result<Self>
+    #[allow(unused_must_use)]
+    pub async fn validate<I>(proxy_source: I, config: Config) -> anyhow::Result<Self>
     where
         I: Iterator<Item = Proxy> + Send + 'static,
     {
@@ -24,11 +43,17 @@ impl ProxyValidator {
         }
 
         let (sender, receiver) = crossbeam_channel::unbounded();
+
+        let tx = sender.clone();
         let handler = tokio::spawn(async move {
             let pool = Pool::bounded(config.concurrency_limit);
+            pool.spawn(my_ip()).await;
+
             for mut proxy in proxy_source {
+                let sender = tx.clone();
+                let max_attempts = config.max_attempts;
                 proxy.types.retain(|type_| {
-                    let left_proto = &*type_.protocol;
+                    let left_proto = &type_.protocol;
                     config
                         .types
                         .iter()
@@ -38,25 +63,31 @@ impl ProxyValidator {
                             _ => left_proto == right_proto,
                         })
                 });
-                if proxy.types.is_empty() {
-                    continue;
+                if !proxy.types.is_empty() {
+                    pool.spawn(async move {
+                        do_work(proxy, sender, max_attempts).await;
+                    })
+                    .await;
                 }
-
-                let _ = sender.send(Some(proxy));
             }
 
             // Wait for all tasks in the pool to complete.
             while pool.busy_permits().unwrap_or(0) != 0 {
-                time::sleep(Duration::from_millis(50)).await;
+                // do nothing
             }
-            sender.send(None).unwrap_or_default();
+            tx.send(None).unwrap_or_default();
         });
-        Ok(Self { receiver, handler })
+        Ok(Self {
+            receiver,
+            handler,
+            sender,
+        })
     }
 }
 
 impl Drop for ProxyValidator {
     fn drop(&mut self) {
+        self.sender.send(None).unwrap_or_default();
         self.handler.abort();
     }
 }

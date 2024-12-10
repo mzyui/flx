@@ -7,7 +7,7 @@ use tokio::{
 };
 
 use super::NegotiatorTrait;
-use crate::models::Proxy;
+use crate::proxy::models::Proxy;
 
 /// A negotiator for HTTPS proxies.
 pub struct HttpsNegotiator;

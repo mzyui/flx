@@ -6,8 +6,8 @@ use std::{
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 
-use super::IProxyTrait;
-use crate::models::{Proxy, ProxyType, Source};
+use super::{models::Source, IProxyTrait};
+use crate::proxy::models::{Proxy, ProxyType};
 
 /// A provider for fetching proxy lists from free-proxy-list.net.
 pub struct FreeProxyListProvider {

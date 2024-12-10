@@ -1,3 +1,5 @@
+mod config;
+
 use std::{
     collections::HashSet,
     net::Ipv4Addr,
@@ -8,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+pub use config::Config;
 use http_body_util::Empty;
 use hyper::body::Bytes;
 use hyper_tls::HttpsConnector;
@@ -19,9 +22,11 @@ use tokio::{task::JoinHandle, time};
 use tokio_task_pool::Pool;
 
 use crate::{
-    geoip::GeoIp,
-    models::{Proxy, ProxyFetcherConfig, ProxyType, Source},
-    providers::{FreeProxyListProvider, GithubRepoProvider, IProxyTrait, ProxyscrapeProvider},
+    geolookup::GeoLookup,
+    providers::{
+        models::Source, FreeProxyListProvider, GithubRepoProvider, IProxyTrait, ProxyscrapeProvider,
+    },
+    proxy::models::{Protocol, Proxy, ProxyType},
 };
 
 /// Responsible for fetching proxies from various sources.
@@ -31,11 +36,11 @@ pub struct ProxyFetcher {
     counter: Arc<AtomicUsize>, // Counter for tracking the number of fetched proxies.
     timer: time::Instant,      // Timer for measuring elapsed time.
     elapsed: Option<Duration>, // Duration of the fetcher operation.
-    geoip: Option<GeoIp>,      // Optional GeoIP instance for location lookups.
+    geolookup: Option<GeoLookup>, // Optional GeoIP instance for location lookups.
     providers: Vec<Arc<dyn IProxyTrait + Send + Sync>>, // List of proxy providers.
     unique_ips: HashSet<(Ipv4Addr, u16)>, // Set to track unique IPs.
     handler: Option<JoinHandle<()>>, // Handle for the fetching task.
-    config: ProxyFetcherConfig, // Configuration for the proxy fetcher.
+    config: Config,            // Configuration for the proxy fetcher.
 }
 
 impl ProxyFetcher {
@@ -48,10 +53,10 @@ impl ProxyFetcher {
     /// # Returns
     ///
     /// A result containing the initialized `ProxyFetcher`.
-    pub async fn gather(config: ProxyFetcherConfig) -> anyhow::Result<Self> {
+    pub async fn gather(config: Config) -> anyhow::Result<Self> {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let geoip = if config.enable_geo_lookup {
-            Some(GeoIp::new().await?)
+        let geolookup = if config.enable_geo_lookup {
+            Some(GeoLookup::new().await?)
         } else {
             None
         };
@@ -68,7 +73,7 @@ impl ProxyFetcher {
             counter: Arc::new(AtomicUsize::new(0)),
             timer: time::Instant::now(),
             elapsed: None,
-            geoip,
+            geolookup,
             handler: None,
             providers,
             unique_ips: HashSet::new(),
@@ -97,6 +102,7 @@ async fn do_work(
         .into_iter()
         .map(|protocol| ProxyType {
             protocol,
+            checked_on: 0.0,
             checked: false,
         })
         .collect();
@@ -164,11 +170,10 @@ impl ProxyFetcher {
             }
             // Wait for all tasks in the pool to complete.
             while pool.busy_permits().unwrap_or(0) != 0 {
-                time::sleep(Duration::from_millis(50)).await;
+                // do nothing
             }
             sender.send(None).unwrap_or_default();
         });
-
         self.handler = Some(handler);
         Ok(())
     }
@@ -182,8 +187,8 @@ impl ProxyFetcher {
     /// An optional `Proxy` if one is available, otherwise `None`.
     pub fn get_one(&mut self) -> Option<Proxy> {
         while let Some(mut proxy) = self.receiver.recv().ok()? {
-            if let Some(geoip) = &self.geoip {
-                proxy.geo = geoip.lookup(&proxy.ip);
+            if let Some(geolookup) = &self.geolookup {
+                proxy.geo = geolookup.lookup(&proxy.ip);
 
                 if !self.config.countries.is_empty()
                     && !proxy

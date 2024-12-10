@@ -10,13 +10,15 @@ use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use models::Source;
 use scraper::Html;
 use tokio::time;
 
-use crate::models::{Proxy, ProxyType, Source};
+use crate::proxy::models::{Proxy, ProxyType};
 
 mod free_proxy_list;
 mod github;
+pub mod models;
 mod proxyscrape;
 
 pub use free_proxy_list::FreeProxyListProvider;

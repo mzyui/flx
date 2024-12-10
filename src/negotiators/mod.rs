@@ -13,7 +13,7 @@ pub use socks4::Socks4Negotiator;
 pub use socks5::Socks5Negotiator;
 use tokio::net::TcpStream;
 
-use crate::models::Proxy;
+use crate::proxy::models::Proxy;
 
 /// Trait defining the negotiation behavior for different proxy types.
 #[async_trait]

@@ -1,17 +1,24 @@
-pub mod client;
+#![allow(unused, dead_code)]
 pub mod fetcher;
-pub mod geoip;
-pub mod models;
+pub mod geolookup;
 pub mod negotiators;
 pub mod providers;
-mod validator;
+pub mod proxy;
+pub mod validator;
 
-use fetcher::ProxyFetcher;
-pub use models::ProxyValidatorConfig;
-use models::{Anonymity, Protocol, Proxy, ProxyFetcherConfig, ProxyType};
+mod utils;
+
+use cached::proc_macro::cached;
+use fetcher::{Config, ProxyFetcher};
+use http_body_util::{BodyExt, Empty};
+use hyper::{body::Bytes, Request};
+use hyper_tls::HttpsConnector;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use proxy::models::{Anonymity, Protocol, Proxy, ProxyType};
 use std::{
     fs::File,
     io::{BufReader, Lines},
+    str::FromStr,
 };
 use std::{io::BufRead, net::Ipv4Addr, path::PathBuf};
 pub use validator::ProxyValidator;
@@ -54,7 +61,7 @@ impl ProxySource {
     /// # Returns
     ///
     /// A result containing the `ProxyFetcher` or an error if the operation fails.
-    pub async fn from_fetcher(config: ProxyFetcherConfig) -> anyhow::Result<ProxyFetcher> {
+    pub async fn from_fetcher(config: Config) -> anyhow::Result<ProxyFetcher> {
         ProxyFetcher::gather(config).await
     }
 
