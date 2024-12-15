@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 pub mod fetcher;
 pub mod geolookup;
 pub mod negotiators;
@@ -8,17 +7,11 @@ pub mod validator;
 
 mod utils;
 
-use cached::proc_macro::cached;
 use fetcher::{Config, ProxyFetcher};
-use http_body_util::{BodyExt, Empty};
-use hyper::{body::Bytes, Request};
-use hyper_tls::HttpsConnector;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use proxy::models::{Anonymity, Protocol, Proxy, ProxyType};
 use std::{
     fs::File,
     io::{BufReader, Lines},
-    str::FromStr,
 };
 use std::{io::BufRead, net::Ipv4Addr, path::PathBuf};
 pub use validator::ProxyValidator;
