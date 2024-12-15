@@ -1,31 +1,41 @@
+mod checker;
 mod config;
 
-use std::time::Duration;
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
-use tokio::{task::JoinHandle, time::Timeout};
+use checker::ProxyCheck;
+use tokio::task::JoinHandle;
 use tokio_task_pool::Pool;
 
 pub use config::Config;
 
 use crate::{
-    proxy::client::ProxyClient,
-    proxy::models::{Anonymity, Protocol, Proxy},
+    proxy::{
+        client::ProxyClient,
+        models::{Protocol, Proxy},
+    },
     utils::my_ip,
 };
 
 pub struct ProxyValidator {
     sender: crossbeam_channel::Sender<Option<Proxy>>,
     receiver: crossbeam_channel::Receiver<Option<Proxy>>,
-    handler: JoinHandle<()>,
+    handler: JoinHandle<anyhow::Result<()>>,
 }
-async fn do_work(
-    proxy: Proxy,
-    sender: crossbeam_channel::Sender<Option<Proxy>>,
-    max_attempts: usize,
-) {
-    let mut proxy_client = ProxyClient::new(proxy);
-    proxy_client.check_all().await;
-    sender.send(Some(proxy_client.proxy)).unwrap_or_default();
+async fn do_work(mut proxy: Proxy, max_attempts: usize, timeout: u64) -> anyhow::Result<Proxy> {
+    let timeout = Duration::from_secs(timeout);
+    let tcp = proxy.connect_timeout(timeout).await?;
+    tcp.apply(&mut proxy);
+
+    proxy.support_http(timeout, max_attempts).await;
+
+    if !proxy.runtimes.is_empty() {
+        return Ok(proxy);
+    }
+    anyhow::bail!("")
 }
 
 impl ProxyValidator {
@@ -35,23 +45,21 @@ impl ProxyValidator {
         I: Iterator<Item = Proxy> + Send + 'static,
     {
         if config.types.is_empty() {
-            anyhow::bail!("config.types cannot be empty")
+            anyhow::bail!("config.types cannot be empty; please specify at least one type.");
         }
-
-        if config.types.contains(&Protocol::Http(Anonymity::Unknown)) {
-            anyhow::bail!("can't use Protocol::Http(Anonymity::Unknown) for proxy filtering")
-        }
+        my_ip().await;
 
         let (sender, receiver) = crossbeam_channel::unbounded();
 
         let tx = sender.clone();
         let handler = tokio::spawn(async move {
             let pool = Pool::bounded(config.concurrency_limit);
-            pool.spawn(my_ip()).await;
-
+            let process_done = Arc::new(AtomicBool::new(false));
             for mut proxy in proxy_source {
-                let sender = tx.clone();
-                let max_attempts = config.max_attempts;
+                if process_done.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
                 proxy.types.retain(|type_| {
                     let left_proto = &type_.protocol;
                     config
@@ -63,19 +71,26 @@ impl ProxyValidator {
                             _ => left_proto == right_proto,
                         })
                 });
+
                 if !proxy.types.is_empty() {
+                    let tx = tx.clone();
+                    let max_attempts = config.max_attempts;
+                    let timeout = config.request_timeout;
+                    let process_done = Arc::clone(&process_done);
+
                     pool.spawn(async move {
-                        do_work(proxy, sender, max_attempts).await;
+                        if let Ok(proxy) = do_work(proxy, max_attempts, timeout).await {
+                            if tx.send(Some(proxy)).is_err() {
+                                process_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                     })
                     .await;
                 }
             }
-
-            // Wait for all tasks in the pool to complete.
-            while pool.busy_permits().unwrap_or(0) != 0 {
-                // do nothing
-            }
-            tx.send(None).unwrap_or_default();
+            while pool.busy_permits().unwrap_or(0) != 0 {}
+            tx.try_send(None)?;
+            Ok::<(), anyhow::Error>(())
         });
         Ok(Self {
             receiver,
