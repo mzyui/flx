@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{io::Cursor, net::Ipv4Addr};
 
 use async_trait::async_trait;
 use byteorder::BigEndian;
@@ -8,8 +8,6 @@ use tokio::{
     net::TcpStream,
     time::Instant,
 };
-
-use crate::proxy::models::Proxy;
 
 use super::NegotiatorTrait;
 
@@ -32,7 +30,8 @@ impl NegotiatorTrait for Socks5Negotiator {
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        proxy: &mut Proxy,
+        runtimes: &mut Vec<f64>,
+        proxy_host: &str,
         _uri: &hyper::Uri,
     ) -> anyhow::Result<()> {
         // Prepare the initial SOCKS5 handshake packet
@@ -40,13 +39,13 @@ impl NegotiatorTrait for Socks5Negotiator {
 
         let start_time = Instant::now();
         stream.write_all(&handshake_packet).await?;
-        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.push(start_time.elapsed().as_secs_f64());
 
         // Read the response from the SOCKS5 server
         let mut response_buf = [0; 2];
         let start_time = Instant::now();
         stream.read_exact(&mut response_buf).await?;
-        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.push(start_time.elapsed().as_secs_f64());
 
         if response_buf[0] != 0x05 {
             anyhow::bail!("InvalidData: invalid response version");
@@ -58,22 +57,31 @@ impl NegotiatorTrait for Socks5Negotiator {
         if response_buf[1] != 0x00 {
             anyhow::bail!("InvalidData: invalid response data");
         }
+        let parts = proxy_host.split(':').collect::<Vec<_>>();
 
         // Prepare the SOCKS5 connection request packet
-        let data = (5u8, 1u8, 0u8, 1u8, proxy.ip.octets(), proxy.port);
+        let data = (
+            5u8,
+            1u8,
+            0u8,
+            1u8,
+            parts[0].parse::<Ipv4Addr>()?.octets(),
+            parts[1].parse::<u16>()?,
+        );
+
         let mut cursor = Cursor::new(Vec::new());
         data.pack_to::<BigEndian, _>(&mut cursor)?;
         let connection_packet = cursor.into_inner();
 
         let start_time = Instant::now();
         stream.write_all(&connection_packet).await?;
-        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.push(start_time.elapsed().as_secs_f64());
 
         // Read the response for the connection request
         let mut response_buf = [0; 10];
         let start_time = Instant::now();
         stream.read_exact(&mut response_buf).await?;
-        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.push(start_time.elapsed().as_secs_f64());
 
         if response_buf[0] != 0x05 {
             anyhow::bail!("InvalidData: invalid response version");

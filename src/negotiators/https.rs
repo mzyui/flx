@@ -7,7 +7,6 @@ use tokio::{
 };
 
 use super::NegotiatorTrait;
-use crate::proxy::models::Proxy;
 
 /// A negotiator for HTTPS proxies.
 pub struct HttpsNegotiator;
@@ -32,21 +31,11 @@ impl HttpsNegotiator {
 
 #[async_trait]
 impl NegotiatorTrait for HttpsNegotiator {
-    /// Negotiates a connection with the HTTPS proxy.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream`: The TCP stream to negotiate.
-    /// * `proxy`: The proxy being used for the negotiation.
-    /// * `uri`: The URI to be accessed through the proxy.
-    ///
-    /// # Returns
-    ///
-    /// A result indicating success or failure of the negotiation.
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        proxy: &mut Proxy,
+        runtimes: &mut Vec<f64>,
+        proxy_host: &str,
         uri: &Uri,
     ) -> anyhow::Result<()> {
         if let Some(host) = uri.host() {
@@ -57,10 +46,13 @@ impl NegotiatorTrait for HttpsNegotiator {
                 anyhow::bail!("Scheme is empty or not https");
             }
 
-            self.log_trace(proxy, format!("Sending a connection request to {}", host));
+            self.log_trace(
+                proxy_host,
+                format!("Sending a connection request to {}", host),
+            );
             let start_time = time::Instant::now();
             stream.write_all(connect_request.as_bytes()).await?;
-            proxy.runtimes.push(start_time.elapsed().as_secs_f64());
+            runtimes.push(start_time.elapsed().as_secs_f64());
 
             let mut buf = [0; 64];
             stream.read_exact(&mut buf).await?;
@@ -77,8 +69,8 @@ impl NegotiatorTrait for HttpsNegotiator {
                     response.reason.unwrap_or("Unknown reason")
                 );
             }
-            self.log_trace(proxy, "Connection successfully established");
-            proxy.runtimes.push(start_time.elapsed().as_secs_f64());
+            self.log_trace(proxy_host, "Connection successfully established");
+            runtimes.push(start_time.elapsed().as_secs_f64());
         }
         Ok(())
     }

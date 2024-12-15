@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{io::Cursor, net::Ipv4Addr};
 
 use byteorder::BigEndian;
 use byteorder_pack::PackTo;
@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use hyper::Uri;
 
 use super::NegotiatorTrait;
-use crate::proxy::models::Proxy;
 
 /// A negotiator for SOCKS4 proxies.
 pub struct Socks4Negotiator;
@@ -33,11 +32,20 @@ impl NegotiatorTrait for Socks4Negotiator {
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        proxy: &mut Proxy,
+        runtimes: &mut Vec<f64>,
+        proxy_host: &str,
         _uri: &Uri,
     ) -> anyhow::Result<()> {
+        let parts = proxy_host.split(':').collect::<Vec<_>>();
+
         // Prepare the SOCKS4 connection request packet
-        let data = (4u8, 1u8, proxy.port, proxy.ip.octets(), 0u8);
+        let data = (
+            4u8,
+            1u8,
+            parts[1].parse::<u16>()?,
+            parts[0].parse::<Ipv4Addr>()?.octets(),
+            0u8,
+        );
         let mut cursor = Cursor::new(Vec::new());
         data.pack_to::<BigEndian, _>(&mut cursor)?;
         let packet = cursor.into_inner();
@@ -45,13 +53,13 @@ impl NegotiatorTrait for Socks4Negotiator {
         // Send the connection request to the SOCKS4 proxy
         let start_time = Instant::now();
         stream.write_all(&packet).await?;
-        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.push(start_time.elapsed().as_secs_f64());
 
         // Read the response from the SOCKS4 proxy
         let mut response = [0u8; 8];
         let start_time = Instant::now();
         stream.read_exact(&mut response).await?;
-        proxy.runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.push(start_time.elapsed().as_secs_f64());
 
         // Validate the response
         let mut response_slice = &response[..];

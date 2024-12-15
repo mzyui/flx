@@ -13,8 +13,6 @@ pub use socks4::Socks4Negotiator;
 pub use socks5::Socks5Negotiator;
 use tokio::net::TcpStream;
 
-use crate::proxy::models::Proxy;
-
 /// Trait defining the negotiation behavior for different proxy types.
 #[async_trait]
 pub trait NegotiatorTrait {
@@ -33,7 +31,8 @@ pub trait NegotiatorTrait {
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        proxy: &mut Proxy,
+        runtimes: &mut Vec<f64>,
+        proxy_host: &str,
         uri: &Uri,
     ) -> anyhow::Result<()> {
         Ok(())
@@ -54,12 +53,12 @@ pub trait NegotiatorTrait {
     ///
     /// * `proxy`: The proxy associated with the log message.
     /// * `msg`: The message to log.
-    fn log_trace<S>(&self, proxy: &Proxy, msg: S)
+    fn log_trace<S>(&self, proxy_host: &str, msg: S)
     where
         S: Display,
     {
         #[cfg(feature = "log")]
-        log::trace!("{}: {}", proxy.as_text(), msg);
+        log::trace!("{}: {}", proxy_host, msg);
     }
 
     /// Logs an error message.
@@ -68,13 +67,13 @@ pub trait NegotiatorTrait {
     ///
     /// * `proxy`: The proxy associated with the error message.
     /// * `msg`: The message to log as an error.
-    fn log_error<S>(&self, proxy: &Proxy, msg: S)
+    fn log_error<S>(&self, proxy_host: &str, msg: S)
     where
         S: Display,
     {
         #[cfg(feature = "log")]
         if log::max_level().eq(&log::LevelFilter::Trace) {
-            log::error!("{}: {}", proxy.as_text(), msg);
+            log::error!("{}: {}", proxy_host, msg);
         }
     }
 }
