@@ -1,4 +1,8 @@
-use std::{fmt::Display, net::Ipv4Addr};
+use std::{
+    fmt::Display,
+    net::Ipv4Addr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Serialize, Serializer};
 
@@ -50,7 +54,6 @@ pub struct ProxyType {
     /// The protocol of the proxy.
     pub protocol: Protocol,
     /// Indicates if the proxy has been checked
-    #[serde(skip)]
     pub checked: bool,
     /// Time when this proxy type was checked
     pub checked_on: f64,
@@ -63,6 +66,17 @@ impl ProxyType {
             protocol,
             checked: false,
             checked_on: 0.0,
+        }
+    }
+    /// Creates a new `ProxyType` with the specified protocol. marked as checked
+    pub fn checked(protocol: Protocol) -> Self {
+        Self {
+            protocol,
+            checked: true,
+            checked_on: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
         }
     }
 }
@@ -125,8 +139,8 @@ impl Proxy {
     /// # Returns
     ///
     /// A result containing the JSON string or an error.
-    pub fn as_json(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    pub fn as_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
     }
 }
 
