@@ -26,7 +26,7 @@ use crate::{
     providers::{
         models::Source, FreeProxyListProvider, GithubRepoProvider, IProxyTrait, ProxyscrapeProvider,
     },
-    proxy::models::{Protocol, Proxy, ProxyType},
+    proxy::models::{Proxy, ProxyType},
 };
 
 /// Responsible for fetching proxies from various sources.
@@ -168,6 +168,7 @@ impl ProxyFetcher {
                 })
                 .await;
             }
+
             // Wait for all tasks in the pool to complete.
             while pool.busy_permits().unwrap_or(0) != 0 {
                 // do nothing
