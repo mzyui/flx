@@ -1,12 +1,8 @@
 use std::{net::Ipv4Addr, str::FromStr};
 
-use async_trait::async_trait;
 use cached::proc_macro::cached;
 use http_body_util::{BodyExt, Empty};
-use hyper::{
-    body::{Bytes, Incoming},
-    Request, Response,
-};
+use hyper::{body::Bytes, Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 
