@@ -22,11 +22,11 @@ pub struct Cli {
     pub countries: Vec<String>,
 
     /// Maximum number of concurrent proxy checks.
-    #[arg(short, long, default_value = "500")]
-    pub max_connections: usize,
+    #[arg(short, long, default_value = "500", value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_connections: u64,
 
     /// Timeout duration in seconds before giving up.
-    #[arg(long, default_value = "3")]
+    #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout: u64,
 
     /// Log level for application output.
