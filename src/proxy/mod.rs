@@ -42,11 +42,7 @@ impl ProxyClient {
                 }
 
                 if let Ok(content) = self.to_raw_response(response).await {
-                    let my_ip = my_ip().await;
-                    if !content.contains(ua) {
-                        continue;
-                    }
-                    if content.contains(&my_ip) {
+                   if content.contains(&my_ip) {
                         return Some(Protocol::Http(Anonymity::Transparent));
                     } else if ANON_INTEREST.iter().any(|&header| content.contains(header))
                         || content.contains(&self.proxy.ip.to_string())
@@ -54,7 +50,7 @@ impl ProxyClient {
                         return Some(Protocol::Http(Anonymity::Anonymous));
                     } else {
                         return Some(Protocol::Http(Anonymity::Elite));
-                    }
+                   }
                 }
             }
         }
@@ -63,20 +59,6 @@ impl ProxyClient {
 
     pub async fn check_all(&mut self) {
         let mut proxytype = self.proxy.types.drain(..).collect::<Vec<_>>();
-        while let Some(proxytype) = proxytype.pop() {
-            match proxytype.protocol {
-                Protocol::Http(_) => {
-                    if let Some(protocol) = self.try_http().await {
-                        self.proxy.types.push(ProxyType::checked(protocol));
-                    }
-                }
-                Protocol::Https => {}
-                Protocol::Socks4 => {}
-                Protocol::Socks5 => {}
-                Protocol::Connect(_) => {}
-                _ => {}
-            }
-        }
     }
 }
 

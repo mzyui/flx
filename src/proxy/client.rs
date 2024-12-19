@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt::{Debug, Display},
     time::Duration,
 };
@@ -16,9 +17,10 @@ use async_trait::async_trait;
 
 use crate::{negotiators::NegotiatorTrait, proxy::models::Proxy};
 
+#[derive(Debug)]
 pub struct ProxyRuntimes<T> {
     pub inner: T,
-    runtimes: Vec<f64>,
+    pub runtimes: Vec<f64>,
 }
 
 impl<T> ProxyRuntimes<T> {
@@ -29,7 +31,7 @@ impl<T> ProxyRuntimes<T> {
 
 #[async_trait]
 pub trait ProxyClient {
-    fn host(&self) -> String;
+    fn host(&self) -> Cow<'static, str>;
 
     /// Establishes a TCP connection to the proxy server.
     ///
@@ -47,7 +49,7 @@ pub trait ProxyClient {
 
         let host = self.host();
         let elapsed_time = start_time.elapsed();
-        let tcp_stream = time::timeout(timeout, TcpStream::connect(&host)).await??;
+        let tcp_stream = time::timeout(timeout, TcpStream::connect(host.into_owned())).await??;
         let runtimes = vec![elapsed_time.as_secs_f64()];
         self.log_trace(format!("Connected in {:?}", elapsed_time));
 
@@ -214,7 +216,7 @@ pub trait ProxyClient {
 }
 
 impl ProxyClient for Proxy {
-    fn host(&self) -> String {
+    fn host(&self) -> Cow<'static, str> {
         self.as_text()
     }
 }
