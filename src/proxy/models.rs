@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt::Display,
     net::Ipv4Addr,
     time::{SystemTime, UNIX_EPOCH},
@@ -129,9 +130,9 @@ impl Proxy {
     ///
     /// # Returns
     ///
-    /// A `String` representing the proxy address.
-    pub fn as_text(&self) -> String {
-        format!("{}:{}", self.ip, self.port)
+    /// A `Cow<'static, str>` representing the proxy address.
+    pub fn as_text(&self) -> Cow<'static, str> {
+        Cow::Owned(format!("{}:{}", self.ip, self.port))
     }
 
     /// Converts the proxy details to JSON format.
