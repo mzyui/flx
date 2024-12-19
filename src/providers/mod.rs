@@ -1,8 +1,4 @@
-use std::{
-    collections::VecDeque,
-    sync::{atomic::AtomicUsize, Arc},
-    time::Duration,
-};
+use std::{borrow::Cow, collections::VecDeque, net::Ipv4Addr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use fake::{faker::internet::en::UserAgent, Fake};
@@ -11,7 +7,6 @@ use hyper::{body::Bytes, Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use models::Source;
-use scraper::Html;
 use tokio::time;
 
 use crate::proxy::models::{Proxy, ProxyType};
@@ -53,7 +48,7 @@ pub trait IProxyTrait {
         client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
         url: &str,
         timeout: Duration,
-    ) -> anyhow::Result<Html> {
+    ) -> anyhow::Result<Cow<'static, str>> {
         let mut urls = VecDeque::new();
         urls.push_back((url.to_string(), None)); // Initialize with the first URL
 
@@ -88,7 +83,7 @@ pub trait IProxyTrait {
                 }
             }
         }
-        Ok(Html::parse_document(&content)) // Parse and return the accumulated HTML
+        Ok(Cow::Owned(content))
     }
 
     /// Scrapes proxy information from the fetched HTML content.
@@ -105,33 +100,26 @@ pub trait IProxyTrait {
     /// A result indicating success or failure of the scraping operation.
     async fn scrape(
         &self,
-        html: Html,
-        tx: crossbeam_channel::Sender<Option<Proxy>>,
-        counter: Arc<AtomicUsize>,
+        html: Cow<'static, str>,
+        tx: kanal::AsyncSender<Proxy>,
         default_types: Vec<ProxyType>,
-    ) -> anyhow::Result<()>;
-
-    /// Sends a found proxy through the provided channel and updates the counter.
-    ///
-    /// # Arguments
-    ///
-    /// * `proxy`: The `Proxy` instance to be sent.
-    /// * `tx`: The channel to send the proxy.
-    /// * `counter`: A counter to track the number of proxies sent.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the proxy was sent successfully, `false` otherwise.
-    fn send(
-        &self,
-        proxy: Proxy,
-        tx: &crossbeam_channel::Sender<Option<Proxy>>,
-        counter: &Arc<AtomicUsize>,
-    ) -> bool {
-        if tx.send(Some(proxy)).is_ok() {
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // Increment the counter
-            return true;
+    ) -> anyhow::Result<()> {
+        for line in html.lines() {
+            let mut parts = line.trim().split(':');
+            if let (Some(ip_str), Some(port_str)) = (parts.next(), parts.next()) {
+                if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
+                    let proxy = Proxy {
+                        ip,
+                        port,
+                        types: default_types.clone(),
+                        ..Default::default()
+                    };
+                    if tx.send(proxy).await.is_err() {
+                        break;
+                    }
+                }
+            }
         }
-        false
+        Ok(())
     }
 }
