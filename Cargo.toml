@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.93"
-tokio = { version = "1.41.1", features = ["net", "rt-multi-thread"] }
+tokio = { version = "1.41.1", features = ["io-util", "rt-multi-thread"] }
 log = { version = "0.4.22", optional = true }
 stderrlog = { version = "0.6.0", optional = true }
 fake = "3.0.1"
@@ -17,6 +17,13 @@ directories = "5.0.1"
 maxminddb = "0.24.0"
 serde = { version = "1.0.215", features = ["derive"] }
 serde_json = "1.0.133"
+
+byteorder = "1.5.0"
+byteorder-pack = "0.1.0"
+kanal = "0.1.0-pre8"
+hashbrown = "0.15.2"
+trust-dns-resolver = { version = "0.23.2" }
+cached = { version = "0.54.0", features = ["async"] }
 
 # request client
 hyper = { version = "1", features = ["client", "http1"] }
@@ -30,11 +37,6 @@ hyper-tls = "0.6.0"
 httparse = "1.9.5"
 native-tls = "0.2.12"
 tokio-native-tls = "0.3.1"
-byteorder = "1.5.0"
-byteorder-pack = "0.1.0"
-cached = { version = "0.54.0", features = ["async"] }
-kanal = "0.1.0-pre8"
-hashbrown = "0.15.2"
 
 [lib]
 path = "src/lib.rs"
