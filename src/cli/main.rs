@@ -84,7 +84,11 @@ where
             .unwrap()
     });
 
+    let mut found_proxy = false;
     for (index, proxy) in source.enumerate() {
+        if !found_proxy {
+            found_proxy = true;
+        }
         let should_end = options.limit > 0 && index + 1 >= options.limit;
         let output = match options.format.as_str() {
             "text" => proxy.as_text().into_owned(),
@@ -115,7 +119,7 @@ where
         }
     }
 
-    if options.format == "json" {
+    if found_proxy && options.format == "json" {
         if let Some(ref mut file) = output_file {
             file.write_all(b"]")?;
         } else {
@@ -158,7 +162,7 @@ fn run_application() -> anyhow::Result<()> {
                 Box::new(source)
             };
 
-        let proxy_iterator: Box<dyn Iterator<Item = Proxy>> = if !options.types.is_empty() {
+        if !options.types.is_empty() {
             let protocols = convert_protocols(&options.types);
             if protocols.is_empty() {
                 std::process::exit(-1)
@@ -173,12 +177,11 @@ fn run_application() -> anyhow::Result<()> {
                 },
             )
             .await?;
-            Box::new(validated_proxies)
+            process_result(validated_proxies, options)?;
         } else {
-            proxy_source
-        };
+            process_result(proxy_source, options)?;
+        }
 
-        process_result(proxy_iterator, options)?;
         Ok(())
     })
 }
