@@ -5,10 +5,10 @@ pub mod providers;
 pub mod proxy;
 pub mod validator;
 
-mod utils;
+mod resolver;
 
 use fetcher::{Config, ProxyFetcher};
-use proxy::models::{Anonymity, Protocol, Proxy, ProxyType};
+use proxy::models::{Anonymity, Protocol, Proxy};
 use std::{
     fs::File,
     io::{BufReader, Lines},
@@ -41,7 +41,7 @@ pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
 /// Represents a source of proxy servers, either from a file or a network fetcher.
 pub struct ProxySource {
     lines: Lines<BufReader<File>>,
-    default_proxy_types: Vec<ProxyType>,
+    default_proxy_types: Vec<Protocol>,
 }
 
 impl ProxySource {
@@ -73,10 +73,10 @@ impl ProxySource {
         let lines = buffered_reader.lines();
 
         let default_proxy_types = vec![
-            ProxyType::new(Protocol::Http(Anonymity::Unknown)),
-            ProxyType::new(Protocol::Https),
-            ProxyType::new(Protocol::Socks4),
-            ProxyType::new(Protocol::Socks5),
+            Protocol::Http(Anonymity::Unknown),
+            Protocol::Https,
+            Protocol::Socks4,
+            Protocol::Socks5,
         ];
 
         Ok(Self {
@@ -104,7 +104,7 @@ impl Iterator for ProxySource {
                     let proxy = Proxy {
                         ip: ip_address,
                         port: port_number,
-                        types: self.default_proxy_types.clone(),
+                        expected_types: self.default_proxy_types.clone(),
                         ..Default::default()
                     };
 
