@@ -9,7 +9,7 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use models::Source;
 use tokio::time;
 
-use crate::proxy::models::{Proxy, ProxyType};
+use crate::proxy::models::{Protocol, Proxy};
 
 mod free_proxy_list;
 mod github;
@@ -102,7 +102,7 @@ pub trait IProxyTrait {
         &self,
         html: Cow<'static, str>,
         tx: kanal::AsyncSender<Proxy>,
-        default_types: Vec<ProxyType>,
+        default_types: Vec<Protocol>,
     ) -> anyhow::Result<()> {
         for line in html.lines() {
             let mut parts = line.trim().split(':');
@@ -111,7 +111,7 @@ pub trait IProxyTrait {
                     let proxy = Proxy {
                         ip,
                         port,
-                        types: default_types.clone(),
+                        expected_types: default_types.clone(),
                         ..Default::default()
                     };
                     if tx.send(proxy).await.is_err() {
