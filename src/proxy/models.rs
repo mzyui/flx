@@ -55,6 +55,7 @@ pub struct ProxyType {
     /// The protocol of the proxy.
     pub protocol: Protocol,
     /// Indicates if the proxy has been checked
+    #[serde(skip)]
     pub checked: bool,
     /// Time when this proxy type was checked
     pub checked_on: f64,
@@ -108,8 +109,10 @@ pub struct Proxy {
         serialize_with = "serialize_runtimes"
     )]
     pub runtimes: Vec<f64>,
-    /// Supported protocols for the proxy.
-    pub types: Vec<ProxyType>,
+    #[serde(skip)]
+    pub expected_types: Vec<Protocol>,
+    #[serde(rename = "type")]
+    pub proxy_type: Option<ProxyType>,
 }
 
 impl Proxy {
@@ -152,7 +155,8 @@ impl Default for Proxy {
             port: 0,
             geo: GeoData::default(),
             runtimes: vec![],
-            types: vec![],
+            expected_types: vec![],
+            proxy_type: None,
         }
     }
 }
@@ -167,19 +171,12 @@ impl Display for Proxy {
 
         write!(
             f,
-            " {:.2}s [{}] {}:{}>",
+            " {:.2}s {} {}:{}>",
             self.avg_response_time(),
-            self.types
-                .iter()
-                .filter_map(|proxy_type| {
-                    if proxy_type.checked {
-                        Some(proxy_type.protocol.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+            self.proxy_type
+                .as_ref()
+                .map(|v| format!("{}", v.protocol))
+                .unwrap_or("--".into()),
             self.ip,
             self.port
         )
