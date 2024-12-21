@@ -1,41 +1,59 @@
+#![allow(unused, dead_code)]
 mod checker;
 mod config;
 
+use core::arch;
 use std::{
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, Mutex},
     time::Duration,
 };
 
-use checker::ProxyCheck;
-use tokio::task::JoinHandle;
-use tokio_task_pool::Pool;
+use tokio::{sync::Semaphore, task::JoinHandle, time::Instant};
 
 pub use config::Config;
 
 use crate::{
     proxy::{
         client::ProxyClient,
-        models::{Protocol, Proxy},
+        models::{Protocol, Proxy, ProxyType},
     },
-    utils::my_ip,
+    resolver::my_ip,
 };
 
 pub struct ProxyValidator {
-    sender: crossbeam_channel::Sender<Option<Proxy>>,
-    receiver: crossbeam_channel::Receiver<Option<Proxy>>,
-    handler: JoinHandle<anyhow::Result<()>>,
+    receiver: kanal::Receiver<Proxy>,
+    is_finished: Arc<AtomicBool>,
 }
-async fn do_work(mut proxy: Proxy, max_attempts: usize, timeout: u64) -> anyhow::Result<Proxy> {
+
+#[allow(unused_must_use)]
+async fn do_work(
+    mut proxy: Proxy,
+    sender: kanal::AsyncSender<Proxy>,
+    protocol: Protocol,
+    max_attempts: usize,
+    timeout: u64,
+) {
     let timeout = Duration::from_secs(timeout);
-    let tcp = proxy.connect_timeout(timeout).await?;
-    tcp.apply(&mut proxy);
+    if let Ok(tcp) = proxy.connect_timeout(timeout).await {
+        tcp.apply(&mut proxy);
 
-    proxy.support_http(timeout, max_attempts).await;
+        if let Protocol::Http(_) = protocol {
+            if let Some(result) = checker::support_http(&mut proxy, timeout, max_attempts).await {
+                result.apply(&mut proxy);
+                proxy.proxy_type = Some(ProxyType::checked(result.inner));
+            }
+        }
 
-    if !proxy.runtimes.is_empty() {
-        return Ok(proxy);
+        if proxy.proxy_type.is_some() {
+            #[cfg(feature = "log")]
+            log::trace!(
+                "{}: support protocol: {}",
+                proxy.as_text(),
+                proxy.proxy_type.as_ref().unwrap().protocol
+            );
+            sender.send(proxy).await.unwrap_or_default();
+        }
     }
-    anyhow::bail!("")
 }
 
 impl ProxyValidator {
@@ -47,63 +65,56 @@ impl ProxyValidator {
         if config.types.is_empty() {
             anyhow::bail!("config.types cannot be empty; please specify at least one type.");
         }
+
         my_ip().await;
 
-        let (sender, receiver) = crossbeam_channel::unbounded();
+        let (sender, receiver) = kanal::unbounded_async();
+        let validator = Self {
+            receiver: receiver.to_sync(),
+            is_finished: Arc::new(AtomicBool::new(false)),
+        };
 
-        let tx = sender.clone();
-        let handler = tokio::spawn(async move {
-            let pool = Pool::bounded(config.concurrency_limit);
-            let process_done = Arc::new(AtomicBool::new(false));
+        let is_finished = Arc::clone(&validator.is_finished);
+        tokio::spawn(async move {
+            let sem = Arc::new(Semaphore::new(config.concurrency_limit));
             for mut proxy in proxy_source {
-                if process_done.load(std::sync::atomic::Ordering::Relaxed) {
+                if is_finished.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-
-                proxy.types.retain(|type_| {
-                    let left_proto = &type_.protocol;
-                    config
+                while let Some(protocol) = proxy.expected_types.pop() {
+                    if config
                         .types
                         .iter()
-                        .any(|right_proto| match (left_proto, right_proto) {
+                        .any(|right_proto| match (&protocol, right_proto) {
                             (Protocol::Http(_), Protocol::Http(_))
                             | (Protocol::Connect(_), Protocol::Connect(_)) => true,
-                            _ => left_proto == right_proto,
+                            _ => protocol == *right_proto,
                         })
-                });
+                    {
+                        let permit = Arc::clone(&sem);
+                        let sender = sender.clone();
+                        let max_attempts = config.max_attempts;
+                        let timeout = config.request_timeout;
+                        let proxy = proxy.clone();
 
-                if !proxy.types.is_empty() {
-                    let tx = tx.clone();
-                    let max_attempts = config.max_attempts;
-                    let timeout = config.request_timeout;
-                    let process_done = Arc::clone(&process_done);
-
-                    pool.spawn(async move {
-                        if let Ok(proxy) = do_work(proxy, max_attempts, timeout).await {
-                            if tx.send(Some(proxy)).is_err() {
-                                process_done.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                    })
-                    .await;
+                        tokio::spawn(async move {
+                            let _ = permit.acquire().await.unwrap();
+                            do_work(proxy, sender, protocol, max_attempts, timeout).await
+                        });
+                    }
                 }
             }
-            while pool.busy_permits().unwrap_or(0) != 0 {}
-            tx.try_send(None)?;
-            Ok::<(), anyhow::Error>(())
         });
-        Ok(Self {
-            receiver,
-            handler,
-            sender,
-        })
+        Ok(validator)
     }
-}
 
-impl Drop for ProxyValidator {
-    fn drop(&mut self) {
-        self.sender.send(None).unwrap_or_default();
-        self.handler.abort();
+    pub fn get_one(&mut self) -> Option<Proxy> {
+        while !self.receiver.is_empty() || self.receiver.sender_count() != 0 {
+            if let Ok(proxy) = self.receiver.recv_timeout(Duration::from_millis(100)) {
+                return Some(proxy);
+            }
+        }
+        None
     }
 }
 
@@ -111,9 +122,13 @@ impl Iterator for ProxyValidator {
     type Item = Proxy;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Ok(proxy) = self.receiver.recv() {
-            return proxy;
-        }
-        None
+        self.get_one()
+    }
+}
+
+impl Drop for ProxyValidator {
+    fn drop(&mut self) {
+        self.is_finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }

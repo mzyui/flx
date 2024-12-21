@@ -11,7 +11,14 @@ use hyper::{
     Request, Response,
 };
 
-use crate::proxy::{client::ProxyClient, models::Proxy};
+use crate::{
+    negotiators::{HttpNegotiator, HttpsNegotiator},
+    proxy::{
+        client::{ProxyClient, ProxyRuntimes},
+        models::{Anonymity, Protocol, Proxy},
+    },
+    resolver::my_ip,
+};
 
 static ANON_INTEREST: [&str; 15] = [
     "X-REAL-IP",
@@ -60,26 +67,47 @@ async fn to_raw_response(response: Response<Incoming>) -> anyhow::Result<String>
     Ok(content)
 }
 
-#[async_trait]
-pub trait ProxyCheck: ProxyClient {
-    fn host(&self) -> String;
+pub async fn support_http(
+    proxy: &mut Proxy,
+    timeout: Duration,
+    max_attempts: usize,
+) -> Option<ProxyRuntimes<Protocol>> {
+    let useragent = UserAgent().fake::<&str>();
+    for judge_url in HTTP_JUDGES.iter().cycle().take(max_attempts) {
+        if let Ok(req) = Request::get(*judge_url)
+            .header(USER_AGENT, useragent)
+            .body(Empty::<Bytes>::new())
+        {
+            if let Ok(response) = proxy.send_request(req, Some(HttpNegotiator), timeout).await {
+                if let Ok(bytes) = response.inner.collect().await.map(|body| body.to_bytes()) {
+                    let body = String::from_utf8_lossy(&bytes);
+                    if !body.contains(useragent) {
+                        continue;
+                    }
+                    if body.contains(&my_ip().await) {
+                        return Some(ProxyRuntimes {
+                            inner: Protocol::Http(Anonymity::Transparent),
+                            runtimes: response.runtimes,
+                        });
+                    }
 
-    async fn support_http(&self, timeout: Duration, max_attempts: usize) -> Option<Proxy> {
-        let useragent = UserAgent().fake::<&str>();
-        for judge_url in HTTP_JUDGES.iter().cycle().take(max_attempts) {
-            if let Ok(req) = Request::get(*judge_url)
-                .header(USER_AGENT, useragent)
-                .body(Empty::<Bytes>::new())
-            {
-                if let Ok(response) = self.send_request(req, None, timeout).await {}
+                    let body_uppercase = body.to_uppercase();
+                    if ANON_INTEREST.iter().any(|&v| body_uppercase.contains(v))
+                        || body_uppercase.contains(&proxy.ip.to_string())
+                    {
+                        return Some(ProxyRuntimes {
+                            inner: Protocol::Http(Anonymity::Anonymous),
+                            runtimes: response.runtimes,
+                        });
+                    }
+
+                    return Some(ProxyRuntimes {
+                        inner: Protocol::Http(Anonymity::Elite),
+                        runtimes: response.runtimes,
+                    });
+                }
             }
         }
-        None
     }
-}
-
-impl ProxyCheck for Proxy {
-    fn host(&self) -> String {
-        self.as_text()
-    }
+    None
 }
