@@ -76,10 +76,7 @@ impl ProxyFetcher {
         }
 
         #[cfg(feature = "log")]
-        log::debug!(
-            "Proxy gathering started. Collecting proxies from {} sources",
-            tasks.len(),
-        );
+        log::debug!("Proxy gathering started ({} sources)", tasks.len(),);
 
         let client = Arc::new(
             Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new()),
@@ -181,11 +178,10 @@ impl Drop for ProxyFetcher {
         }
 
         #[cfg(feature = "log")]
-        #[cfg(feature = "log")]
         log::debug!(
-            "Proxy gathering completed in {:?}. {} proxies were found",
+            "Proxy gathering completed: {} proxies found ({:?})",
+            self.counter,
             self.elapsed.unwrap_or(self.timer.elapsed()),
-            self.counter
         );
     }
 }
