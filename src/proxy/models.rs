@@ -171,7 +171,7 @@ impl Display for Proxy {
 
         write!(
             f,
-            " {:.2}s {} {}:{}>",
+            " {:.2}s [{}] {}:{}>",
             self.avg_response_time(),
             self.proxy_type
                 .as_ref()
