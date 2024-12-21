@@ -79,11 +79,10 @@ pub async fn support_http(
             .body(Empty::<Bytes>::new())
         {
             if let Ok(response) = proxy.send_request(req, Some(HttpNegotiator), timeout).await {
-                if let Ok(bytes) = response.inner.collect().await.map(|body| body.to_bytes()) {
-                    let body = String::from_utf8_lossy(&bytes);
-                    if !body.contains(useragent) {
-                        continue;
-                    }
+                if !response.inner.status().is_success() {
+                    return None;
+                }
+                if let Ok(body) = to_raw_response(response.inner).await {
                     if body.contains(&my_ip().await) {
                         return Some(ProxyRuntimes {
                             inner: Protocol::Http(Anonymity::Transparent),
@@ -91,9 +90,8 @@ pub async fn support_http(
                         });
                     }
 
-                    let body_uppercase = body.to_uppercase();
-                    if ANON_INTEREST.iter().any(|&v| body_uppercase.contains(v))
-                        || body_uppercase.contains(&proxy.ip.to_string())
+                    if ANON_INTEREST.iter().any(|&v| body.contains(v))
+                        || body.contains(&proxy.ip.to_string())
                     {
                         return Some(ProxyRuntimes {
                             inner: Protocol::Http(Anonymity::Anonymous),

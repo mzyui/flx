@@ -4,10 +4,15 @@ mod config;
 
 use core::arch;
 use std::{
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    borrow::Cow,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
+use hashbrown::HashSet;
 use tokio::{sync::Semaphore, task::JoinHandle, time::Instant};
 
 pub use config::Config;
@@ -22,6 +27,9 @@ use crate::{
 
 pub struct ProxyValidator {
     receiver: kanal::Receiver<Proxy>,
+    total: Arc<AtomicUsize>,
+    counter: Arc<AtomicUsize>,
+    timer: Instant,
     is_finished: Arc<AtomicBool>,
 }
 
@@ -29,6 +37,7 @@ pub struct ProxyValidator {
 async fn do_work(
     mut proxy: Proxy,
     sender: kanal::AsyncSender<Proxy>,
+    counter: Arc<AtomicUsize>,
     protocol: Protocol,
     max_attempts: usize,
     timeout: u64,
@@ -52,6 +61,7 @@ async fn do_work(
                 proxy.proxy_type.as_ref().unwrap().protocol
             );
             sender.send(proxy).await.unwrap_or_default();
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -66,14 +76,25 @@ impl ProxyValidator {
             anyhow::bail!("config.types cannot be empty; please specify at least one type.");
         }
 
+        #[cfg(feature = "log")]
+        log::debug!(
+            "Proxy validator started ({} workers)",
+            config.concurrency_limit
+        );
+
         my_ip().await;
 
         let (sender, receiver) = kanal::unbounded_async();
         let validator = Self {
             receiver: receiver.to_sync(),
+            total: Arc::new(AtomicUsize::new(0)),
+            counter: Arc::new(AtomicUsize::new(0)),
+            timer: Instant::now(),
             is_finished: Arc::new(AtomicBool::new(false)),
         };
 
+        let counter = Arc::clone(&validator.counter);
+        let total = Arc::clone(&validator.total);
         let is_finished = Arc::clone(&validator.is_finished);
         tokio::spawn(async move {
             let sem = Arc::new(Semaphore::new(config.concurrency_limit));
@@ -81,6 +102,8 @@ impl ProxyValidator {
                 if is_finished.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
+
+                let mut added = false;
                 while let Some(protocol) = proxy.expected_types.pop() {
                     if config
                         .types
@@ -91,15 +114,20 @@ impl ProxyValidator {
                             _ => protocol == *right_proto,
                         })
                     {
+                        if !added {
+                            total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            added = true;
+                        }
                         let permit = Arc::clone(&sem);
                         let sender = sender.clone();
+                        let counter = Arc::clone(&counter);
                         let max_attempts = config.max_attempts;
                         let timeout = config.request_timeout;
                         let proxy = proxy.clone();
 
                         tokio::spawn(async move {
                             let _ = permit.acquire().await.unwrap();
-                            do_work(proxy, sender, protocol, max_attempts, timeout).await
+                            do_work(proxy, sender, counter, protocol, max_attempts, timeout).await
                         });
                     }
                 }
@@ -130,5 +158,12 @@ impl Drop for ProxyValidator {
     fn drop(&mut self) {
         self.is_finished
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(feature = "log")]
+        log::debug!(
+            "Proxy validator completed: {}/{} proxies validated ({:?})",
+            self.counter.load(std::sync::atomic::Ordering::Acquire),
+            self.total.load(std::sync::atomic::Ordering::Acquire),
+            self.timer.elapsed(),
+        );
     }
 }
