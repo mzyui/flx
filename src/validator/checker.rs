@@ -1,9 +1,7 @@
-#![allow(unused, dead_code)]
-
 use std::time::Duration;
 
-use async_trait::async_trait;
-use fake::{faker::internet::en::UserAgent, Fake};
+use anyhow::Context;
+
 use http_body_util::{BodyExt, Empty};
 use hyper::{
     body::{Bytes, Incoming},
@@ -12,7 +10,7 @@ use hyper::{
 };
 
 use crate::{
-    negotiators::{HttpNegotiator, HttpsNegotiator},
+    negotiators::HttpNegotiator,
     proxy::{
         client::{ProxyClient, ProxyRuntimes},
         models::{Anonymity, Protocol, Proxy},
@@ -51,12 +49,31 @@ static HTTP_JUDGES: [&str; 10] = [
     "http://www2t.biglobe.ne.jp/~take52/test/env.cgi",
 ];
 
+/// Maximum simultaneous requests aimed at a single judge.
+///
+/// With `--max-connections 500` every worker could otherwise hammer the same
+/// judge at once, which gets our IP throttled or banned and turns healthy
+/// proxies into false negatives.
+const MAX_CONCURRENT_PER_JUDGE: usize = 25;
+
+/// One semaphore per entry of [`HTTP_JUDGES`], indexed identically.
+static JUDGE_LIMITS: std::sync::LazyLock<Vec<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        HTTP_JUDGES
+            .iter()
+            .map(|_| tokio::sync::Semaphore::new(MAX_CONCURRENT_PER_JUDGE))
+            .collect()
+    });
+
 async fn to_raw_response(response: Response<Incoming>) -> anyhow::Result<String> {
     let mut content = String::new();
     for (k, v) in response.headers() {
         content.push_str(&k.as_str().to_uppercase());
         content.push_str(": ");
-        content.push_str(v.to_str()?);
+        content.push_str(
+            v.to_str()
+                .with_context(|| format!("response header `{}` is not valid utf-8", k))?,
+        );
         content.push('\n');
     }
     content.push_str("\n\n");
@@ -67,45 +84,90 @@ async fn to_raw_response(response: Response<Incoming>) -> anyhow::Result<String>
     Ok(content)
 }
 
+/// Checks whether the proxy supports plain HTTP by querying public proxy judges.
+///
+/// # Errors
+///
+/// Returns an error only for non-recoverable problems (e.g. the public IP of
+/// this host could not be determined). Per-attempt failures such as connection
+/// refused, timeouts or malformed judge responses are logged and retried, and
+/// exhausting all attempts yields `Ok(None)` instead of an error.
 pub async fn support_http(
     proxy: &mut Proxy,
     timeout: Duration,
     max_attempts: usize,
-) -> Option<ProxyRuntimes<Protocol>> {
-    let useragent = UserAgent().fake::<&str>();
-    for judge_url in HTTP_JUDGES.iter().cycle().take(max_attempts) {
-        if let Ok(req) = Request::get(*judge_url)
+) -> anyhow::Result<Option<ProxyRuntimes<Protocol>>> {
+    let useragent = crate::user_agent::random_user_agent();
+    let my_ip = my_ip()
+        .await
+        .context("cannot determine anonymity level without knowing our own public IP")?;
+
+    for (index, judge_url) in HTTP_JUDGES.iter().enumerate().cycle().take(max_attempts) {
+        // Rate-limit per judge so one host is never overwhelmed.
+        let Ok(_judge_permit) = JUDGE_LIMITS[index].acquire().await else {
+            continue;
+        };
+
+        let req = match Request::get(*judge_url)
             .header(USER_AGENT, useragent)
             .body(Empty::<Bytes>::new())
         {
-            if let Ok(response) = proxy.send_request(req, Some(HttpNegotiator), timeout).await {
-                if !response.inner.status().is_success() {
-                    return None;
-                }
-                if let Ok(body) = to_raw_response(response.inner).await {
-                    if body.contains(&my_ip().await) {
-                        return Some(ProxyRuntimes {
-                            inner: Protocol::Http(Anonymity::Transparent),
-                            runtimes: response.runtimes,
-                        });
-                    }
-
-                    if ANON_INTEREST.iter().any(|&v| body.contains(v))
-                        || body.contains(&proxy.ip.to_string())
-                    {
-                        return Some(ProxyRuntimes {
-                            inner: Protocol::Http(Anonymity::Anonymous),
-                            runtimes: response.runtimes,
-                        });
-                    }
-
-                    return Some(ProxyRuntimes {
-                        inner: Protocol::Http(Anonymity::Elite),
-                        runtimes: response.runtimes,
-                    });
-                }
+            Ok(req) => req,
+            Err(_e) => {
+                #[cfg(feature = "log")]
+                log::trace!("{}: invalid judge request for {}: {}", proxy, judge_url, _e);
+                continue;
             }
+        };
+
+        let response = match proxy.send_request(req, Some(HttpNegotiator), timeout).await {
+            Ok(response) => response,
+            Err(_e) => {
+                #[cfg(feature = "log")]
+                log::trace!("{}: judge {} unreachable: {:#}", proxy, judge_url, _e);
+                continue;
+            }
+        };
+
+        if !response.inner.status().is_success() {
+            #[cfg(feature = "log")]
+            log::trace!(
+                "{}: judge {} returned status {}",
+                proxy,
+                judge_url,
+                response.inner.status()
+            );
+            return Ok(None);
         }
+
+        let body = match to_raw_response(response.inner).await {
+            Ok(body) => body,
+            Err(_e) => {
+                #[cfg(feature = "log")]
+                log::trace!(
+                    "{}: failed to read judge {} response: {:#}",
+                    proxy,
+                    judge_url,
+                    _e
+                );
+                continue;
+            }
+        };
+
+        let anonymity = if body.contains(&my_ip) {
+            Anonymity::Transparent
+        } else if ANON_INTEREST.iter().any(|&v| body.contains(v))
+            || body.contains(&proxy.ip.to_string())
+        {
+            Anonymity::Anonymous
+        } else {
+            Anonymity::Elite
+        };
+
+        return Ok(Some(ProxyRuntimes {
+            inner: Protocol::Http(anonymity),
+            runtimes: response.runtimes,
+        }));
     }
-    None
+    Ok(None)
 }

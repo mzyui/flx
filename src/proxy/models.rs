@@ -2,12 +2,13 @@ use std::{
     borrow::Cow,
     fmt::Display,
     net::Ipv4Addr,
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Serialize, Serializer};
 
-use crate::geolookup::models::GeoData;
+use crate::{error::ProtocolParseError, geolookup::models::GeoData};
 
 /// Represents the level of anonymity of a proxy.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -49,6 +50,34 @@ impl Display for Protocol {
     }
 }
 
+impl FromStr for Protocol {
+    type Err = ProtocolParseError;
+
+    /// Parses a protocol token such as `HTTP`, `HTTP:Elite`, `SOCKS5` or
+    /// `CONNECT:8080`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.split(':');
+        let head = parts.next().unwrap_or_default();
+        match head {
+            "HTTP" => Ok(Protocol::Http(match parts.next() {
+                Some("Transparent") => Anonymity::Transparent,
+                Some("Anonymous") => Anonymity::Anonymous,
+                Some("Elite") => Anonymity::Elite,
+                _ => Anonymity::Unknown,
+            })),
+            "HTTPS" => Ok(Protocol::Https),
+            "SOCKS4" => Ok(Protocol::Socks4),
+            "SOCKS5" => Ok(Protocol::Socks5),
+            "CONNECT" => parts
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+                .map(Protocol::Connect)
+                .ok_or_else(|| ProtocolParseError::InvalidConnectPort(s.to_string())),
+            _ => Err(ProtocolParseError::Unknown(s.to_string())),
+        }
+    }
+}
+
 /// Represents a type of proxy with its protocol and checked status.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyType {
@@ -71,14 +100,17 @@ impl ProxyType {
         }
     }
     /// Creates a new `ProxyType` with the specified protocol. marked as checked
+    ///
+    /// If the system clock is set before the unix epoch the timestamp falls
+    /// back to `0.0` rather than panicking.
     pub fn checked(protocol: Protocol) -> Self {
         Self {
             protocol,
             checked: true,
             checked_on: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
         }
     }
 }

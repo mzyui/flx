@@ -10,6 +10,12 @@ pub struct Config {
     pub enable_geo_lookup: bool,
     /// Filter proxies by ISO country code; if empty, skip filtering (optional).
     pub countries: Vec<String>,
+    /// Skip the fallback (GitHub mirror) providers when the primary providers
+    /// already yielded at least this many proxies.
+    ///
+    /// `None` runs the fallback providers unconditionally — still only after
+    /// every primary provider has finished.
+    pub fallback_threshold: Option<usize>,
 }
 
 impl Default for Config {
@@ -20,6 +26,7 @@ impl Default for Config {
             request_timeout: 3000,
             enable_geo_lookup: true,
             countries: Vec::new(),
+            fallback_threshold: None,
         }
     }
 }

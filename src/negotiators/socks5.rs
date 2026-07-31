@@ -1,8 +1,7 @@
-use std::{io::Cursor, net::Ipv4Addr};
+use std::net::Ipv4Addr;
 
 use async_trait::async_trait;
-use byteorder::BigEndian;
-use byteorder_pack::PackTo;
+use anyhow::Context;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -57,21 +56,22 @@ impl NegotiatorTrait for Socks5Negotiator {
         if response_buf[1] != 0x00 {
             anyhow::bail!("InvalidData: invalid response data");
         }
-        let parts = proxy_host.split(':').collect::<Vec<_>>();
+        let (host, port) = proxy_host
+            .rsplit_once(':')
+            .context("SOCKS5 proxy host must be in `ip:port` form")?;
+        let ip: Ipv4Addr = host
+            .parse()
+            .with_context(|| format!("SOCKS5 host `{}` is not an IPv4 address", host))?;
+        let port: u16 = port
+            .parse()
+            .with_context(|| format!("SOCKS5 port `{}` is invalid", port))?;
 
-        // Prepare the SOCKS5 connection request packet
-        let data = (
-            5u8,
-            1u8,
-            0u8,
-            1u8,
-            parts[0].parse::<Ipv4Addr>()?.octets(),
-            parts[1].parse::<u16>()?,
-        );
-
-        let mut cursor = Cursor::new(Vec::new());
-        data.pack_to::<BigEndian, _>(&mut cursor)?;
-        let connection_packet = cursor.into_inner();
+        // SOCKS5 CONNECT: VER=5, CMD=1, RSV=0, ATYP=1 (IPv4), DST.ADDR,
+        // DST.PORT (big-endian).
+        let mut connection_packet = Vec::with_capacity(10);
+        connection_packet.extend_from_slice(&[5u8, 1u8, 0u8, 1u8]);
+        connection_packet.extend_from_slice(&ip.octets());
+        connection_packet.extend_from_slice(&port.to_be_bytes());
 
         let start_time = Instant::now();
         stream.write_all(&connection_packet).await?;

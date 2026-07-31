@@ -42,7 +42,7 @@ impl NegotiatorTrait for HttpsNegotiator {
             let connect_request = self.generate_connect_request(host);
 
             // Ensure the request uses HTTPS
-            if !uri.scheme().map_or(false, |s| s.as_str() == "https") {
+            if !uri.scheme().is_some_and(|s| s.as_str() == "https") {
                 anyhow::bail!("Scheme is empty or not https");
             }
 

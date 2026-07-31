@@ -1,24 +1,44 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 
-use super::{models::Source, IProxyTrait};
+use super::models::{valid_sources, ScrapeMode, Source};
+use super::ProxyProvider;
+use crate::proxy::models::{Anonymity, Protocol};
 
-/// A provider for fetching proxy lists from free-proxy-list.net.
+/// The "free-proxy-list" family of sites (free-proxy-list.net, sslproxies.org,
+/// us-proxy.org, socks-proxy.net), which all share the same table markup.
 pub struct FreeProxyListProvider;
 
 #[async_trait]
-impl IProxyTrait for FreeProxyListProvider {
+impl ProxyProvider for FreeProxyListProvider {
+    fn name(&self) -> &'static str {
+        "free-proxy-list"
+    }
+
     /// Returns a list of sources from which proxies can be fetched.
-    ///
-    /// # Returns
-    ///
-    /// A vector of `Source` objects representing the proxy sources.
     fn sources(&self) -> Vec<Source> {
-        vec![
-            Source::http("https://www.sslproxies.org/"),
-            Source::http("https://free-proxy-list.net/uk-proxy.html"),
-            Source::http("https://www.us-proxy.org/"),
-            Source::http("https://free-proxy-list.net/"),
-            Source::socks("https://socks-proxy.net/"),
-        ]
+        let sites = [
+            (
+                "https://free-proxy-list.net/",
+                Protocol::Http(Anonymity::Unknown),
+            ),
+            ("https://www.sslproxies.org/", Protocol::Https),
+            ("https://us-proxy.org/", Protocol::Http(Anonymity::Unknown)),
+            ("https://www.socks-proxy.net/", Protocol::Socks4),
+        ];
+
+        valid_sources(
+            sites
+                .into_iter()
+                .map(|(url, protocol)| {
+                    Source::typed(url, protocol).map(|source| {
+                        source
+                            .with_mode(ScrapeMode::HtmlTable)
+                            .with_timeout(Duration::from_secs(15))
+                    })
+                })
+                .collect(),
+        )
     }
 }

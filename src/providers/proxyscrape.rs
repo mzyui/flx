@@ -1,21 +1,41 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 
-use super::models::Source;
-use super::IProxyTrait;
+use super::models::{valid_sources, Source};
+use super::ProxyProvider;
+use crate::proxy::models::{Anonymity, Protocol};
 
-/// A provider for fetching proxy lists from proxyscrape.com.
+/// A provider for fetching proxy lists from the proxyscrape.com API.
 pub struct ProxyscrapeProvider;
 
+/// Per-request timeout, matching the reference implementation.
+const TIMEOUT: Duration = Duration::from_secs(20);
+
 #[async_trait]
-impl IProxyTrait for ProxyscrapeProvider {
+impl ProxyProvider for ProxyscrapeProvider {
+    fn name(&self) -> &'static str {
+        "proxyscrape"
+    }
+
     /// Returns a list of sources from which proxies can be fetched.
-    ///
-    /// # Returns
-    ///
-    /// A vector of `Source` objects representing the proxy sources.
     fn sources(&self) -> Vec<Source> {
-        vec![
-            Source::all("https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=ipport&format=text"),
-        ]
+        valid_sources(vec![
+            Source::typed(
+                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+                Protocol::Http(Anonymity::Unknown),
+            )
+            .map(|s| s.with_timeout(TIMEOUT)),
+            Source::typed(
+                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=all",
+                Protocol::Socks4,
+            )
+            .map(|s| s.with_timeout(TIMEOUT)),
+            Source::typed(
+                "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all",
+                Protocol::Socks5,
+            )
+            .map(|s| s.with_timeout(TIMEOUT)),
+        ])
     }
 }

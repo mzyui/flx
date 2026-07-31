@@ -10,9 +10,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use anyhow::Context;
 #[cfg(feature = "progress_bar")]
 use colored::Colorize;
-use fake::{faker::internet::en::UserAgent, Fake};
 use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Request};
 use hyper_tls::HttpsConnector;
@@ -68,13 +68,14 @@ fn data_dir() -> anyhow::Result<PathBuf> {
         dir.push(env!("CARGO_PKG_NAME"));
 
         if !dir.is_dir() {
-            fs::create_dir(&dir)?;
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create data directory {}", dir.display()))?;
         }
         Ok(dir)
     } else {
         #[cfg(feature = "log")]
         log::warn!("Failed to get local data directory, using current directory instead");
-        Ok(current_dir().unwrap_or_default())
+        current_dir().context("failed to determine current working directory")
     }
 }
 
@@ -93,10 +94,24 @@ pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
 
     let req = Request::builder()
         .uri(GEOLITE_ENDPOINT_URL)
-        .header(hyper::header::USER_AGENT, UserAgent().fake::<&str>())
-        .body(Empty::<Bytes>::new())?;
+        .header(hyper::header::USER_AGENT, crate::user_agent::random_user_agent())
+        .body(Empty::<Bytes>::new())
+        .context("failed to build GeoLite2 download request")?;
 
-    let mut response = client.request(req).await?;
+    let mut response = client.request(req).await.with_context(|| {
+        format!(
+            "failed to download GeoLite2 database from {}",
+            GEOLITE_ENDPOINT_URL
+        )
+    })?;
+
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "GeoLite2 download from {} returned status {}",
+            GEOLITE_ENDPOINT_URL,
+            response.status()
+        );
+    }
 
     #[cfg(feature = "progress_bar")]
     let max_size = if let Some(length) = response.headers().get(hyper::header::CONTENT_LENGTH) {
@@ -118,14 +133,16 @@ pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
         .create(true)
         .truncate(true)
         .write(true)
-        .open(mmdb_path)?;
+        .open(mmdb_path)
+        .with_context(|| format!("failed to create {}", mmdb_path.display()))?;
 
     while let Some(next) = response.frame().await {
-        let frame = next?;
+        let frame = next.context("GeoLite2 download stream interrupted")?;
         if let Some(chunk) = frame.data_ref() {
             #[cfg(feature = "progress_bar")]
             status.progress.fetch_add(chunk.len(), Ordering::Relaxed);
-            file.write_all(chunk)?;
+            file.write_all(chunk)
+                .with_context(|| format!("failed to write to {}", mmdb_path.display()))?;
         }
     }
     Ok(())
@@ -149,14 +166,27 @@ impl GeoLookup {
         if !mmdb_path.exists() {
             #[cfg(feature = "log")]
             log::debug!("Geolite2-city.mmdb does not exist, downloading");
-            download_database(&mmdb_path).await?;
+            download_database(&mmdb_path)
+                .await
+                .context("failed to download the GeoLite2 city database")?;
         }
 
         match Reader::open_readfile(&mmdb_path) {
             Ok(reader) => Ok(Self { reader }),
             Err(e) => {
-                remove_file(mmdb_path)?;
-                anyhow::bail!(e);
+                // The file is corrupt or truncated; drop it so the next run re-downloads.
+                if let Err(_remove_err) = remove_file(&mmdb_path) {
+                    #[cfg(feature = "log")]
+                    log::warn!(
+                        "failed to remove corrupt database {}: {}",
+                        mmdb_path.display(),
+                        _remove_err
+                    );
+                }
+                Err(anyhow::Error::new(e).context(format!(
+                    "failed to open GeoLite2 database {}",
+                    mmdb_path.display()
+                )))
             }
         }
     }

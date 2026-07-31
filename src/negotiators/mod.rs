@@ -27,13 +27,12 @@ pub trait NegotiatorTrait {
     /// # Returns
     ///
     /// A result indicating success or failure of the negotiation.
-    #[allow(unused_variables)] // Allows unused variables for trait methods.
     async fn negotiate(
         &self,
-        stream: &mut TcpStream,
-        runtimes: &mut Vec<f64>,
-        proxy_host: &str,
-        uri: &Uri,
+        _stream: &mut TcpStream,
+        _runtimes: &mut Vec<f64>,
+        _proxy_host: &str,
+        _uri: &Uri,
     ) -> anyhow::Result<()> {
         Ok(())
     }

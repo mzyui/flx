@@ -1,7 +1,6 @@
-use std::{io::Cursor, net::Ipv4Addr};
+use std::net::Ipv4Addr;
 
-use byteorder::BigEndian;
-use byteorder_pack::PackTo;
+use anyhow::Context;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -36,19 +35,24 @@ impl NegotiatorTrait for Socks4Negotiator {
         proxy_host: &str,
         _uri: &Uri,
     ) -> anyhow::Result<()> {
-        let parts = proxy_host.split(':').collect::<Vec<_>>();
+        let (host, port) = proxy_host
+            .rsplit_once(':')
+            .context("SOCKS4 proxy host must be in `ip:port` form")?;
+        let ip: Ipv4Addr = host
+            .parse()
+            .with_context(|| format!("SOCKS4 host `{}` is not an IPv4 address", host))?;
+        let port: u16 = port
+            .parse()
+            .with_context(|| format!("SOCKS4 port `{}` is invalid", port))?;
 
-        // Prepare the SOCKS4 connection request packet
-        let data = (
-            4u8,
-            1u8,
-            parts[1].parse::<u16>()?,
-            parts[0].parse::<Ipv4Addr>()?.octets(),
-            0u8,
-        );
-        let mut cursor = Cursor::new(Vec::new());
-        data.pack_to::<BigEndian, _>(&mut cursor)?;
-        let packet = cursor.into_inner();
+        // SOCKS4 CONNECT request: VN=4, CD=1, DSTPORT (BE), DSTIP, USERID='',
+        // NULL terminator. All multi-byte fields are big-endian.
+        let mut packet = Vec::with_capacity(9);
+        packet.push(4u8); // version
+        packet.push(1u8); // command: CONNECT
+        packet.extend_from_slice(&port.to_be_bytes());
+        packet.extend_from_slice(&ip.octets());
+        packet.push(0u8); // empty USERID, null-terminated
 
         // Send the connection request to the SOCKS4 proxy
         let start_time = Instant::now();

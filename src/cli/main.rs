@@ -1,5 +1,6 @@
 use std::{fs::File, io::Write};
 
+use anyhow::Context;
 use argument::Cli;
 use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
@@ -11,17 +12,21 @@ use fluxy::{
     proxy::models::{Anonymity, Protocol, Proxy},
     ProxySource, ProxyValidator,
 };
+use futures_util::{Stream, StreamExt};
 use tokio::runtime;
 
 mod argument;
 
-fn main() {
-    if let Err(e) = run_application() {
-        eprintln!("Error: {:?}", e);
+fn main() -> std::process::ExitCode {
+    match run_application() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
-#[allow(unused_must_use)]
 fn report_invalid_type_value(value: &str) {
     let mut error = clap::Error::new(ErrorKind::ValueValidation).with_cmd(&Cli::command());
     error.insert(
@@ -32,7 +37,7 @@ fn report_invalid_type_value(value: &str) {
         ContextKind::InvalidValue,
         ContextValue::String(value.to_string()),
     );
-    error.print();
+    let _ = error.print();
 }
 
 fn convert_protocols(types: &[String]) -> Vec<Protocol> {
@@ -71,21 +76,25 @@ fn convert_protocols(types: &[String]) -> Vec<Protocol> {
         .collect()
 }
 
-fn process_result<I>(source: I, options: Cli) -> anyhow::Result<()>
+async fn process_result<S>(source: S, options: Cli) -> anyhow::Result<()>
 where
-    I: Iterator<Item = Proxy>,
+    S: Stream<Item = Proxy>,
 {
-    let mut output_file = options.output_file.map(|file_path| {
-        File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(file_path)
-            .unwrap()
-    });
+    let mut output_file = match options.output_file.as_ref() {
+        Some(file_path) => Some(
+            File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(file_path)
+                .with_context(|| format!("failed to open output file {}", file_path.display()))?,
+        ),
+        None => None,
+    };
 
     let mut found_proxy = false;
-    for (index, proxy) in source.enumerate() {
+    let mut source = std::pin::pin!(source.enumerate());
+    while let Some((index, proxy)) = source.next().await {
         if !found_proxy {
             found_proxy = true;
         }
@@ -108,8 +117,10 @@ where
         };
 
         if let Some(ref mut file) = output_file {
-            file.write_all(output.as_bytes()).unwrap();
-            file.write_all(b"\n").unwrap();
+            file.write_all(output.as_bytes())
+                .context("failed to write proxy to output file")?;
+            file.write_all(b"\n")
+                .context("failed to write newline to output file")?;
         } else {
             println!("{}", output);
         }
@@ -121,7 +132,8 @@ where
 
     if found_proxy && options.format == "json" {
         if let Some(ref mut file) = output_file {
-            file.write_all(b"]")?;
+            file.write_all(b"]")
+                .context("failed to finalize json output file")?;
         } else {
             println!("]");
         }
@@ -145,21 +157,26 @@ fn run_application() -> anyhow::Result<()> {
         initialize_logging(log_level)?;
     }
 
-    let runtime = runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
     runtime.block_on(async {
-        let proxy_source: Box<dyn Iterator<Item = Proxy> + Send + 'static> =
+        let proxy_source: std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send + 'static>> =
             if let Some(file) = &options.file {
-                let source = ProxySource::from_file(file.clone())?;
-                Box::new(source)
+                let source = ProxySource::from_file(file.clone())
+                    .with_context(|| format!("failed to read proxies from {}", file.display()))?;
+                Box::pin(futures_util::stream::iter(source))
             } else {
                 let source = ProxySource::from_fetcher(fluxy::fetcher::Config {
                     request_timeout: options.timeout,
-                    concurrency_limit: 10,
+                    concurrency_limit: options.fetch_concurrency as usize,
                     countries: options.countries.clone(),
                     ..Default::default()
                 })
-                .await?;
-                Box::new(source)
+                .await
+                .context("failed to start proxy fetcher")?;
+                Box::pin(source)
             };
 
         if !options.types.is_empty() {
@@ -176,10 +193,15 @@ fn run_application() -> anyhow::Result<()> {
                     request_timeout: options.timeout,
                 },
             )
-            .await?;
-            process_result(validated_proxies, options)?;
+            .await
+            .context("failed to start proxy validator")?;
+            process_result(validated_proxies, options)
+                .await
+                .context("failed to write results")?;
         } else {
-            process_result(proxy_source, options)?;
+            process_result(proxy_source, options)
+                .await
+                .context("failed to write results")?;
         }
 
         Ok(())

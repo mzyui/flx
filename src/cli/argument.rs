@@ -25,6 +25,13 @@ pub struct Cli {
     #[arg(short, long, default_value = "500", value_parser = clap::value_parser!(u64).range(1..))]
     pub max_connections: u64,
 
+    /// Maximum number of proxy sources fetched concurrently.
+    ///
+    /// Separate from `--max-connections`: fetching touches a few dozen source
+    /// URLs, while validation touches thousands of proxies.
+    #[arg(long, default_value = "25", value_parser = clap::value_parser!(u64).range(1..))]
+    pub fetch_concurrency: u64,
+
     /// Timeout duration in seconds before giving up.
     #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout: u64,

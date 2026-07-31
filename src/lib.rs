@@ -1,4 +1,5 @@
 pub mod fetcher;
+pub mod error;
 pub mod geolookup;
 pub mod negotiators;
 pub mod providers;
@@ -6,6 +7,7 @@ pub mod proxy;
 pub mod validator;
 
 mod resolver;
+mod user_agent;
 
 use fetcher::{Config, ProxyFetcher};
 use proxy::models::{Anonymity, Protocol, Proxy};
@@ -68,7 +70,9 @@ impl ProxySource {
     ///
     /// A result containing the `ProxySource` or an error if the operation fails.
     pub fn from_file(filepath: PathBuf) -> anyhow::Result<Self> {
-        let file = File::open(filepath)?;
+        let file = anyhow::Context::with_context(File::open(&filepath), || {
+            format!("failed to open proxy file {}", filepath.display())
+        })?;
         let buffered_reader = BufReader::new(file);
         let lines = buffered_reader.lines();
 
