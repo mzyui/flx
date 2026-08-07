@@ -2,17 +2,22 @@ pub mod models;
 
 use std::{
     env::current_dir,
-    fmt::{Display, Formatter},
-    fs::{self, remove_file, OpenOptions},
-    io::Write,
+    fs::{self, remove_file},
     net::Ipv4Addr,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+
+#[cfg(feature = "progress_bar")]
+use std::{
+    fmt::{Display, Formatter},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use anyhow::Context;
 #[cfg(feature = "progress_bar")]
 use colored::Colorize;
+use futures_util::{Stream, StreamExt};
 use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Request};
 use hyper_tls::HttpsConnector;
@@ -21,10 +26,143 @@ use maxminddb::{geoip2::City, Reader};
 use models::GeoData;
 #[cfg(feature = "progress_bar")]
 use status_line::StatusLine;
+use tokio::io::AsyncWriteExt;
+#[cfg(feature = "progress_bar")]
 use tokio::time;
 
 const GEOLITE_ENDPOINT_URL: &str =
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb";
+const MAX_DATABASE_SIZE: usize = 128 * 1024 * 1024;
+const DATABASE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+static DOWNLOAD_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn download_lock() -> &'static tokio::sync::Mutex<()> {
+    DOWNLOAD_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut temporary = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("geolite2-city.mmdb");
+    temporary.set_file_name(format!(".{file_name}.part"));
+    temporary
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut lock = path.to_path_buf();
+    lock.set_file_name(format!(
+        ".{}.lock",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("geolite2-city.mmdb")
+    ));
+    lock
+}
+
+async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
+    let lock = lock_path(path);
+    tokio::task::spawn_blocking(move || {
+        use fs2::FileExt;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+            .with_context(|| format!("failed to create {}", lock.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("failed to lock {}", lock.display()))?;
+        Ok(file)
+    })
+    .await
+    .context("GeoLite2 lock task failed")?
+}
+
+async fn write_database_chunks<S, E, P>(
+    mmdb_path: &Path,
+    chunks: S,
+    max_size: usize,
+    deadline: tokio::time::Instant,
+    mut progress: P,
+) -> anyhow::Result<()>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+    P: FnMut(usize),
+{
+    let temporary_path = temporary_path(mmdb_path);
+    let _lock = acquire_download_lock(mmdb_path).await?;
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)
+            .await
+            .with_context(|| format!("failed to create {}", temporary_path.display()))?;
+        let mut downloaded = 0usize;
+        let mut chunks = std::pin::pin!(chunks);
+
+        while let Some(next) = tokio::time::timeout_at(deadline, chunks.next())
+            .await
+            .context("GeoLite2 download body timed out")?
+        {
+            let chunk = next.context("GeoLite2 download stream interrupted")?;
+            downloaded = downloaded
+                .checked_add(chunk.len())
+                .context("GeoLite2 database size overflow")?;
+            if downloaded > max_size {
+                anyhow::bail!(
+                    "GeoLite2 database exceeds maximum size of {} bytes",
+                    max_size
+                );
+            }
+            progress(chunk.len());
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("failed to write to {}", temporary_path.display()))?;
+        }
+
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed to flush {}", temporary_path.display()))?;
+        drop(file);
+        tokio::task::spawn_blocking({
+            let temporary_path = temporary_path.clone();
+            move || Reader::open_readfile(&temporary_path).map(|_| ())
+        })
+        .await
+        .context("GeoLite2 validation task failed")?
+        .context("downloaded GeoLite2 file is not a valid MMDB database")?;
+        tokio::fs::rename(&temporary_path, mmdb_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to atomically install {} as {}",
+                    temporary_path.display(),
+                    mmdb_path.display()
+                )
+            })
+    }
+    .await;
+
+    if result.is_err() {
+        match tokio::fs::remove_file(&temporary_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to remove partial file {}", temporary_path.display())
+                });
+            }
+        }
+    }
+
+    result
+}
 
 #[cfg(feature = "progress_bar")]
 /// Struct to manage and display progress for downloading the GeoLite2 database.
@@ -88,28 +226,47 @@ fn data_dir() -> anyhow::Result<PathBuf> {
 /// # Returns
 ///
 /// A result indicating success or failure.
-pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
+pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
     let https_connector = HttpsConnector::new();
     let client = Client::builder(TokioExecutor::new()).build(https_connector);
 
     let req = Request::builder()
         .uri(GEOLITE_ENDPOINT_URL)
-        .header(hyper::header::USER_AGENT, crate::user_agent::random_user_agent())
+        .header(
+            hyper::header::USER_AGENT,
+            crate::user_agent::random_user_agent(),
+        )
         .body(Empty::<Bytes>::new())
         .context("failed to build GeoLite2 download request")?;
 
-    let mut response = client.request(req).await.with_context(|| {
-        format!(
-            "failed to download GeoLite2 database from {}",
-            GEOLITE_ENDPOINT_URL
-        )
-    })?;
+    let response = tokio::time::timeout_at(deadline, client.request(req))
+        .await
+        .context("GeoLite2 download request timed out")?
+        .with_context(|| {
+            format!(
+                "failed to download GeoLite2 database from {}",
+                GEOLITE_ENDPOINT_URL
+            )
+        })?;
 
     if !response.status().is_success() {
         anyhow::bail!(
             "GeoLite2 download from {} returned status {}",
             GEOLITE_ENDPOINT_URL,
             response.status()
+        );
+    }
+
+    let content_length = response
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    if content_length.is_some_and(|length| length > MAX_DATABASE_SIZE) {
+        anyhow::bail!(
+            "GeoLite2 database exceeds maximum size of {} bytes",
+            MAX_DATABASE_SIZE
         );
     }
 
@@ -129,23 +286,32 @@ pub async fn download_database(mmdb_path: &PathBuf) -> anyhow::Result<()> {
     #[cfg(feature = "progress_bar")]
     status.progress.fetch_add(0, Ordering::Relaxed);
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(mmdb_path)
-        .with_context(|| format!("failed to create {}", mmdb_path.display()))?;
-
-    while let Some(next) = response.frame().await {
-        let frame = next.context("GeoLite2 download stream interrupted")?;
-        if let Some(chunk) = frame.data_ref() {
-            #[cfg(feature = "progress_bar")]
-            status.progress.fetch_add(chunk.len(), Ordering::Relaxed);
-            file.write_all(chunk)
-                .with_context(|| format!("failed to write to {}", mmdb_path.display()))?;
+    let chunks = futures_util::stream::unfold(response, |mut response| async move {
+        loop {
+            match response.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(chunk) = frame.into_data() {
+                        return Some((Ok(chunk), response));
+                    }
+                }
+                Some(Err(error)) => return Some((Err(error), response)),
+                None => return None,
+            }
         }
-    }
-    Ok(())
+    });
+    write_database_chunks(
+        mmdb_path,
+        chunks,
+        MAX_DATABASE_SIZE,
+        deadline,
+        |chunk_size| {
+            #[cfg(feature = "progress_bar")]
+            status.progress.fetch_add(chunk_size, Ordering::Relaxed);
+            #[cfg(not(feature = "progress_bar"))]
+            let _ = chunk_size;
+        },
+    )
+    .await
 }
 
 /// Manages the GeoIP database and provides lookup functionality.
@@ -163,6 +329,7 @@ impl GeoLookup {
         let mut mmdb_path = data_dir()?;
         mmdb_path.set_file_name("geolite2-city.mmdb");
 
+        let _download_guard = download_lock().lock().await;
         if !mmdb_path.exists() {
             #[cfg(feature = "log")]
             log::debug!("Geolite2-city.mmdb does not exist, downloading");
@@ -259,5 +426,87 @@ impl GeoLookup {
                 geodata.city_name = city_names.get("en").map(ToString::to_string);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{temporary_path, write_database_chunks};
+    use futures_util::stream;
+    use hyper::body::Bytes;
+
+    fn test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fluxy_geoip_{name}_{}_{}.mmdb",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[tokio::test]
+    async fn oversized_database_is_rejected_and_partial_file_is_removed() {
+        let path = test_path("oversized");
+        let partial = temporary_path(&path);
+        let chunks = stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"1234")),
+            Ok(Bytes::from_static(b"5678")),
+        ]);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = write_database_chunks(&path, chunks, 6, deadline, |_| {}).await;
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(!partial.exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_database_download_removes_partial_file() {
+        let path = test_path("interrupted");
+        let partial = temporary_path(&path);
+        let chunks = stream::iter([
+            Ok(Bytes::from_static(b"1234")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "interrupted",
+            )),
+        ]);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = write_database_chunks(&path, chunks, 64, deadline, |_| {}).await;
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(!partial.exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_database_is_rejected_before_atomic_install() {
+        let path = test_path("invalid");
+        let partial = temporary_path(&path);
+        let chunks = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+            b"not a maxmind database",
+        ))]);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let result = write_database_chunks(&path, chunks, 64, deadline, |_| {}).await;
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(!partial.exists());
+    }
+
+    #[tokio::test]
+    async fn stalled_database_body_times_out_and_removes_partial_file() {
+        let path = test_path("stalled");
+        let partial = temporary_path(&path);
+        let chunks = stream::pending::<Result<Bytes, std::io::Error>>();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(25);
+
+        let result = write_database_chunks(&path, chunks, 64, deadline, |_| {}).await;
+
+        assert!(format!("{:#}", result.unwrap_err()).contains("body timed out"));
+        assert!(!path.exists());
+        assert!(!partial.exists());
     }
 }

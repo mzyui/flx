@@ -10,6 +10,17 @@ fn get_styles() -> Styles {
         .placeholder(AnsiColor::Cyan.on_default())
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "must be a positive integer".to_owned())?;
+    if parsed == 0 {
+        Err("must be greater than zero".to_owned())
+    } else {
+        Ok(parsed)
+    }
+}
+
 /// Command-line interface definition for the proxy application.
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -73,7 +84,8 @@ pub struct Cli {
     pub output_file: Option<std::path::PathBuf>,
 
     /// Proxy types (protocols) to validate. [possible values: HTTP{:Transparent,
-    /// :Anonymous,:Elite}, HTTPS, SOCKS4, SOCKS5, CONNECT:<port>]
+    /// :Anonymous,:Elite}, HTTPS{:Transparent,:Anonymous,:Elite}, SOCKS4, SOCKS5,
+    /// CONNECT:<port>]
     #[arg(
         short = 't',
         long = "types",
@@ -90,8 +102,44 @@ pub struct Cli {
     #[arg(
         long,
         default_value = "1",
+        value_parser = parse_positive_usize,
         help_heading = "Validate",
         requires("types")
     )]
     pub max_attempts: usize,
+
+    /// Online judges used to validate plain HTTP proxy forwarding.
+    ///
+    /// May be supplied multiple times or as a comma-separated list. Every URL is
+    /// preflighted at startup; those that fail are dropped and the survivors are
+    /// used round-robin. If all fail, the run aborts with a message.
+    #[arg(
+        long,
+        default_value = "http://azenv.net/,http://wfuchs.de/azenv.php,http://proxyjudge.us/,http://shinh.org/env.cgi",
+        value_delimiter = ',',
+        help_heading = "Validate",
+        requires = "types"
+    )]
+    pub http_judge_urls: Vec<String>,
+
+    /// Online HTTPS judges used for HTTPS, CONNECT and SOCKS tunnels.
+    ///
+    /// Same contract as `--http-judge-urls` but reached over a verified TLS
+    /// connection to port 443.
+    #[arg(
+        long,
+        default_value = "https://aranguren.org/azenv.php,https://wfuchs.de/azenv.php",
+        value_delimiter = ',',
+        help_heading = "Validate",
+        requires = "types"
+    )]
+    pub https_judge_urls: Vec<String>,
+
+    /// Disable TLS certificate validation for judge connections.
+    ///
+    /// Off by default. Enable only for self-hosted judges that use self-signed
+    /// certificates; leaving it on for public HTTPS judges lets a MITM on the
+    /// judge path forge validation responses.
+    #[arg(long, default_value_t = false)]
+    pub insecure: bool,
 }

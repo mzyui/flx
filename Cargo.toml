@@ -10,6 +10,7 @@ tokio = { version = "1.41.1", features = [
   "io-util",
   "rt-multi-thread",
   "sync",
+  "fs",
   "net",
   "time",
   "macros",
@@ -22,12 +23,13 @@ colored = { version = "2.1.0", optional = true }
 clap = { version = "4.5.22", optional = true, features = ["derive"] }
 directories = "5.0.1"
 maxminddb = "0.24.0"
-serde = { version = "1.0.215", features = ["derive"] }
+serde = { version = "1.0.215", features = ["derive", "rc"] }
 serde_json = "1.0.133"
 
-tokio-stream = "0.1"
+
 futures-util = "0.3"
 hashbrown = "0.15.2"
+fs2 = "0.4.3"
 hickory-resolver = "0.24"
 
 # request client
@@ -45,6 +47,7 @@ tokio-native-tls = "0.3.1"
 scraper = "0.27.0"
 regex = "1.13.1"
 base64 = "0.23.0"
+url = "2.5"
 
 [lib]
 path = "src/lib.rs"
@@ -52,6 +55,12 @@ path = "src/lib.rs"
 [[bin]]
 path = "src/cli/main.rs"
 name = "fluxy"
+required-features = ["clap"]
+
+[[bench]]
+name = "parser_throughput"
+harness = false
+
 
 [features]
 default = ["log", "progress_bar", "clap"]

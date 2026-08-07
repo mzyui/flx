@@ -6,17 +6,176 @@
 //!
 //! Ported from the Node implementation in `mzyui/proxy-list` (engine/src/providers).
 
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, sync::LazyLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use regex::Regex;
 use scraper::{Html, Selector};
-use serde::Deserialize;
+use serde::{
+    de::{
+        DeserializeOwned, DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor,
+    },
+    Deserialize, Deserializer,
+};
 
 use crate::proxy::models::{Anonymity, Protocol};
 
 /// A single parsed row. `protocol` is `None` when the source does not say.
 pub type ParsedProxy = (Ipv4Addr, u16, Option<Protocol>);
+const VISITOR_STOPPED: &str = "fluxy parser visitor stopped";
+
+struct JsonDataSeed<'a, T, F> {
+    visit: &'a mut F,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T, F> DeserializeSeed<'de> for JsonDataSeed<'_, T, F>
+where
+    T: DeserializeOwned,
+    F: FnMut(T) -> bool,
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(JsonRootVisitor {
+            visit: self.visit,
+            marker: std::marker::PhantomData,
+        })
+    }
+}
+
+struct JsonRootVisitor<'a, T, F> {
+    visit: &'a mut F,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T, F> Visitor<'de> for JsonRootVisitor<'_, T, F>
+where
+    T: DeserializeOwned,
+    F: FnMut(T) -> bool,
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object containing a data array")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "data" {
+                map.next_value_seed(JsonRowsSeed {
+                    visit: self.visit,
+                    marker: std::marker::PhantomData,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct JsonRowsSeed<'a, T, F> {
+    visit: &'a mut F,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T, F> DeserializeSeed<'de> for JsonRowsSeed<'_, T, F>
+where
+    T: DeserializeOwned,
+    F: FnMut(T) -> bool,
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(JsonRowsVisitor {
+            visit: self.visit,
+            marker: std::marker::PhantomData,
+        })
+    }
+}
+
+struct JsonRowsVisitor<'a, T, F> {
+    visit: &'a mut F,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T, F> Visitor<'de> for JsonRowsVisitor<'_, T, F>
+where
+    T: DeserializeOwned,
+    F: FnMut(T) -> bool,
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a sequence of proxy rows")
+    }
+
+    fn visit_seq<A>(self, mut rows: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(row) = rows.next_element::<T>()? {
+            if !(self.visit)(row) {
+                return Err(A::Error::custom(VISITOR_STOPPED));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn visit_json_data<T>(body: &str, mut visit: impl FnMut(T) -> bool) -> anyhow::Result<()>
+where
+    T: DeserializeOwned,
+{
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let result = JsonDataSeed::<T, _> {
+        visit: &mut visit,
+        marker: std::marker::PhantomData,
+    }
+    .deserialize(&mut deserializer);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains(VISITOR_STOPPED) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+// ── Compiled-once regexen ──────────────────────────────────────────────
+
+/// Extracts the `code-N` offset from a ProxyNova `String.fromCharCode` clause.
+static RE_PROXYNOVA_OFFSET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"code\s*-\s*(\d+)").unwrap());
+
+/// Matches the `atob("...")` base64 tail in a ProxyNova obfuscated IP.
+static RE_PROXYNOVA_ATOB: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"atob\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)"#).unwrap());
+
+/// Finds every `ip:port` pair in free-form HTML (my-proxy.com).
+static RE_IP_PORT_PAIR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b").unwrap());
+
+/// Decodes `Proxy('base64')` calls inside proxy-list.org rows.
+static RE_PROXY_CALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Proxy\('([A-Za-z0-9+/=]+)'\)").unwrap());
+
+static TABLE_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("table").expect("static table selector is valid"));
+static ROW_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("tr").expect("static row selector is valid"));
+static HEADER_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("th").expect("static header selector is valid"));
+static CELL_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("td").expect("static cell selector is valid"));
 
 /// Maps a protocol label from a source into a [`Protocol`].
 ///
@@ -25,7 +184,7 @@ pub fn protocol_from_str(raw: &str) -> Option<Protocol> {
     let raw = raw.trim().to_ascii_lowercase();
     match raw.as_str() {
         "http" => Some(Protocol::Http(Anonymity::Unknown)),
-        "https" | "ssl" => Some(Protocol::Https),
+        "https" | "ssl" => Some(Protocol::Https(Anonymity::Unknown)),
         "socks4" => Some(Protocol::Socks4),
         "socks5" => Some(Protocol::Socks5),
         _ => None,
@@ -69,17 +228,16 @@ fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
     Some((ip, port))
 }
 
-/// Parses newline-delimited `ip:port` lists.
-pub fn parse_plaintext(body: &str) -> Vec<ParsedProxy> {
-    body.lines()
+/// Visits newline-delimited `ip:port` rows without accumulating an output list.
+pub fn visit_plaintext(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
+    for row in body
+        .lines()
         .filter_map(|line| parse_pair(line).map(|(ip, port)| (ip, port, None)))
-        .collect()
-}
-
-#[derive(Deserialize)]
-struct GeonodeResponse {
-    #[serde(default)]
-    data: Vec<GeonodeRow>,
+    {
+        if !visit(row) {
+            break;
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -93,27 +251,21 @@ struct GeonodeRow {
 /// Parses the GeoNode JSON API.
 ///
 /// A single entry may advertise several protocols; each becomes its own row.
-pub fn parse_geonode(body: &str) -> anyhow::Result<Vec<ParsedProxy>> {
-    let payload: GeonodeResponse = serde_json::from_str(body)?;
-    let mut out = Vec::new();
-    for row in payload.data {
+pub fn visit_geonode(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) -> anyhow::Result<()> {
+    visit_json_data::<GeonodeRow>(body, |row| {
         let (Ok(ip), Ok(port)) = (row.ip.parse::<Ipv4Addr>(), row.port.parse::<u16>()) else {
-            continue;
+            return true;
         };
         if row.protocols.is_empty() {
-            out.push((ip, port, None));
+            return visit((ip, port, None));
         }
         for protocol in &row.protocols {
-            out.push((ip, port, protocol_from_str(protocol)));
+            if !visit((ip, port, protocol_from_str(protocol))) {
+                return false;
+            }
         }
-    }
-    Ok(out)
-}
-
-#[derive(Deserialize)]
-struct ProxyNovaResponse {
-    #[serde(default)]
-    data: Vec<ProxyNovaRow>,
+        true
+    })
 }
 
 #[derive(Deserialize)]
@@ -144,9 +296,8 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
     if let Some(start) = raw.find('[') {
         if let Some(end) = raw[start..].find(']').map(|i| start + i) {
             // The `code-N` offset applied to every entry (defaults to 0).
-            let offset: i64 = Regex::new(r"code\s*-\s*(\d+)")
-                .ok()
-                .and_then(|re| re.captures(raw))
+            let offset: i64 = RE_PROXYNOVA_OFFSET
+                .captures(raw)
                 .and_then(|caps| caps.get(1)?.as_str().parse().ok())
                 .unwrap_or(0);
 
@@ -163,10 +314,7 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
     }
 
     // Trailing `atob("...")` base64 literal.
-    if let Some(caps) = Regex::new(r#"atob\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)"#)
-        .ok()
-        .and_then(|re| re.captures(raw))
-    {
+    if let Some(caps) = RE_PROXYNOVA_ATOB.captures(raw) {
         if let Some(text) = caps
             .get(1)
             .and_then(|m| BASE64.decode(m.as_str()).ok())
@@ -180,22 +328,22 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
 }
 
 /// Parses the ProxyNova JSON API.
-pub fn parse_proxynova(body: &str) -> anyhow::Result<Vec<ParsedProxy>> {
-    let payload: ProxyNovaResponse = serde_json::from_str(body)?;
-    let mut out = Vec::new();
-    for row in payload.data {
+pub fn visit_proxynova(
+    body: &str,
+    mut visit: impl FnMut(ParsedProxy) -> bool,
+) -> anyhow::Result<()> {
+    visit_json_data::<ProxyNovaRow>(body, |row| {
         let Some(ip) = deobfuscate_proxynova_ip(&row.ip) else {
-            continue;
+            return true;
         };
         let port = match &row.port {
             serde_json::Value::String(s) => s.trim().parse::<u16>().ok(),
             serde_json::Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
             _ => None,
         };
-        let Some(port) = port else { continue };
-        out.push((ip, port, Some(Protocol::Http(Anonymity::Unknown))));
-    }
-    Ok(out)
+        let Some(port) = port else { return true };
+        visit((ip, port, Some(Protocol::Http(Anonymity::Unknown))))
+    })
 }
 
 /// Returns the index of the first header cell matching any of `names`.
@@ -206,40 +354,36 @@ fn header_index(header: &[String], names: &[&str]) -> Option<usize> {
     })
 }
 
+fn normalized_text(element: scraper::ElementRef<'_>) -> String {
+    let mut normalized = String::new();
+    for fragment in element.text() {
+        for word in fragment.split_whitespace() {
+            if !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push_str(word);
+        }
+    }
+    normalized
+}
+
 /// Parses the HTML `<table>` markup shared by free-proxy-list.net,
 /// sslproxies.org, us-proxy.org, socks-proxy.net and freeproxy.world.
 ///
 /// Column positions differ between those sites, so columns are located by
 /// header text rather than by fixed index.
-pub fn parse_html_table(body: &str) -> Vec<ParsedProxy> {
+pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
     let document = Html::parse_document(body);
-    let (Ok(table_sel), Ok(tr_sel), Ok(th_sel), Ok(td_sel)) = (
-        Selector::parse("table"),
-        Selector::parse("tr"),
-        Selector::parse("th"),
-        Selector::parse("td"),
-    ) else {
-        return Vec::new();
-    };
 
-    let cell_text = |element: scraper::ElementRef| {
-        element
-            .text()
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-
-    let mut out = Vec::new();
-    for table in document.select(&table_sel) {
+    for table in document.select(&TABLE_SELECTOR) {
         let header: Vec<String> = table
-            .select(&tr_sel)
+            .select(&ROW_SELECTOR)
             .next()
             .map(|row| {
-                let cells: Vec<String> = row.select(&th_sel).map(cell_text).collect();
+                let cells: Vec<String> =
+                    row.select(&HEADER_SELECTOR).map(normalized_text).collect();
                 if cells.is_empty() {
-                    row.select(&td_sel).map(cell_text).collect()
+                    row.select(&CELL_SELECTOR).map(normalized_text).collect()
                 } else {
                     cells
                 }
@@ -252,8 +396,8 @@ pub fn parse_html_table(body: &str) -> Vec<ParsedProxy> {
         let i_https = header_index(&header, &["https"]);
         let i_anon = header_index(&header, &["anonymity"]);
 
-        for row in table.select(&tr_sel) {
-            let cells: Vec<String> = row.select(&td_sel).map(cell_text).collect();
+        for row in table.select(&ROW_SELECTOR) {
+            let cells: Vec<String> = row.select(&CELL_SELECTOR).map(normalized_text).collect();
             if cells.len() < 2 {
                 continue;
             }
@@ -274,7 +418,7 @@ pub fn parse_html_table(body: &str) -> Vec<ParsedProxy> {
             if protocol.is_none() {
                 if let Some(cell) = i_https.and_then(|i| cells.get(i)) {
                     if cell.trim().eq_ignore_ascii_case("yes") {
-                        protocol = Some(Protocol::Https);
+                        protocol = Some(Protocol::Https(Anonymity::Unknown));
                     }
                 }
             }
@@ -285,45 +429,108 @@ pub fn parse_html_table(body: &str) -> Vec<ParsedProxy> {
                 protocol = Some(Protocol::Http(anonymity_from_str(cell)));
             }
 
-            out.push((ip, port, protocol));
+            if !visit((ip, port, protocol)) {
+                return;
+            }
         }
     }
-    out
 }
 
 /// Extracts every `ip:port` pair from free-form HTML (my-proxy.com).
-pub fn parse_regex_pairs(body: &str) -> Vec<ParsedProxy> {
-    let Ok(re) = Regex::new(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b") else {
-        return Vec::new();
-    };
-    re.captures_iter(body)
-        .filter_map(|caps| {
-            let ip = caps.get(1)?.as_str().parse::<Ipv4Addr>().ok()?;
-            let port = caps.get(2)?.as_str().parse::<u16>().ok()?;
-            Some((ip, port, None))
-        })
-        .collect()
+pub fn visit_regex_pairs(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
+    for row in RE_IP_PORT_PAIR.captures_iter(body).filter_map(|caps| {
+        let ip = caps.get(1)?.as_str().parse::<Ipv4Addr>().ok()?;
+        let port = caps.get(2)?.as_str().parse::<u16>().ok()?;
+        Some((ip, port, None))
+    }) {
+        if !visit(row) {
+            break;
+        }
+    }
 }
 
 /// Parses proxy-list.org rows, whose `ip:port` is base64 encoded inside a
 /// `Proxy('...')` call.
-pub fn parse_base64_rows(body: &str) -> Vec<ParsedProxy> {
-    let Ok(re) = Regex::new(r"Proxy\('([A-Za-z0-9+/=]+)'\)") else {
-        return Vec::new();
-    };
-    re.captures_iter(body)
-        .filter_map(|caps| {
-            let decoded = BASE64.decode(caps.get(1)?.as_str()).ok()?;
-            let text = String::from_utf8(decoded).ok()?;
-            let (ip, port) = parse_pair(&text)?;
-            Some((ip, port, None))
-        })
-        .collect()
+pub fn visit_base64_rows(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
+    for row in RE_PROXY_CALL.captures_iter(body).filter_map(|caps| {
+        let decoded = BASE64.decode(caps.get(1)?.as_str()).ok()?;
+        let text = String::from_utf8(decoded).ok()?;
+        let (ip, port) = parse_pair(&text)?;
+        Some((ip, port, None))
+    }) {
+        if !visit(row) {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+fn collect_rows(run: impl FnOnce(&mut dyn FnMut(ParsedProxy) -> bool)) -> Vec<ParsedProxy> {
+    let mut rows = Vec::new();
+    run(&mut |row| {
+        rows.push(row);
+        true
+    });
+    rows
+}
+
+#[cfg(test)]
+fn parse_plaintext(body: &str) -> Vec<ParsedProxy> {
+    collect_rows(|visit| visit_plaintext(body, visit))
+}
+
+#[cfg(test)]
+fn parse_geonode(body: &str) -> anyhow::Result<Vec<ParsedProxy>> {
+    let mut rows = Vec::new();
+    visit_geonode(body, |row| {
+        rows.push(row);
+        true
+    })?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+fn parse_proxynova(body: &str) -> anyhow::Result<Vec<ParsedProxy>> {
+    let mut rows = Vec::new();
+    visit_proxynova(body, |row| {
+        rows.push(row);
+        true
+    })?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+fn parse_html_table(body: &str) -> Vec<ParsedProxy> {
+    collect_rows(|visit| visit_html_table(body, visit))
+}
+
+#[cfg(test)]
+fn parse_regex_pairs(body: &str) -> Vec<ParsedProxy> {
+    collect_rows(|visit| visit_regex_pairs(body, visit))
+}
+
+#[cfg(test)]
+fn parse_base64_rows(body: &str) -> Vec<ParsedProxy> {
+    collect_rows(|visit| visit_base64_rows(body, visit))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geonode_stops_deserializing_after_visitor_closes() {
+        let body = r#"{"data":[{"ip":"192.0.2.1","port":"8080","protocols":["http"]},INVALID]}"#;
+        let mut visited = 0;
+
+        visit_geonode(body, |_| {
+            visited += 1;
+            false
+        })
+        .unwrap();
+
+        assert_eq!(visited, 1);
+    }
 
     #[test]
     fn plaintext_handles_bare_and_annotated_lines() {
@@ -390,7 +597,16 @@ mod tests {
         let parsed = parse_html_table(body);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].1, 8080);
-        assert_eq!(parsed[0].2, Some(Protocol::Https));
+        assert_eq!(parsed[0].2, Some(Protocol::Https(Anonymity::Unknown)));
+    }
+
+    #[test]
+    fn html_cell_text_normalizes_whitespace_without_empty_fragments() {
+        let document =
+            Html::parse_fragment("<table><tr><td>  elite\n <b>proxy</b>\t </td></tr></table>");
+        let cell = document.select(&CELL_SELECTOR).next().unwrap();
+
+        assert_eq!(normalized_text(cell), "elite proxy");
     }
 
     #[test]

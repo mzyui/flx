@@ -1,4 +1,4 @@
-use std::{str::FromStr, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use hyper::Uri;
@@ -38,10 +38,10 @@ pub enum ProviderTier {
 
 /// Represents a source of proxy information, such as a URL and default protocol types.
 pub struct Source {
-    pub url: Uri,                     // URL of the proxy source.
-    pub default_types: Vec<Protocol>, // Default protocol types for the source.
-    pub timeout: Duration,            // Time before giving up on a request.
-    pub mode: ScrapeMode,             // How to parse the response body.
+    pub url: Uri,                       // URL of the proxy source.
+    pub default_types: Arc<[Protocol]>, // Default protocol types, shared across proxies.
+    pub timeout: Duration,              // Time before giving up on a request.
+    pub mode: ScrapeMode,               // How to parse the response body.
 }
 
 impl Source {
@@ -59,7 +59,7 @@ impl Source {
         let types = if types.is_empty() {
             vec![
                 Protocol::Http(Anonymity::Unknown),
-                Protocol::Https,
+                Protocol::Https(Anonymity::Unknown),
                 Protocol::Socks4,
                 Protocol::Socks5,
                 Protocol::Connect(25),
@@ -71,7 +71,7 @@ impl Source {
 
         Ok(Self {
             url: Uri::from_str(url).with_context(|| format!("invalid provider url: {}", url))?,
-            default_types: types,
+            default_types: Arc::from(types.into_boxed_slice()),
             timeout: Duration::from_secs(3),
             mode: ScrapeMode::Plaintext,
         })
@@ -119,7 +119,7 @@ impl Source {
             url,
             vec![
                 Protocol::Http(Anonymity::Unknown),
-                Protocol::Https,
+                Protocol::Https(Anonymity::Unknown),
                 Protocol::Connect(80),
                 Protocol::Connect(25),
             ],
@@ -143,13 +143,12 @@ impl Source {
 pub fn valid_sources(sources: Vec<anyhow::Result<Source>>) -> Vec<Source> {
     sources
         .into_iter()
-        .filter_map(|source| match source {
-            Ok(source) => Some(source),
-            Err(_e) => {
-                #[cfg(feature = "log")]
-                log::warn!("skipping provider source: {:#}", _e);
-                None
+        .filter_map(|source| {
+            #[cfg(feature = "log")]
+            if let Err(error) = &source {
+                log::warn!("skipping provider source: {error:#}");
             }
+            source.ok()
         })
         .collect()
 }

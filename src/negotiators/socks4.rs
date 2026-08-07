@@ -1,5 +1,3 @@
-use std::net::Ipv4Addr;
-
 use anyhow::Context;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -11,59 +9,59 @@ use async_trait::async_trait;
 use hyper::Uri;
 
 use super::NegotiatorTrait;
+use crate::proxy::models::RuntimeStats;
 
 /// A negotiator for SOCKS4 proxies.
 pub struct Socks4Negotiator;
 
 #[async_trait]
 impl NegotiatorTrait for Socks4Negotiator {
-    /// Negotiates a connection with the SOCKS4 proxy.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream`: The TCP stream to negotiate.
-    /// * `proxy`: The proxy being used for the negotiation.
-    /// * `_uri`: The URI to be accessed through the proxy (not used for SOCKS4).
-    ///
-    /// # Returns
-    ///
-    /// A result indicating success or failure of the negotiation.
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        runtimes: &mut Vec<f64>,
-        proxy_host: &str,
-        _uri: &Uri,
+        runtimes: &mut RuntimeStats,
+        _proxy_host: &str,
+        uri: &Uri,
     ) -> anyhow::Result<()> {
-        let (host, port) = proxy_host
-            .rsplit_once(':')
-            .context("SOCKS4 proxy host must be in `ip:port` form")?;
-        let ip: Ipv4Addr = host
-            .parse()
-            .with_context(|| format!("SOCKS4 host `{}` is not an IPv4 address", host))?;
-        let port: u16 = port
-            .parse()
-            .with_context(|| format!("SOCKS4 port `{}` is invalid", port))?;
+        let host = uri.host().context("SOCKS4 target URI has no host")?;
+        let port = uri
+            .port_u16()
+            .or_else(|| match uri.scheme_str() {
+                Some("http") => Some(80),
+                Some("https") => Some(443),
+                _ => None,
+            })
+            .context("SOCKS4 target URI has no port")?;
 
         // SOCKS4 CONNECT request: VN=4, CD=1, DSTPORT (BE), DSTIP, USERID='',
         // NULL terminator. All multi-byte fields are big-endian.
-        let mut packet = Vec::with_capacity(9);
+        let mut packet = Vec::with_capacity(10 + host.len());
         packet.push(4u8); // version
         packet.push(1u8); // command: CONNECT
         packet.extend_from_slice(&port.to_be_bytes());
-        packet.extend_from_slice(&ip.octets());
-        packet.push(0u8); // empty USERID, null-terminated
+        match host.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => {
+                packet.extend_from_slice(&ip.octets());
+                packet.push(0u8);
+            }
+            Err(_) => {
+                packet.extend_from_slice(&[0, 0, 0, 1]);
+                packet.push(0u8);
+                packet.extend_from_slice(host.as_bytes());
+                packet.push(0u8);
+            }
+        }
 
         // Send the connection request to the SOCKS4 proxy
         let start_time = Instant::now();
         stream.write_all(&packet).await?;
-        runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.record(start_time.elapsed().as_secs_f64());
 
         // Read the response from the SOCKS4 proxy
         let mut response = [0u8; 8];
         let start_time = Instant::now();
         stream.read_exact(&mut response).await?;
-        runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.record(start_time.elapsed().as_secs_f64());
 
         // Validate the response
         let mut response_slice = &response[..];

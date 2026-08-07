@@ -5,16 +5,17 @@ use std::{
 };
 
 use anyhow::Context;
-use http_body_util::{BodyExt, Empty};
-use hyper::body::Bytes;
-use hyper_tls::HttpsConnector;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use tokio::time;
-use tokio::sync::OnceCell;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use hickory_resolver::{
     config::{LookupIpStrategy, NameServerConfigGroup, ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
 };
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Bytes;
+use hyper_tls::HttpsConnector;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use tokio::sync::OnceCell;
+use tokio::time;
 
 /// HTTPS endpoints used when DNS-based discovery is unavailable.
 ///
@@ -26,6 +27,53 @@ static HTTP_IP_ENDPOINTS: [&str; 3] = [
 ];
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_IP_BODY_BYTES: usize = 64;
+
+fn parse_ip_body(body: &[u8]) -> anyhow::Result<String> {
+    if body.len() > MAX_IP_BODY_BYTES {
+        anyhow::bail!("public-IP response exceeds {MAX_IP_BODY_BYTES} bytes");
+    }
+    let text = std::str::from_utf8(body).context("public-IP response is not valid UTF-8")?;
+    let ip: IpAddr = text
+        .trim()
+        .parse()
+        .with_context(|| format!("endpoint did not return a valid IP: {text:?}"))?;
+    Ok(ip.to_string())
+}
+
+async fn fetch_ip_endpoint(
+    client: Client<
+        HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        Empty<Bytes>,
+    >,
+    endpoint: &'static str,
+    deadline: time::Instant,
+) -> anyhow::Result<String> {
+    let response = time::timeout_at(deadline, client.get(endpoint.parse()?))
+        .await
+        .with_context(|| format!("request to {endpoint} timed out"))?
+        .with_context(|| format!("request to {endpoint} failed"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("{endpoint} returned status {}", response.status());
+    }
+
+    let mut body = response.into_body();
+    let mut bytes = Vec::with_capacity(32);
+    while let Some(frame) = time::timeout_at(deadline, body.frame())
+        .await
+        .with_context(|| format!("body from {endpoint} timed out"))?
+    {
+        let chunk = frame
+            .with_context(|| format!("body from {endpoint} was interrupted"))?
+            .into_data()
+            .unwrap_or_default();
+        if bytes.len().saturating_add(chunk.len()) > MAX_IP_BODY_BYTES {
+            anyhow::bail!("{endpoint} response exceeds {MAX_IP_BODY_BYTES} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    parse_ip_body(&bytes).with_context(|| format!("invalid response from {endpoint}"))
+}
 
 /// Resolves our public IP over DNS using OpenDNS.
 async fn my_ip_via_dns() -> anyhow::Result<String> {
@@ -69,49 +117,19 @@ async fn my_ip_via_dns() -> anyhow::Result<String> {
 async fn my_ip_via_https() -> anyhow::Result<String> {
     let client =
         Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new());
-
-    let mut last_error = None;
-    for endpoint in HTTP_IP_ENDPOINTS {
-        let result = time::timeout(LOOKUP_TIMEOUT, async {
-            let response = client
-                .get(endpoint.parse()?)
-                .await
-                .with_context(|| format!("request to {} failed", endpoint))?;
-
-            if !response.status().is_success() {
-                anyhow::bail!("{} returned status {}", endpoint, response.status());
-            }
-
-            let body = response
-                .into_body()
-                .collect()
-                .await
-                .with_context(|| format!("failed to read body from {}", endpoint))?
-                .to_bytes();
-
-            let text = String::from_utf8_lossy(&body);
-            let ip: IpAddr = text
-                .trim()
-                .parse()
-                .with_context(|| format!("{} did not return a valid IP: {:?}", endpoint, text))?;
-            Ok::<_, anyhow::Error>(ip.to_string())
-        })
-        .await;
-
+    let deadline = time::Instant::now() + LOOKUP_TIMEOUT;
+    let mut requests = HTTP_IP_ENDPOINTS
+        .into_iter()
+        .map(|endpoint| fetch_ip_endpoint(client.clone(), endpoint, deadline))
+        .collect::<FuturesUnordered<_>>();
+    let mut errors = Vec::new();
+    while let Some(result) = requests.next().await {
         match result {
-            Ok(Ok(ip)) => return Ok(ip),
-            Ok(Err(e)) => last_error = Some(e),
-            Err(_) => {
-                last_error = Some(anyhow::anyhow!(
-                    "{} timed out after {:?}",
-                    endpoint,
-                    LOOKUP_TIMEOUT
-                ))
-            }
+            Ok(ip) => return Ok(ip),
+            Err(error) => errors.push(format!("{error:#}")),
         }
     }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no HTTPS IP endpoint configured")))
+    anyhow::bail!("all HTTPS IP endpoints failed: {}", errors.join("; "))
 }
 
 /// Determines the public IP address of the current host.
@@ -128,10 +146,7 @@ pub async fn my_ip() -> anyhow::Result<String> {
     // Failures are not stored, so a transient outage can be retried. Replaces
     // the `cached` crate with a single `OnceCell`.
     static CACHE: OnceCell<String> = OnceCell::const_new();
-    CACHE
-        .get_or_try_init(resolve_public_ip)
-        .await
-        .cloned()
+    CACHE.get_or_try_init(resolve_public_ip).await.cloned()
 }
 
 /// Performs the actual public-IP discovery, uncached.
@@ -170,5 +185,17 @@ async fn resolve_public_ip() -> anyhow::Result<String> {
             "could not determine public IP; DNS also failed: {:#}",
             dns_error
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_ip_body, MAX_IP_BODY_BYTES};
+
+    #[test]
+    fn public_ip_body_is_bounded_and_validated() {
+        assert_eq!(parse_ip_body(b"203.0.113.7\n").unwrap(), "203.0.113.7");
+        assert!(parse_ip_body(&[b'x'; MAX_IP_BODY_BYTES + 1]).is_err());
+        assert!(parse_ip_body(b"not-an-ip").is_err());
     }
 }

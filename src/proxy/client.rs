@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     fmt::{Debug, Display},
+    sync::LazyLock,
     time::Duration,
 };
 
@@ -16,7 +17,10 @@ use tokio::{net::TcpStream, time};
 
 use async_trait::async_trait;
 
-use crate::{negotiators::NegotiatorTrait, proxy::models::Proxy};
+use crate::{
+    negotiators::NegotiatorTrait,
+    proxy::models::{Proxy, RuntimeStats},
+};
 
 /// How long a background connection task is allowed to keep running after the
 /// response headers arrived, so the body can still be streamed by the caller.
@@ -27,47 +31,58 @@ use crate::{negotiators::NegotiatorTrait, proxy::models::Proxy};
 /// worst case so a stalled peer cannot leak the task forever.
 const CONNECTION_LINGER: Duration = Duration::from_secs(30);
 
-/// Process-wide TLS connector.
+/// One cached TLS connector per `insecure` value.
 ///
-/// Building one loads the system root certificate store, so constructing it
-/// per request (the previous behaviour) repeated that cost for every single
-/// proxy check. The configuration never varies, so one instance is enough.
-static TLS_CONNECTOR: std::sync::LazyLock<anyhow::Result<tokio_native_tls::TlsConnector>> =
-    std::sync::LazyLock::new(|| {
+/// Building a connector loads the system root certificate store, so we must
+/// NOT construct it per request/attempt (the previous behaviour repeated that
+/// cost for every single proxy check). `insecure` only takes two values, so we
+/// build exactly two connectors once and clone the relevant handle on demand.
+/// Cloning a `tokio_native_tls::TlsConnector` is cheap (it wraps an `Arc`).
+static TLS_CONNECTORS: LazyLock<[tokio_native_tls::TlsConnector; 2]> = LazyLock::new(|| {
+    let build = |insecure: bool| -> tokio_native_tls::TlsConnector {
         let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(insecure)
             .build()
-            .context("failed to build TLS connector")?;
-        Ok(tokio_native_tls::TlsConnector::from(connector))
-    });
+            .expect("failed to build TLS connector");
+        tokio_native_tls::TlsConnector::from(connector)
+    };
+    [build(false), build(true)]
+});
 
-/// Returns the shared TLS connector, cloning the cheap handle.
-fn tls_connector() -> anyhow::Result<tokio_native_tls::TlsConnector> {
-    match &*TLS_CONNECTOR {
-        Ok(connector) => Ok(connector.clone()),
-        Err(e) => Err(anyhow::anyhow!("TLS connector unavailable: {:#}", e)),
-    }
+/// Returns a (cached) TLS connector for the requested `insecure` mode.
+///
+/// Certificates are validated by default; `insecure` opts into
+/// `danger_accept_invalid_certs` for self-hosted judges with self-signed certs
+/// (mirrors `prompt.txt` §5 — `--insecure`, default off).
+pub(crate) fn tls_connector(insecure: bool) -> tokio_native_tls::TlsConnector {
+    TLS_CONNECTORS[insecure as usize].clone()
 }
 
 /// Drives a hyper connection to completion in the background.
 ///
 /// The task ends on its own when the connection closes, or after
 /// `linger` if the peer never does.
-fn spawn_connection_driver<F, E>(conn: F, host: Cow<'static, str>, linger: Duration)
+pub(crate) fn spawn_connection_driver<F, E>(
+    conn: F,
+    host: Cow<'static, str>,
+    linger: Duration,
+) -> ConnectionDriver
 where
     F: std::future::Future<Output = Result<(), E>> + Send + 'static,
     E: Display + Send + 'static,
 {
-    tokio::task::spawn(async move {
+    let handle = tokio::task::spawn(async move {
         match time::timeout(linger, conn).await {
             Ok(Ok(())) => {}
-            Ok(Err(_err)) => {
+            Ok(Err(_err)) =>
+            {
                 #[cfg(feature = "log")]
                 if log::max_level().eq(&log::LevelFilter::Trace) {
                     log::error!("{}: Connection error: {}", host, _err);
                 }
             }
-            Err(_elapsed) => {
+            Err(_elapsed) =>
+            {
                 #[cfg(feature = "log")]
                 if log::max_level().eq(&log::LevelFilter::Trace) {
                     log::trace!("{}: Connection closed after linger timeout", host);
@@ -76,17 +91,37 @@ where
         }
         let _ = host;
     });
+    ConnectionDriver { handle }
 }
 
 #[derive(Debug)]
+pub struct ConnectionDriver {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ConnectionDriver {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// A value together with the timing samples collected while obtaining it.
+#[derive(Debug)]
 pub struct ProxyRuntimes<T> {
     pub inner: T,
-    pub runtimes: Vec<f64>,
+    pub runtimes: RuntimeStats,
+    pub driver: Option<ConnectionDriver>,
 }
 
 impl<T> ProxyRuntimes<T> {
+    /// Merges the collected timing samples into `proxy.runtimes`.
     pub fn apply(&self, proxy: &mut Proxy) {
-        proxy.runtimes.extend_from_slice(&self.runtimes);
+        // RuntimeStats is not additive across independent connect/negotiate/…
+        // phases, so we record the aggregate instead of individual samples.
+        let avg = self.runtimes.avg();
+        if avg > 0.0 {
+            proxy.runtimes.record(avg);
+        }
     }
 }
 
@@ -98,9 +133,7 @@ pub trait ProxyClient {
     ///
     /// # Returns
     ///
-    /// A tuple containing a `TcpStream` if the connection is successful,
-    /// and an array with the elapsed time in seconds as `f64`.
-    /// If the connection fails, it returns an error.
+    /// A `ProxyRuntimes<TcpStream>` with the connect latency recorded.
     async fn connect_timeout(
         &mut self,
         timeout: Duration,
@@ -109,19 +142,20 @@ pub trait ProxyClient {
         self.log_trace("Starting TCP connection");
 
         let host = self.host();
-        let tcp_stream = time::timeout(timeout, TcpStream::connect(host.to_string()))
+        let tcp_stream = time::timeout(timeout, TcpStream::connect(host.as_ref()))
             .await
             .with_context(|| format!("timed out connecting to {} after {:?}", host, timeout))?
             .with_context(|| format!("failed to connect to {}", host))?;
-        // Measured *after* the await: sampling before it recorded ~0s and made
-        // every latency statistic meaningless.
-        let elapsed_time = start_time.elapsed();
-        let runtimes = vec![elapsed_time.as_secs_f64()];
-        self.log_trace(format!("Connected in {:?}", elapsed_time));
+        let elapsed_time = start_time.elapsed().as_secs_f64();
+        self.log_trace(format!("Connected in {:.3}s", elapsed_time));
+
+        let mut runtimes = RuntimeStats::default();
+        runtimes.record(elapsed_time);
 
         Ok(ProxyRuntimes {
             inner: tcp_stream,
             runtimes,
+            driver: None,
         })
     }
 
@@ -130,6 +164,7 @@ pub trait ProxyClient {
         req: Request<B>,
         negotiator: Option<N>,
         timeout: Duration,
+        insecure: bool,
     ) -> anyhow::Result<ProxyRuntimes<Response<Incoming>>>
     where
         B: Body + 'static + Debug + Send,
@@ -137,7 +172,15 @@ pub trait ProxyClient {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
         N: NegotiatorTrait + Sync + Send,
     {
-        let tcp = self.connect_timeout(timeout).await?;
+        // Single end-to-end deadline shared across connect, negotiate, and send
+        // so `--timeout N` bounds the whole request, not each phase separately
+        // (which previously allowed up to 3×N).
+        let deadline = time::Instant::now() + timeout;
+
+        let remaining = deadline
+            .checked_duration_since(time::Instant::now())
+            .context("proxy request timed out before TCP connect")?;
+        let tcp = self.connect_timeout(remaining).await?;
         let mut stream = tcp.inner;
         let mut runtimes = tcp.runtimes;
 
@@ -145,95 +188,101 @@ pub trait ProxyClient {
 
         if let Some(negotiator) = negotiator {
             let proxy_host = self.host();
-            negotiator
-                .negotiate(&mut stream, &mut runtimes, &proxy_host, req.uri())
-                .await
-                .with_context(|| format!("failed to negotiate with proxy {}", proxy_host))?;
+            let remaining = deadline
+                .checked_duration_since(time::Instant::now())
+                .with_context(|| format!("proxy negotiation with {} timed out", proxy_host))?;
+            time::timeout(
+                remaining,
+                negotiator.negotiate(&mut stream, &mut runtimes, &proxy_host, req.uri()),
+            )
+            .await
+            .with_context(|| format!("proxy negotiation with {} timed out", proxy_host))?
+            .with_context(|| format!("failed to negotiate with proxy {}", proxy_host))?;
             use_tls = negotiator.with_tls();
         }
 
+        let remaining = deadline
+            .checked_duration_since(time::Instant::now())
+            .context("proxy request timed out before send")?;
         if use_tls || req.uri().scheme_str().unwrap_or("") == "https" {
-            time::timeout(timeout, self.send_with_tls(req, stream, runtimes))
-                .await
-                .context("timed out sending request over TLS")?
+            time::timeout(
+                remaining,
+                self.send_via_conn(req, stream, runtimes, true, insecure),
+            )
+            .await
+            .context("timed out sending request over TLS")?
         } else {
-            time::timeout(timeout, self.send_without_tls(req, stream, runtimes))
-                .await
-                .context("timed out sending request")?
+            time::timeout(
+                remaining,
+                self.send_via_conn(req, stream, runtimes, false, insecure),
+            )
+            .await
+            .context("timed out sending request")?
         }
     }
 
-    async fn send_with_tls<B>(
+    async fn send_via_conn<B>(
         &mut self,
         req: Request<B>,
         stream: TcpStream,
-        mut runtimes: Vec<f64>,
+        mut runtimes: RuntimeStats,
+        tls: bool,
+        insecure: bool,
     ) -> anyhow::Result<ProxyRuntimes<Response<Incoming>>>
     where
         B: Body + 'static + Debug + Send,
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        self.log_trace("Starting TLS connection");
-        let start_time = time::Instant::now();
-
-        let connector = tls_connector()?;
-
         let host = self.host();
-        let sni_host = host
-            .split(':')
-            .next()
-            .filter(|h| !h.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("proxy host `{}` has no hostname part", host))?;
-        let tls_stream = connector
-            .connect(sni_host, stream)
-            .await
-            .with_context(|| format!("TLS handshake with {} failed", host))?;
-        runtimes.push(start_time.elapsed().as_secs_f64());
-        self.log_trace("TLS connection established successfully");
 
-        let start_time = time::Instant::now();
-        let io = TokioIo::new(tls_stream);
-        let (mut sender, conn) = handshake(io)
-            .await
-            .context("HTTP/1 handshake over TLS failed")?;
-        runtimes.push(start_time.elapsed().as_secs_f64());
+        if tls {
+            self.log_trace("Starting TLS connection");
+            let start_time = time::Instant::now();
 
-        let host = self.host();
-        spawn_connection_driver(conn, host, CONNECTION_LINGER);
+            let connector = tls_connector(insecure);
+            let sni_host = req
+                .uri()
+                .host()
+                .filter(|host| !host.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("request URI `{}` has no target hostname", req.uri())
+                })?;
+            let tls_stream = connector
+                .connect(sni_host, stream)
+                .await
+                .with_context(|| format!("TLS handshake with {} failed", host))?;
+            runtimes.record(start_time.elapsed().as_secs_f64());
+            self.log_trace("TLS connection established successfully");
 
-        self.log_trace(format!("Sending request: {:?}", req));
-        let start_time = time::Instant::now();
-        let response = sender
-            .send_request(req)
-            .await
-            .context("failed to send request over TLS connection")?;
-        runtimes.push(start_time.elapsed().as_secs_f64());
+            let start_time = time::Instant::now();
+            let io = TokioIo::new(tls_stream);
+            let (mut sender, conn) = handshake(io)
+                .await
+                .context("HTTP/1 handshake over TLS failed")?;
+            runtimes.record(start_time.elapsed().as_secs_f64());
+            let driver = spawn_connection_driver(conn, host, CONNECTION_LINGER);
 
-        Ok(ProxyRuntimes {
-            inner: response,
-            runtimes,
-        })
-    }
+            self.log_trace(format!("Sending request: {:?}", req));
+            let start_time = time::Instant::now();
+            let response = sender
+                .send_request(req)
+                .await
+                .context("failed to send request over TLS connection")?;
+            runtimes.record(start_time.elapsed().as_secs_f64());
 
-    async fn send_without_tls<B>(
-        &mut self,
-        req: Request<B>,
-        stream: TcpStream,
-        mut runtimes: Vec<f64>,
-    ) -> anyhow::Result<ProxyRuntimes<Response<Incoming>>>
-    where
-        B: Body + 'static + Debug + Send,
-        B::Data: Send,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
+            return Ok(ProxyRuntimes {
+                inner: response,
+                runtimes,
+                driver: Some(driver),
+            });
+        }
+
         let start_time = time::Instant::now();
         let io = TokioIo::new(stream);
         let (mut sender, conn) = handshake(io).await.context("HTTP/1 handshake failed")?;
-        runtimes.push(start_time.elapsed().as_secs_f64());
-
-        let host = self.host();
-        spawn_connection_driver(conn, host, CONNECTION_LINGER);
+        runtimes.record(start_time.elapsed().as_secs_f64());
+        let driver = spawn_connection_driver(conn, host, CONNECTION_LINGER);
 
         self.log_trace(format!("Sending request: {:?}", req));
         let start_time = time::Instant::now();
@@ -241,45 +290,41 @@ pub trait ProxyClient {
             .send_request(req)
             .await
             .context("failed to send request to proxy")?;
-        runtimes.push(start_time.elapsed().as_secs_f64());
+        runtimes.record(start_time.elapsed().as_secs_f64());
 
         Ok(ProxyRuntimes {
             inner: response,
             runtimes,
+            driver: Some(driver),
         })
     }
 
     /// Logs a trace message.
-    ///
-    /// # Arguments
-    ///
-    /// * `msg`: The message to log.
-    fn log_trace<S>(&self, msg: S)
+    fn log_trace<S>(&self, _msg: S)
     where
         S: Display,
     {
         #[cfg(feature = "log")]
-        log::trace!("{}: {}", self.host(), msg);
+        log::trace!("{}: {}", self.host(), _msg);
     }
 
     /// Logs an error message.
-    ///
-    /// # Arguments
-    ///
-    /// * `msg`: The message to log as an error.
-    fn log_error<S>(&self, msg: S)
+    fn log_error<S>(&self, _msg: S)
     where
         S: Display,
     {
         #[cfg(feature = "log")]
         if log::max_level().eq(&log::LevelFilter::Trace) {
-            log::error!("{}: {}", self.host(), msg);
+            log::error!("{}: {}", self.host(), _msg);
         }
     }
 }
 
 impl ProxyClient for Proxy {
     fn host(&self) -> Cow<'static, str> {
-        self.as_text()
+        // `text` is already a precomputed `ip:port` String (see Proxy::new),
+        // so cloning it is a single allocation-free-of-formatting copy — far
+        // cheaper than re-formatting on every connection attempt.
+        Cow::Owned(self.as_text().to_owned())
     }
 }

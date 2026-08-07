@@ -71,7 +71,7 @@ static SOURCES: [(&str, Protocol); 31] = [
     ),
     (
         "iplocate/free-proxy-list/main/protocols/https.txt",
-        Protocol::Https,
+        Protocol::Https(Anonymity::Unknown),
     ),
     (
         "iplocate/free-proxy-list/main/protocols/socks4.txt",
@@ -89,7 +89,7 @@ static SOURCES: [(&str, Protocol); 31] = [
     ("zloi-user/hideip.me/main/socks5.txt", Protocol::Socks5),
     (
         "roosterkid/openproxylist/main/HTTPS_RAW.txt",
-        Protocol::Https,
+        Protocol::Https(Anonymity::Unknown),
     ),
     (
         "roosterkid/openproxylist/main/SOCKS4_RAW.txt",

@@ -13,6 +13,8 @@ pub use socks4::Socks4Negotiator;
 pub use socks5::Socks5Negotiator;
 use tokio::net::TcpStream;
 
+use crate::proxy::models::RuntimeStats;
+
 /// Trait defining the negotiation behavior for different proxy types.
 #[async_trait]
 pub trait NegotiatorTrait {
@@ -21,7 +23,8 @@ pub trait NegotiatorTrait {
     /// # Arguments
     ///
     /// * `stream`: The TCP stream to negotiate.
-    /// * `proxy`: The proxy being used for the negotiation.
+    /// * `runtimes`: Running timing statistics, updated with each phase.
+    /// * `proxy_host`: The proxy address (ip:port).
     /// * `uri`: The URI to be accessed through the proxy.
     ///
     /// # Returns
@@ -30,7 +33,7 @@ pub trait NegotiatorTrait {
     async fn negotiate(
         &self,
         _stream: &mut TcpStream,
-        _runtimes: &mut Vec<f64>,
+        _runtimes: &mut RuntimeStats,
         _proxy_host: &str,
         _uri: &Uri,
     ) -> anyhow::Result<()> {
@@ -38,41 +41,27 @@ pub trait NegotiatorTrait {
     }
 
     /// Determines if the negotiator requires TLS.
-    ///
-    /// # Returns
-    ///
-    /// A boolean indicating whether TLS is required.
     fn with_tls(&self) -> bool {
         false
     }
 
     /// Logs a trace message.
-    ///
-    /// # Arguments
-    ///
-    /// * `proxy`: The proxy associated with the log message.
-    /// * `msg`: The message to log.
-    fn log_trace<S>(&self, proxy_host: &str, msg: S)
+    fn log_trace<S>(&self, _proxy_host: &str, _msg: S)
     where
         S: Display,
     {
         #[cfg(feature = "log")]
-        log::trace!("{}: {}", proxy_host, msg);
+        log::trace!("{}: {}", _proxy_host, _msg);
     }
 
     /// Logs an error message.
-    ///
-    /// # Arguments
-    ///
-    /// * `proxy`: The proxy associated with the error message.
-    /// * `msg`: The message to log as an error.
-    fn log_error<S>(&self, proxy_host: &str, msg: S)
+    fn log_error<S>(&self, _proxy_host: &str, _msg: S)
     where
         S: Display,
     {
         #[cfg(feature = "log")]
         if log::max_level().eq(&log::LevelFilter::Trace) {
-            log::error!("{}: {}", proxy_host, msg);
+            log::error!("{}: {}", _proxy_host, _msg);
         }
     }
 }

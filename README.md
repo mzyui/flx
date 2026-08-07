@@ -9,7 +9,8 @@
 #### Example 📝
 
 > [!NOTE]
-> On the first use, Fluxy automatically downloads **maxminddb** for geo lookup purposes.
+> GeoIP lookup is opt-in. Fluxy downloads the MaxMind database only when a country
+> filter is requested with `--countries`.
 
 Here's the debug output showing the proxy validator process:
 
@@ -35,3 +36,23 @@ fluxy::resolver: DEBUG My IP: 114.10.152.29 (resolved in 47.73877ms)
 fluxy::validator: DEBUG Proxy validator completed: 10/10542 proxies validated (1.281753231s)
 fluxy::fetcher: DEBUG Proxy gathering completed: 19946 proxies found (1.488841769s)
 ```
+
+## Public judge for end-to-end validation
+
+HTTP, HTTPS/CONNECT, SOCKS4, and SOCKS5 validation uses preflighted online judge
+pools. Every candidate must echo Fluxy's unique `X-Fluxy-Token`; unhealthy or
+incompatible candidates are removed before validation starts, and healthy judges
+are selected round-robin.
+
+The built-in defaults work without a local judge binary or shared secret:
+
+```sh
+cargo run --release --bin fluxy -- \
+  -t HTTP HTTPS SOCKS4 SOCKS5 \
+  --timeout 5
+```
+
+Custom pools can be supplied with comma-separated `--http-judge-urls` and
+`--https-judge-urls`. HTTPS certificate validation is enabled by default. Use
+`--insecure` only for an explicitly trusted self-signed judge; HTTP judges do not
+provide transport authentication and should be treated accordingly.

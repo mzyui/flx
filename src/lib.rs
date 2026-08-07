@@ -1,6 +1,7 @@
-pub mod fetcher;
 pub mod error;
+pub mod fetcher;
 pub mod geolookup;
+
 pub mod negotiators;
 pub mod providers;
 pub mod proxy;
@@ -14,6 +15,7 @@ use proxy::models::{Anonymity, Protocol, Proxy};
 use std::{
     fs::File,
     io::{BufReader, Lines},
+    sync::Arc,
 };
 use std::{io::BufRead, net::Ipv4Addr, path::PathBuf};
 pub use validator::ProxyValidator;
@@ -43,7 +45,7 @@ pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
 /// Represents a source of proxy servers, either from a file or a network fetcher.
 pub struct ProxySource {
     lines: Lines<BufReader<File>>,
-    default_proxy_types: Vec<Protocol>,
+    default_proxy_types: Arc<[Protocol]>,
 }
 
 impl ProxySource {
@@ -76,12 +78,15 @@ impl ProxySource {
         let buffered_reader = BufReader::new(file);
         let lines = buffered_reader.lines();
 
-        let default_proxy_types = vec![
-            Protocol::Http(Anonymity::Unknown),
-            Protocol::Https,
-            Protocol::Socks4,
-            Protocol::Socks5,
-        ];
+        let default_proxy_types: Arc<[Protocol]> = Arc::from(
+            vec![
+                Protocol::Http(Anonymity::Unknown),
+                Protocol::Https(Anonymity::Unknown),
+                Protocol::Socks4,
+                Protocol::Socks5,
+            ]
+            .into_boxed_slice(),
+        );
 
         Ok(Self {
             lines,
@@ -105,12 +110,11 @@ impl Iterator for ProxySource {
             let mut parts = line.split(':');
             if let Some(Ok(ip_address)) = parts.next().map(|part| part.parse::<Ipv4Addr>()) {
                 if let Some(Ok(port_number)) = parts.next().map(|part| part.parse::<u16>()) {
-                    let proxy = Proxy {
-                        ip: ip_address,
-                        port: port_number,
-                        expected_types: self.default_proxy_types.clone(),
-                        ..Default::default()
-                    };
+                    let proxy = Proxy::with_expected_types(
+                        ip_address,
+                        port_number,
+                        Arc::clone(&self.default_proxy_types),
+                    );
 
                     return Some(proxy);
                 }

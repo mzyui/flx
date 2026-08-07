@@ -23,7 +23,10 @@ impl ProxyProvider for FreeProxyListProvider {
                 "https://free-proxy-list.net/",
                 Protocol::Http(Anonymity::Unknown),
             ),
-            ("https://www.sslproxies.org/", Protocol::Https),
+            (
+                "https://www.sslproxies.org/",
+                Protocol::Https(Anonymity::Unknown),
+            ),
             ("https://us-proxy.org/", Protocol::Http(Anonymity::Unknown)),
             ("https://www.socks-proxy.net/", Protocol::Socks4),
         ];
