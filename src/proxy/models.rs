@@ -1,5 +1,6 @@
 use std::{
     fmt::Display,
+    io::{Cursor, Write},
     net::Ipv4Addr,
     str::FromStr,
     sync::Arc,
@@ -179,7 +180,7 @@ where
 
 // ── Proxy ─────────────────────────────────────────────────────────────
 
-/// Represents a proxy with its details.
+/// An `ip:port` proxy endpoint enriched with geo data and validation results.
 #[derive(Debug, Clone, Serialize)]
 pub struct Proxy {
     /// IP address of the proxy.
@@ -206,6 +207,11 @@ pub struct Proxy {
 impl Proxy {
     /// Builds a proxy, precomputing its `ip:port` text representation.
     pub fn new(ip: Ipv4Addr, port: u16) -> Self {
+        let mut buf = [0u8; 32];
+        let mut writer = Cursor::new(&mut buf[..]);
+        write!(writer, "{}:{}", ip, port)
+            .expect("`ip:port` always fits in the 32-byte stack buffer");
+        let len = writer.position() as usize;
         Self {
             ip,
             port,
@@ -213,7 +219,7 @@ impl Proxy {
             runtimes: RuntimeStats::default(),
             expected_types: Arc::from([]),
             proxy_type: None,
-            text: Arc::from(format!("{}:{}", ip, port)),
+            text: Arc::from(std::str::from_utf8(&buf[..len]).expect("`ip:port` is always ASCII")),
         }
     }
 
@@ -245,11 +251,7 @@ impl Default for Proxy {
 }
 
 impl Proxy {
-    /// Calculates the average proxy response time.
-    ///
-    /// # Returns
-    ///
-    /// The average response time as a `f64`. Returns 0.0 if no runtimes are recorded.
+    /// Average proxy response time in seconds; `0.0` when no samples exist.
     pub fn avg_response_time(&self) -> f64 {
         self.runtimes.avg()
     }
@@ -259,13 +261,14 @@ impl Proxy {
         &self.text
     }
 
-    /// Converts the proxy details to JSON format.
-    ///
-    /// # Returns
-    ///
-    /// A result containing the JSON string or an error.
+    /// Serializes the proxy as compact JSON.
     pub fn as_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Serializes the proxy as pretty-printed JSON.
+    pub fn as_pretty_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_default()
     }
 }
 
