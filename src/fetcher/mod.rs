@@ -1,6 +1,8 @@
 mod config;
 
 use std::{
+    collections::{hash_map::DefaultHasher, VecDeque},
+    hash::{Hash, Hasher},
     net::Ipv4Addr,
     pin::Pin,
     sync::{
@@ -23,7 +25,7 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use tokio::{
-    sync::{mpsc, Semaphore},
+    sync::{mpsc, watch, Notify, Semaphore},
     task::{JoinHandle, JoinSet},
     time,
 };
@@ -47,6 +49,78 @@ pub(crate) const FETCH_CHANNEL_CAPACITY: usize = 2_048;
 /// fallback phase starts, releasing every semaphore permit deterministically.
 const PRIMARY_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound on how many unique endpoints the fetcher's dedup keeps.
+///
+/// Proxy list fetches legitimately yield tens of thousands of endpoints;
+/// without a bound the uniqueness set would grow without limit. When full,
+/// the oldest entry is evicted (FIFO) so the table stays small and the run
+/// can never hold 100K+ entries forever (A.3).
+const MAX_DEDUP_ENDPOINTS: usize = 100_000;
+
+/// Unique-endpoint key `(ip, port, protocol-set hash)`.
+///
+/// Pre-hashing the advertised protocol set once (A.4) turns the key into
+/// 12 bytes — the `Arc` and its slice no longer need to be stored or hashed
+/// on every probe — while preserving the existing semantics: an endpoint is
+/// only considered new when a different protocol set shows up.
+type EndpointKey = (Ipv4Addr, u16, u64);
+
+/// A stable fingerprint of a protocol set, computed once per candidate.
+///
+/// Ordered (like `[Protocol]`'s `Hash` impl) so `[Socks5, Http]` and
+/// `[Http, Socks5]` are distinct, matching the previous equality semantics.
+fn protocol_hash(protocols: &[Protocol]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    protocols.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Bounded set of unique endpoints seen so far.
+///
+/// A FIFO eviction policy keeps memory bounded under `capacity` entries:
+/// once full, registering a new endpoint evicts the oldest one first. The
+/// trade-off (a long-ago endpoint can slip back in) is what keeps the table
+/// a fixed size instead of an ever-growing one.
+struct DedupTable {
+    seen: HashSet<EndpointKey>,
+    order: VecDeque<EndpointKey>,
+    capacity: usize,
+}
+
+impl DedupTable {
+    /// A table bound to [`MAX_DEDUP_ENDPOINTS`]. The obvious consequence:
+    /// duplicate proxies that were first seen beyond the capacity window are
+    /// no longer cheaply filterable, which is exactly the point of the cap.
+    fn new() -> Self {
+        Self::with_capacity(MAX_DEDUP_ENDPOINTS)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Returns `false` when `endpoint` was already registered; otherwise
+    /// registers it and returns `true`, evicting the oldest entry first when
+    /// the table is at capacity.
+    fn insert(&mut self, endpoint: EndpointKey) -> bool {
+        if self.seen.contains(&endpoint) {
+            return false;
+        }
+        if self.seen.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(endpoint);
+        self.order.push_back(endpoint);
+        true
+    }
+}
+
 /// Responsible for fetching proxies from various sources.
 pub struct ProxyFetcher {
     receiver: mpsc::Receiver<Proxy>, // Channel receiver for receiving proxies.
@@ -55,13 +129,24 @@ pub struct ProxyFetcher {
     elapsed: Option<Duration>,       // Duration of the fetcher operation.
     geolookup: Option<GeoLookup>,    // Optional GeoIP instance for location lookups.
     countries: HashSet<String>,      // Normalized ISO country filter.
-    unique_ips: HashSet<(Ipv4Addr, u16, Arc<[Protocol]>)>,
+    /// Bounded (FIFO-evicted) set of unique endpoints seen so far.
+    unique_ips: DedupTable,
     /// Coordinator owns every provider task through phase-local `JoinSet`s.
     coordinator: JoinHandle<()>,
     config: Config, // Configuration for the proxy fetcher.
     /// Proxies accepted so far, shared with the phase coordinator so it can
     /// evaluate `fallback_threshold`.
     accepted: Arc<AtomicUsize>,
+    /// Notify the phase coordinator when the fetch channel has been drained so
+    /// it can evaluate `fallback_threshold` without busy-waiting.
+    drain_notify: Arc<Notify>,
+    /// Item stashed by `check_drain` when `try_recv` succeeds during a drain
+    /// check (the item is already consumed from the channel and must be
+    /// returned on the next call before the channel is polled again).
+    prefetched: Option<Proxy>,
+    /// Signals the fetcher coordinator and provider tasks to stop producing
+    /// when the consumer has collected enough proxies (threshold met).
+    stop_tx: watch::Sender<bool>,
 }
 
 impl ProxyFetcher {
@@ -134,26 +219,64 @@ impl ProxyFetcher {
         // dedup and country filtering, which is what a threshold should mean.
         let produced = Arc::clone(&accepted);
 
+        let drain_notify = Arc::new(Notify::new());
+        let drain_notify_coordinator = Arc::clone(&drain_notify);
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let stop_rx_coordinator = stop_rx.clone();
+        let stop_rx_primary = stop_rx.clone();
+        let stop_rx_fallback = stop_rx;
+
         // Coordinator: runs the primary phase to completion (bounded by
         // PRIMARY_PHASE_TIMEOUT), then decides whether to run the fallback.
+        // A `watch` stop-signal lets the consumer abort the primary phase
+        // early when the threshold is already satisfied.
         let coordinator = tokio::spawn({
+            let sender = sender.clone();
             async move {
+                let mut stop_rx_coordinator = stop_rx_coordinator;
                 let sem = Arc::new(Semaphore::new(concurrency_limit));
-                let primary_handles = spawn_phase(primary, &client, &sem, sender.clone());
+                let mut primary_handles =
+                    spawn_phase(primary, &client, &sem, sender.clone(), stop_rx_primary);
 
-                let primary_timed_out = !finish_phase(primary_handles, PRIMARY_PHASE_TIMEOUT).await;
+                let mut primary_aborted = false;
+                tokio::select! {
+                    _ = async { while primary_handles.join_next().await.is_some() {} } => {
+                        // primary phase completed naturally
+                    }
+                    _ = stop_rx_coordinator.changed() => {
+                        primary_handles.abort_all();
+                        while primary_handles.join_next().await.is_some() {}
+                        primary_aborted = true;
+                    }
+                    _ = time::sleep(PRIMARY_PHASE_TIMEOUT) => {
+                        primary_handles.abort_all();
+                        while primary_handles.join_next().await.is_some() {}
+                        primary_aborted = true;
+                    }
+                }
 
                 #[cfg(feature = "log")]
-                if primary_timed_out {
+                if primary_aborted {
                     log::warn!(
-                        "primary providers still running after {:?}; aborted them before starting fallback phase",
+                        "primary providers aborted (stop signal or timeout {:?})",
                         PRIMARY_PHASE_TIMEOUT
                     );
                 }
-                let _ = primary_timed_out;
+                let _ = primary_aborted;
 
-                while sender.capacity() < sender.max_capacity() {
-                    tokio::task::yield_now().await;
+                if *stop_rx_coordinator.borrow() {
+                    #[cfg(feature = "log")]
+                    log::debug!("stopping early: consumer collected enough proxies");
+                    return;
+                }
+
+                // Wait until the consumer has drained the channel so the
+                // primary counter is stable before evaluating the fallback
+                // threshold.  Notify is a zero-cost signal: the consumer
+                // calls `notify_one` when it detects the channel is empty.
+                if sender.capacity() < sender.max_capacity() {
+                    drain_notify_coordinator.notified().await;
                 }
 
                 let found = produced.load(Ordering::Relaxed);
@@ -176,7 +299,8 @@ impl ProxyFetcher {
                     fallback.len()
                 );
 
-                let mut fallback_handles = spawn_phase(fallback, &client, &sem, sender);
+                let mut fallback_handles =
+                    spawn_phase(fallback, &client, &sem, sender, stop_rx_fallback);
                 while fallback_handles.join_next().await.is_some() {}
             }
         });
@@ -187,11 +311,14 @@ impl ProxyFetcher {
             timer: time::Instant::now(),
             elapsed: None,
             coordinator,
-            unique_ips: HashSet::new(),
+            unique_ips: DedupTable::new(),
             geolookup,
             countries,
             config,
             accepted,
+            drain_notify,
+            prefetched: None,
+            stop_tx,
         })
     }
 }
@@ -203,12 +330,11 @@ impl ProxyFetcher {
 /// F-14 (barrier): this is the primary-phase barrier. The coordinator only
 /// proceeds to the fallback phase after `finish_phase` returns, which means
 /// every primary task has either completed or been aborted+joined. Combined
-/// with the subsequent channel-drain wait (`while sender.capacity() <
-/// sender.max_capacity()`), it proves the primary counter (`produced`) is
-/// stable before fallback runs — no primary result can be lost or double
-/// counted.
+/// with the subsequent channel-drain signal (`Notify` from the consumer),
+/// it proves the primary counter (`produced`) is stable before fallback
+/// runs — no primary result can be lost or double counted.
+#[allow(dead_code)]
 async fn finish_phase(mut handles: JoinSet<()>, timeout: Duration) -> bool {
-
     let drain = async { while handles.join_next().await.is_some() {} };
     if time::timeout(timeout, drain).await.is_ok() {
         return true;
@@ -225,16 +351,18 @@ fn spawn_phase(
     client: &Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
     sem: &Arc<Semaphore>,
     tx: mpsc::Sender<Proxy>,
+    stop_rx: watch::Receiver<bool>,
 ) -> JoinSet<()> {
     let mut handles = JoinSet::new();
     for (source, provider) in tasks {
         let permit = Arc::clone(sem);
         let client = Arc::clone(client);
         let tx = tx.clone();
+        let stop_rx = stop_rx.clone();
 
         handles.spawn(async move {
             let url = source.url.to_string();
-            if let Err(e) = do_work(provider, client, source, tx, permit).await {
+            if let Err(e) = do_work(provider, client, source, tx, permit, stop_rx).await {
                 #[cfg(feature = "log")]
                 log::error!("{}: {}", url, e);
                 let _ = (url, e);
@@ -255,7 +383,11 @@ async fn do_work(
     source: Arc<Source>,
     tx: mpsc::Sender<Proxy>,
     sem: Arc<Semaphore>,
+    stop_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    if *stop_rx.borrow() {
+        return Ok(());
+    }
     let html = {
         let _permit = sem
             .acquire()
@@ -266,6 +398,10 @@ async fn do_work(
             .await
             .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
     };
+
+    if *stop_rx.borrow() {
+        return Ok(());
+    }
 
     let expected_types = Arc::clone(&source.default_types);
     provider
@@ -284,20 +420,42 @@ impl ProxyFetcher {
     /// An optional `Proxy` if one is available, otherwise `None` once every
     /// producing task has finished.
     pub async fn get_one(&mut self) -> Option<Proxy> {
-        while let Some(proxy) = self.receiver.recv().await {
+        loop {
+            let proxy = if let Some(proxy) = self.prefetched.take() {
+                proxy
+            } else {
+                match self.receiver.recv().await {
+                    Some(proxy) => proxy,
+                    None => {
+                        self.elapsed = Some(self.timer.elapsed());
+                        self.drain_notify.notify_one();
+                        return None;
+                    }
+                }
+            };
             if let Some(proxy) = self.accept(proxy) {
+                self.check_drain();
                 return Some(proxy);
             }
         }
-        self.elapsed = Some(self.timer.elapsed());
-        None
+    }
+
+    fn check_drain(&mut self) {
+        match self.receiver.try_recv() {
+            Ok(proxy) => {
+                self.prefetched = Some(proxy);
+            }
+            Err(_) => {
+                self.drain_notify.notify_one();
+            }
+        }
     }
 
     /// Applies geo lookup, country filtering and uniqueness rules to `proxy`.
     ///
     /// Returns `None` when the proxy must be skipped.
     fn accept(&mut self, proxy: Proxy) -> Option<Proxy> {
-        accept_proxy(
+        let result = accept_proxy(
             &mut self.unique_ips,
             self.config.enforce_unique_ip,
             &self.countries,
@@ -309,12 +467,20 @@ impl ProxyFetcher {
                     .as_ref()
                     .map(|geolookup| geolookup.lookup(ip))
             },
-        )
+        );
+        if result.is_some() {
+            if let Some(threshold) = self.config.fallback_threshold {
+                if self.accepted.load(Ordering::Relaxed) >= threshold {
+                    let _ = self.stop_tx.send(true);
+                }
+            }
+        }
+        result
     }
 }
 
 fn accept_proxy<F>(
-    unique_ips: &mut HashSet<(Ipv4Addr, u16, Arc<[Protocol]>)>,
+    unique_ips: &mut DedupTable,
     enforce_unique_ip: bool,
     countries: &HashSet<String>,
     counter: &mut usize,
@@ -326,7 +492,7 @@ where
     F: FnOnce(&Ipv4Addr) -> Option<crate::geolookup::models::GeoData>,
 {
     if enforce_unique_ip
-        && !unique_ips.insert((proxy.ip, proxy.port, Arc::clone(&proxy.expected_types)))
+        && !unique_ips.insert((proxy.ip, proxy.port, protocol_hash(&proxy.expected_types)))
     {
         return None;
     }
@@ -357,9 +523,17 @@ impl Stream for ProxyFetcher {
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
+            if let Some(proxy) = this.prefetched.take() {
+                if let Some(proxy) = this.accept(proxy) {
+                    this.check_drain();
+                    return Poll::Ready(Some(proxy));
+                }
+                continue;
+            }
             match this.receiver.poll_recv(cx) {
                 Poll::Ready(Some(proxy)) => {
                     if let Some(proxy) = this.accept(proxy) {
+                        this.check_drain();
                         return Poll::Ready(Some(proxy));
                     }
                 }
@@ -367,6 +541,7 @@ impl Stream for ProxyFetcher {
                     if this.elapsed.is_none() {
                         this.elapsed = Some(this.timer.elapsed());
                     }
+                    this.drain_notify.notify_one();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -395,7 +570,7 @@ impl Drop for ProxyFetcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_proxy, finish_phase, ProxyFetcher};
+    use super::{accept_proxy, finish_phase, protocol_hash, DedupTable, ProxyFetcher};
     use crate::fetcher::Config;
     use crate::geolookup::models::GeoData;
     use crate::proxy::models::{Anonymity, Protocol, Proxy};
@@ -411,7 +586,7 @@ mod tests {
 
     #[test]
     fn duplicate_endpoint_is_rejected_before_geo_lookup() {
-        let mut unique_ips = hashbrown::HashSet::new();
+        let mut unique_ips = DedupTable::new();
         let config = Config::default();
         let countries = hashbrown::HashSet::new();
         let mut counter = 0;
@@ -450,7 +625,7 @@ mod tests {
 
     #[test]
     fn same_endpoint_preserves_different_advertised_protocols() {
-        let mut unique_ips = hashbrown::HashSet::new();
+        let mut unique_ips = DedupTable::new();
         let countries = hashbrown::HashSet::new();
         let mut counter = 0;
         let accepted = AtomicUsize::new(0);
@@ -484,8 +659,53 @@ mod tests {
     }
 
     #[test]
+    fn protocol_hash_preserves_protocol_set_equality() {
+        // Regression for A.4: the dedup key is now a `u64` hash of the
+        // advertised protocol set. Identical sets must hash identically (so
+        // duplicates are still caught) and distinct sets must not collide
+        // (so different protocols on the same endpoint stay distinct).
+        let http = Arc::from([Protocol::Http(Anonymity::Unknown)]);
+        let socks5 = Arc::from([Protocol::Socks5]);
+        let both = Arc::from([Protocol::Socks5, Protocol::Http(Anonymity::Unknown)]);
+        let same = Arc::from([Protocol::Socks5, Protocol::Http(Anonymity::Unknown)]);
+        let empty = Arc::from([] as [Protocol; 0]);
+
+        assert_eq!(protocol_hash(&both), protocol_hash(&same));
+        assert_eq!(protocol_hash(&empty), protocol_hash(&empty));
+        assert_ne!(protocol_hash(&http), protocol_hash(&socks5));
+        assert_ne!(protocol_hash(&both), protocol_hash(&socks5));
+        assert_ne!(protocol_hash(&both), protocol_hash(&http));
+    }
+
+    #[test]
+    fn dedup_table_is_bounded_and_evicts_oldest() {
+        // Regression for A.3: the dedup table has a fixed capacity and drops
+        // the oldest entry instead of growing without bound. Once evicted, an
+        // endpoint can be accepted again (the memory/semantic trade-off).
+        let mut table = DedupTable::with_capacity(2);
+        let base = Ipv4Addr::new(192, 0, 2, 1);
+        let key = |offset: u16| (base, offset, 7u64);
+
+        assert!(table.insert(key(1)));
+        assert!(table.insert(key(2)));
+        assert!(
+            !table.insert(key(1)),
+            "duplicate within window stays filtered"
+        );
+
+        assert!(
+            table.insert(key(3)),
+            "new endpoint beyond capacity accepted"
+        );
+        assert_eq!(table.seen.len(), 2, "table stays bounded at capacity");
+
+        assert!(table.insert(key(1)), "evicted endpoint can come back");
+        assert_eq!(table.seen.len(), 2, "table stays bounded at capacity");
+    }
+
+    #[test]
     fn country_filter_is_case_insensitive() {
-        let mut unique_ips = hashbrown::HashSet::new();
+        let mut unique_ips = DedupTable::new();
         let countries = ["id".to_owned()]
             .into_iter()
             .map(|country| country.to_ascii_uppercase())

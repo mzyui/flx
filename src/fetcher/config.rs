@@ -1,12 +1,15 @@
-/// Options for configuring the proxy fetching process.
+/// Configuration for the proxy fetching pipeline.
 pub struct Config {
-    /// Ensure each proxy has a unique IP; affects performance.
+    /// Deduplicate proxies that share the same endpoint (ip, port, protocol
+    /// set). Bounded memory cost, so it stays on by default.
     pub enforce_unique_ip: bool,
-    /// Maximum number of concurrent requests to process source URLs.
+    /// Maximum number of source URLs fetched concurrently.
     pub concurrency_limit: usize,
-    /// Perform geo lookup for each proxy; affects performance.
+    /// Whether every accepted proxy receives a GeoIP lookup.
+    ///
+    /// The lookup is off by default because it adds per-proxy I/O.
     pub enable_geo_lookup: bool,
-    /// Filter proxies by ISO country code; if empty, skip filtering (optional).
+    /// ISO country codes to filter accepted proxies by; empty means no filter.
     pub countries: Vec<String>,
     /// Skip the fallback (GitHub mirror) providers when the primary providers
     /// already yielded at least this many proxies.
