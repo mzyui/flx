@@ -116,12 +116,12 @@ pub trait ProxyProvider {
         let mut content = String::new();
         let mut pending = [0u8; 3];
         let mut pending_len = 0usize;
-        let mut visited = HashSet::new();
+        let mut visited: HashSet<url::Url> = HashSet::new();
         let mut redirect_count = 0usize;
         let deadline = time::Instant::now() + timeout;
 
         while let Some((url, previous_url)) = urls.pop_front() {
-            if !visited.insert(url.as_str().to_owned()) {
+            if !visited.insert(url.clone()) {
                 anyhow::bail!("redirect loop detected at {}", url);
             }
             let mut req = Request::builder()
