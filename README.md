@@ -9,8 +9,10 @@
 #### Example 📝
 
 > [!NOTE]
-> GeoIP lookup is opt-in. Fluxy downloads the MaxMind database only when a country
-> filter is requested with `--countries`.
+> GeoIP lookup is opt-in. Fluxy downloads the MaxMind database on first use.
+> `--countries` enables lookup **and** filters by ISO country code;
+> `--with-geo` enables the lookup only, annotating every proxy with its country
+> in the output without filtering.
 
 Here's the debug output showing the proxy validator process:
 

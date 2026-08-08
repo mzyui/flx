@@ -32,6 +32,12 @@ pub struct Cli {
     #[arg(short, long, num_args(1..))]
     pub countries: Vec<String>,
 
+    /// Enable GeoIP lookup so every proxy carries country information in the
+    /// output without filtering by location. Requires downloading GeoLite2-City
+    /// on first use; pair with --countries to also filter.
+    #[arg(long)]
+    pub with_geo: bool,
+
     /// Maximum number of concurrent proxy checks.
     #[arg(short, long, default_value = "500", value_parser = clap::value_parser!(u64).range(1..))]
     pub max_connections: u64,
@@ -71,6 +77,7 @@ pub struct Cli {
             PossibleValue::new("default"),
             PossibleValue::new("text"),
             PossibleValue::new("json"),
+            PossibleValue::new("pretty-json"),
         ])
     )]
     pub format: String,

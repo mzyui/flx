@@ -11,15 +11,87 @@ use fluxy::{
     ProxySource, ProxyValidator,
 };
 use futures_util::{Stream, StreamExt};
+use std::future::Future;
 use tokio::{io::AsyncWriteExt, runtime};
 
 mod argument;
 
+/// Terminal setup that keeps a Ctrl+C from echoing `^C` into the streamed
+/// output. The `^C` character is written by the tty driver (not by fluxy)
+/// when `ECHOCTL` is set; clearing the flag for the duration of the run keeps
+/// the JSON/stream output clean, and `Drop` restores the original settings.
+#[cfg(unix)]
+mod quiet_signal_echo {
+    pub struct QuietSignalEcho {
+        fd: libc::c_int,
+        original: libc::termios,
+    }
+
+    impl QuietSignalEcho {
+        /// Applies the guard to the first of stdin/stdout/stderr that refers
+        /// to a tty. Returns `None` for redirected runs, leaving them alone.
+        pub fn install() -> Option<Self> {
+            let fd = [0, 1, 2]
+                .into_iter()
+                .find(|&fd| unsafe { libc::isatty(fd) } == 1)?;
+
+            let mut original: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+                return None;
+            }
+
+            let mut quiet = original;
+            quiet.c_lflag &= !libc::ECHOCTL;
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+                return None;
+            }
+
+            Some(Self { fd, original })
+        }
+    }
+
+    impl Drop for QuietSignalEcho {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod quiet_signal_echo {
+    pub struct QuietSignalEcho;
+
+    impl QuietSignalEcho {
+        pub fn install() -> Option<Self> {
+            None
+        }
+    }
+}
+
+use quiet_signal_echo::QuietSignalEcho;
+
+/// How the output loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    /// The stream ran to completion (or `--limit` was hit).
+    Finished,
+    /// Ctrl+C interrupted the run; the document was still finalized.
+    Cancelled,
+}
+
 fn main() -> std::process::ExitCode {
+    // Restore the terminal settings before the process leaves, on every path.
+    let _quiet = QuietSignalEcho::install();
     match run_application() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(RunOutcome::Finished) => std::process::ExitCode::SUCCESS,
+        Ok(RunOutcome::Cancelled) => std::process::ExitCode::from(130),
         Err(e) => {
-            eprintln!("Error: {:?}", e);
+            #[cfg(feature = "log")]
+            log::error!("Error: {e:?}");
+            #[cfg(not(feature = "log"))]
+            eprintln!("Error: {e:?}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -86,9 +158,10 @@ fn convert_protocols(types: &[String]) -> Vec<Protocol> {
         .collect()
 }
 
-async fn process_result<S>(source: S, options: Cli) -> anyhow::Result<()>
+async fn process_result<S, C>(source: S, options: Cli, cancel: C) -> anyhow::Result<RunOutcome>
 where
     S: Stream<Item = Proxy>,
+    C: Future<Output = ()>,
 {
     let mut output_file = match options.output_file.as_ref() {
         Some(file_path) => Some(tokio::io::BufWriter::new(
@@ -103,65 +176,129 @@ where
         None => None,
     };
 
+    let json = matches!(options.format.as_str(), "json" | "pretty-json");
     let mut found_proxy = false;
+    let mut cancelled = false;
     let mut source = std::pin::pin!(source.enumerate());
-    let json = options.format == "json";
-    while let Some((index, proxy)) = source.next().await {
-        let should_end = options.limit > 0 && index + 1 >= options.limit;
-        let output = match options.format.as_str() {
-            "text" => proxy.as_text().to_owned(),
-            "json" => {
-                let mut json_output = String::new();
-                // Open the array on the first element and prepend a comma before
-                // every subsequent element, so we never emit a trailing comma and
-                // always close the array cleanly.
-                if index == 0 {
-                    json_output.push_str("[\n  ");
+
+    // When `cancel` resolves (Ctrl+C in the real binary), the run finalizes a
+    // valid JSON document instead of leaving an unterminated array behind.
+    let mut cancel = std::pin::pin!(cancel);
+
+    // Collects the write error, if any, so the document can still be closed
+    // before the error is reported to the caller.
+    let mut write_error: Option<anyhow::Error> = None;
+
+    loop {
+        tokio::select! {
+            _ = &mut cancel => {
+                cancelled = true;
+                break;
+            }
+            item = source.next() => {
+                let Some((index, proxy)) = item else { break };
+                let should_end = options.limit > 0 && index + 1 >= options.limit;
+                let output = match options.format.as_str() {
+                    "text" => {
+                        let mut text = proxy.as_text().to_owned();
+                        text.push('\n');
+                        text
+                    }
+                    "json" => {
+                        let mut json_output = String::new();
+                        if index == 0 {
+                            json_output.push_str("[\n  ");
+                        } else {
+                            json_output.push_str(",\n  ");
+                        }
+                        json_output.push_str(&proxy.as_json());
+                        json_output
+                    }
+                    "pretty-json" => {
+                        let mut json_output = String::new();
+                        if index == 0 {
+                            json_output.push_str("[\n");
+                        } else {
+                            json_output.push_str(",\n");
+                        }
+                        let pretty = proxy.as_pretty_json();
+                        let lines: Vec<&str> = pretty.lines().collect();
+                        let last = lines.len().saturating_sub(1);
+                        for (i, line) in lines.iter().enumerate() {
+                            json_output.push_str("  ");
+                            json_output.push_str(line);
+                            if i < last {
+                                json_output.push('\n');
+                            }
+                        }
+                        json_output
+                    }
+                    _ => format!("{}\n", proxy),
+                };
+
+                if let Some(ref mut file) = output_file {
+                    if let Err(error) = file.write_all(output.as_bytes()).await {
+                        write_error = Some(
+                            anyhow::Error::new(error)
+                                .context("failed to write proxy to output file"),
+                        );
+                        break;
+                    }
                 } else {
-                    json_output.push_str(",\n  ");
+                    print!("{output}");
                 }
-                json_output.push_str(&proxy.as_json());
-                json_output
-            }
-            _ => format!("{}", proxy),
-        };
 
-        if let Some(ref mut file) = output_file {
-            file.write_all(output.as_bytes())
-                .await
-                .context("failed to write proxy to output file")?;
-            if json {
-                file.write_all(b"\n")
-                    .await
-                    .context("failed to finalize json output file")?;
-            } else {
-                file.write_all(b"\n")
-                    .await
-                    .context("failed to write newline to output file")?;
+                found_proxy = true;
+                if should_end {
+                    break;
+                }
             }
-        } else {
-            println!("{}{}", output, if json { "\n" } else { "" });
-        }
-
-        found_proxy = true;
-        if should_end {
-            break;
         }
     }
 
     if json {
-        if found_proxy {
-            // Close the array on its own line.
-            write_output(&mut output_file, "]\n").await?;
+        // Finalizing is best-effort: an interrupted or failing run must still
+        // yield valid JSON, but a failure here is only interesting when nothing
+        // else already went wrong.
+        if write_error.is_none() {
+            write_error = finalize_json_output(&mut output_file, found_proxy)
+                .await
+                .err();
         } else {
-            // No proxies: valid empty JSON array on a single line.
-            write_output(&mut output_file, "[]\n").await?;
+            let _ = finalize_json_output(&mut output_file, found_proxy).await;
         }
     }
     if let Some(file) = output_file.as_mut() {
-        file.flush().await.context("failed to flush output file")?;
+        let _ = file.flush().await;
     }
-    Ok(())
+    // Flush stdout explicitly so a cancelled/failed run still delivers the
+    // final bytes (e.g. the closing `]`) before we exit or report an error.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+
+    if cancelled {
+        // Ctrl+C: the document above has been finalized; report the
+        // interruption so `main` can exit with the conventional SIGINT status
+        // (128 + 2) after the terminal settings have been restored on drop.
+        return Ok(RunOutcome::Cancelled);
+    }
+
+    match write_error {
+        Some(error) => Err(error),
+        None => Ok(RunOutcome::Finished),
+    }
+}
+
+/// Writes the closing part of the JSON document: `]` after the collected
+/// entries (on its own line) or a single-line `[]` when nothing was found.
+/// Runs even when the stream was interrupted or errored, so consumers never
+/// receive an unterminated array.
+async fn finalize_json_output(
+    output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
+    found_proxy: bool,
+) -> anyhow::Result<()> {
+    let close = if found_proxy { "\n]\n" } else { "[]\n" };
+    write_output(output_file, close).await
 }
 
 /// Writes `content` to the output file if present, otherwise to stdout.
@@ -182,13 +319,13 @@ async fn write_output(
 fn fetcher_config(options: &Cli) -> fluxy::fetcher::Config {
     fluxy::fetcher::Config {
         concurrency_limit: options.fetch_concurrency as usize,
-        enable_geo_lookup: !options.countries.is_empty(),
+        enable_geo_lookup: options.with_geo || !options.countries.is_empty(),
         countries: options.countries.clone(),
         ..Default::default()
     }
 }
 
-fn run_application() -> anyhow::Result<()> {
+fn run_application() -> anyhow::Result<RunOutcome> {
     let options = Cli::parse();
 
     #[cfg(feature = "log")]
@@ -227,10 +364,18 @@ fn run_application() -> anyhow::Result<()> {
                 Box::pin(source)
             };
 
+        // Ctrl+C (SIGINT): resolved inside `process_result`, which finalizes a
+        // valid JSON document before the process exits. The runtime is built
+        // with `enable_all()` above, so the tokio signal driver is available
+        // here.
+        let cancel = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+
         if !options.types.is_empty() {
             let protocols = convert_protocols(&options.types);
             if protocols.is_empty() {
-                std::process::exit(-1)
+                return Err(anyhow::anyhow!("no valid protocols parsed from --types"));
             }
             let validated_proxies = ProxyValidator::validate(
                 proxy_source,
@@ -246,16 +391,16 @@ fn run_application() -> anyhow::Result<()> {
             )
             .await
             .context("failed to start proxy validator")?;
-            process_result(validated_proxies, options)
+            let outcome = process_result(validated_proxies, options, cancel)
                 .await
                 .context("failed to write results")?;
+            Ok(outcome)
         } else {
-            process_result(proxy_source, options)
+            let outcome = process_result(proxy_source, options, cancel)
                 .await
                 .context("failed to write results")?;
+            Ok(outcome)
         }
-
-        Ok(())
     })
 }
 
@@ -271,6 +416,19 @@ mod tests {
 
         let with_countries = Cli::parse_from(["fluxy", "--countries", "ID"]);
         assert!(fetcher_config(&with_countries).enable_geo_lookup);
+    }
+
+    #[test]
+    fn with_geo_enables_geo_lookup_without_country_filter() {
+        let geo_only = Cli::parse_from(["fluxy", "--with-geo"]);
+        let config = fetcher_config(&geo_only);
+        assert!(config.enable_geo_lookup);
+        assert!(config.countries.is_empty());
+
+        let combined = Cli::parse_from(["fluxy", "--with-geo", "--countries", "ID"]);
+        let config = fetcher_config(&combined);
+        assert!(config.enable_geo_lookup);
+        assert_eq!(config.countries, vec!["ID"]);
     }
 
     #[test]
@@ -352,7 +510,10 @@ mod tests {
         let (cli, path) = cli_with_output("json", limit);
         rt.block_on(async {
             let s = stream::iter(proxies.iter().cloned());
-            process_result(s, cli).await.unwrap();
+            // Tests never cancel: use a future that stays pending.
+            process_result(s, cli, std::future::pending::<()>())
+                .await
+                .unwrap();
         });
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -383,6 +544,26 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed.len(), 3);
         assert!(!out.contains(",]"));
+    }
+
+    #[test]
+    fn json_one_entry_per_line_with_trailing_commas() {
+        // Regression: entries used to leave a blank line and put the comma on
+        // its own removed line. Each proxy must sit on its own line with the
+        // comma at the end of the previous line and `]` alone on the last.
+        let proxies = [sample_proxy(1), sample_proxy(2), sample_proxy(3)];
+        let out = run_json(&proxies, 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 5, "expected [ + entry + entry + entry + ]");
+        assert_eq!(lines[0], "[", "array must open on its own line");
+        assert_eq!(lines[4], "]", "array must close on its own line");
+        for body in &lines[1..4] {
+            assert!(body.starts_with("  {"), "entries must be indented");
+        }
+        assert!(lines[1].ends_with(','));
+        assert!(lines[2].ends_with(','));
+        assert!(!lines[3].ends_with(','), "no comma on the last entry");
+        assert!(!out.contains("\n\n"), "no blank lines between entries");
     }
 
     #[test]
