@@ -21,15 +21,15 @@ pub const DEFAULT_HTTPS_JUDGE_URLS: &[&str] = &[
     "https://wfuchs.de/azenv.php",
 ];
 
-/// Options for configuring the proxy validating process.
+/// Configuration for the proxy validating service.
 pub struct Config {
-    /// Maximum number of concurrent processes.
+    /// Maximum number of proxies validated concurrently.
     pub concurrency_limit: usize,
-    /// Timeout for requests in seconds.
+    /// Per-validation timeout in seconds, shared across the whole check.
     pub request_timeout: u64,
-    /// Filter proxies by protocol; if empty, skip filtering (optional).
+    /// Protocols to validate and match against. Empty disables the validator.
     pub types: Vec<Protocol>,
-    /// Maximum number of attempts to validate a proxy.
+    /// Maximum number of attempts per advertised protocol before giving up.
     pub max_attempts: usize,
     /// Online judges used to validate plain HTTP proxy forwarding.
     ///

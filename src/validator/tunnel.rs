@@ -30,10 +30,14 @@ struct JudgeTarget {
     request_token: String,
 }
 
+/// How far a tunnel probe got before it finished or failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationStatus {
+    /// TCP connection to the proxy succeeded.
     TcpReachable,
+    /// The protocol handshake (CONNECT/SOCKS) completed.
     HandshakePassed,
+    /// A request was carried end-to-end and the judge echoed the token.
     EndToEndPassed,
 }
 
@@ -320,6 +324,8 @@ async fn read_discard(stream: &mut TcpStream, length: usize) -> anyhow::Result<(
     Ok(())
 }
 
+/// Carries the probe request over the tunnel and a TLS leg to the HTTPS judge,
+/// then verifies the bound token was echoed.
 async fn verify_tls_judge(
     stream: TcpStream,
     target: &JudgeTarget,
@@ -708,7 +714,11 @@ mod tests {
         // Regression for F-33: `report_failure` must put a judge on cooldown
         // so `next()` round-robins away from it.
         let targets: Vec<_> = (0..2)
-            .map(|i| std::sync::Arc::new(ValidationTarget::online(&format!("http://{i}.example.com/")).unwrap()))
+            .map(|i| {
+                std::sync::Arc::new(
+                    ValidationTarget::online(&format!("http://{i}.example.com/")).unwrap(),
+                )
+            })
             .collect();
         let pool = JudgePool::from_targets(targets.clone());
         pool.report_failure(&targets[0]);

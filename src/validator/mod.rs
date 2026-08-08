@@ -27,12 +27,21 @@ use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType};
 pub(crate) const VALIDATOR_CHANNEL_MIN: usize = 64;
 pub(crate) const VALIDATOR_CHANNEL_MAX: usize = 4_096;
 
+/// Sizes the bounded result channel from the validator's concurrency.
+///
+/// The buffer is proportional to the worker count so it never becomes a
+/// bottleneck, but is clamped to stay within reason regardless of how large
+/// `concurrency_limit` gets.
 fn validator_channel_capacity(concurrency_limit: usize) -> usize {
     concurrency_limit
         .saturating_mul(4)
         .clamp(VALIDATOR_CHANNEL_MIN, VALIDATOR_CHANNEL_MAX)
 }
 
+/// Validates a stream of proxies and yields the ones that pass.
+///
+/// Consume it with [`ProxyValidator::get_one`] or as a [`Stream`]
+/// ([`futures_util::StreamExt`]).
 pub struct ProxyValidator {
     receiver: mpsc::Receiver<Proxy>,
     #[cfg(feature = "log")]
@@ -154,6 +163,11 @@ impl ProxyValidator {
     ///
     /// The source is an async [`Stream`]; use [`futures_util::stream::iter`] to
     /// feed a plain iterator into it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid or a requested judge
+    /// pool ends up empty after preflight.
     pub async fn validate<S>(proxy_source: S, config: Config) -> anyhow::Result<Self>
     where
         S: Stream<Item = Proxy> + Send + 'static,
@@ -196,7 +210,10 @@ impl ProxyValidator {
             .any(|protocol| !matches!(protocol, Protocol::Http(_)));
 
         let report_dropped = |url: &str, reason: &str| {
-            eprintln!("warning: judge `{url}` failed preflight and was dropped: {reason}");
+            #[cfg(feature = "log")]
+            log::warn!("warning: judge `{url}` failed preflight and was dropped: {reason}");
+            #[cfg(not(feature = "log"))]
+            let _ = (url, reason);
         };
 
         let http_target = if need_http {
@@ -227,11 +244,13 @@ impl ProxyValidator {
         } else {
             None
         };
+        #[cfg(feature = "log")]
         if let Some(pool) = http_target.as_ref() {
-            eprintln!("using {} healthy HTTP judge(s)", pool.len());
+            log::info!("using {} healthy HTTP judge(s)", pool.len());
         }
+        #[cfg(feature = "log")]
         if let Some(pool) = tunnel_target.as_ref() {
-            eprintln!("using {} healthy HTTPS judge(s)", pool.len());
+            log::info!("using {} healthy HTTPS judge(s)", pool.len());
         }
         let targets = JudgeTargets {
             http: http_target

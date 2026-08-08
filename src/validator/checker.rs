@@ -28,6 +28,8 @@ use crate::{
     resolver::my_ip,
 };
 
+/// Header tokens whose appearance in a judge's echoed environment is taken as
+/// evidence that a proxy forwards client- or proxy-internal metadata.
 static ANON_INTEREST: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "X-REAL-IP",
@@ -106,6 +108,10 @@ pub struct ValidationTarget {
 }
 
 impl ValidationTarget {
+    /// Builds a target from a judge URL, minting a fresh request token for it.
+    ///
+    /// The token is bound to this target, so a response cannot be reused
+    /// against a different target (token-replay resistance).
     pub fn online(url: &str) -> anyhow::Result<Self> {
         let uri: hyper::Uri = url
             .parse()
@@ -132,6 +138,12 @@ impl ValidationTarget {
         })
     }
 
+    /// Sends the request token and checks that the judge echoes it back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the judge is unreachable or times out, returns a
+    /// non-success status, or fails to echo the token.
     pub async fn verify_online(&self, timeout: Duration, insecure: bool) -> anyhow::Result<()> {
         use hyper_tls::HttpsConnector;
         use hyper_util::{
@@ -246,6 +258,9 @@ impl JudgePool {
         Arc::clone(&self.judges[start % self.judges.len()])
     }
 
+    /// Healthy judges to try for the next attempt: the round-robin rotation
+    /// minus any judges currently in cooldown. Falls back to a single judge
+    /// when all are cooling down.
     fn candidates(&self) -> Vec<Arc<ValidationTarget>> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let now_ms = self.epoch.elapsed().as_millis() as u64;
@@ -291,6 +306,8 @@ impl JudgePool {
     }
 }
 
+/// Serializes a judge response into a plain-text representation for marker and
+/// anonymity matching: upper-cased headers followed by the bounded body.
 async fn to_raw_response(
     response: Response<Incoming>,
     deadline: time::Instant,
@@ -634,7 +651,10 @@ mod tests {
             .await;
         match &err {
             Ok(()) => {}
-            Err(e) => eprintln!("VERIFY_ERR insecure=true: {e:#}"),
+            #[cfg(feature = "log")]
+            Err(e) => log::error!("VERIFY_ERR insecure=true: {e:#}"),
+            #[cfg(not(feature = "log"))]
+            Err(_) => {}
         }
         assert!(err.is_ok(), "self-signed judge must pass with --insecure");
     }
@@ -651,7 +671,10 @@ mod tests {
             |_, _| {},
         )
         .await;
-        assert!(result.is_err(), "self-signed judge must fail without --insecure");
+        assert!(
+            result.is_err(),
+            "self-signed judge must fail without --insecure"
+        );
     }
 
     #[tokio::test]

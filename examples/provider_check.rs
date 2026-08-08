@@ -17,6 +17,9 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "log")]
+    fluxy::initialize_logging(log::LevelFilter::Debug)?;
+
     let client = Arc::new(
         Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new()),
     );
@@ -39,8 +42,12 @@ async fn main() -> anyhow::Result<()> {
                 Ok(body) => {
                     let types = source.default_types.clone();
                     let mode = source.mode.clone();
-                    if let Err(e) = provider.scrape_with(body, tx.clone(), types, mode).await {
-                        eprintln!("  scrape error {}: {:#}", url, e);
+                    let scrape = provider.scrape_with(body, tx.clone(), types, mode).await;
+                    if let Err(e) = scrape {
+                        #[cfg(feature = "log")]
+                        log::warn!("  scrape error {}: {:#}", url, e);
+                        #[cfg(not(feature = "log"))]
+                        let _ = e;
                     }
                     drop(tx);
                     let mut drained = Vec::new();
@@ -52,13 +59,17 @@ async fn main() -> anyhow::Result<()> {
                         ok += 1;
                     } else {
                         failed += 1;
-                        eprintln!("  ZERO {}", url);
+                        #[cfg(feature = "log")]
+                        log::warn!("  ZERO {}", url);
                     }
                     total += count;
                 }
                 Err(e) => {
                     failed += 1;
-                    eprintln!("  FETCH FAIL {}: {:#}", url, e);
+                    #[cfg(feature = "log")]
+                    log::error!("  FETCH FAIL {}: {:#}", url, e);
+                    #[cfg(not(feature = "log"))]
+                    let _ = e;
                 }
             }
         }
