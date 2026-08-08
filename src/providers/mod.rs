@@ -113,7 +113,9 @@ pub trait ProxyProvider {
         urls.push_back((initial_url, None));
 
         let user_agent = crate::user_agent::random_user_agent();
-        let mut content = Vec::new(); // Accumulate bytes; decode once after all frames.
+        let mut content = String::new();
+        let mut pending = [0u8; 3];
+        let mut pending_len = 0usize;
         let mut visited = HashSet::new();
         let mut redirect_count = 0usize;
         let deadline = time::Instant::now() + timeout;
@@ -176,13 +178,14 @@ pub trait ProxyProvider {
                             MAX_SOURCE_BODY_BYTES
                         );
                     }
-                    content.extend_from_slice(chunk);
+                    append_utf8(&mut content, &mut pending, &mut pending_len, chunk)?;
                 }
             }
         }
-        Ok(Cow::Owned(
-            String::from_utf8(content).context("provider response body is not valid UTF-8")?,
-        ))
+        if pending_len > 0 {
+            anyhow::bail!("provider response body is not valid UTF-8");
+        }
+        Ok(Cow::Owned(content))
     }
 
     /// Scrapes proxies from a response body, using the source's `default_types`.
@@ -242,6 +245,40 @@ pub trait ProxyProvider {
         .context("provider parser task failed")??;
         Ok(())
     }
+}
+
+fn append_utf8(
+    content: &mut String,
+    pending: &mut [u8; 3],
+    pending_len: &mut usize,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let mut combined;
+    let buf: &[u8] = if *pending_len == 0 {
+        bytes
+    } else {
+        combined = Vec::with_capacity(*pending_len + bytes.len());
+        combined.extend_from_slice(&pending[..*pending_len]);
+        combined.extend_from_slice(bytes);
+        &combined
+    };
+    match std::str::from_utf8(buf) {
+        Ok(text) => {
+            content.push_str(text);
+            *pending_len = 0;
+        }
+        Err(e) if e.error_len().is_none() => {
+            content.push_str(
+                std::str::from_utf8(&buf[..e.valid_up_to()])
+                    .expect("valid_up_to() is always a char boundary"),
+            );
+            let tail = &buf[e.valid_up_to()..];
+            pending[..tail.len()].copy_from_slice(tail);
+            *pending_len = tail.len();
+        }
+        Err(_) => anyhow::bail!("provider response body is not valid UTF-8"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
