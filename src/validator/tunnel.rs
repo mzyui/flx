@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Context;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     time,
 };
@@ -193,7 +193,7 @@ async fn probe_once(
     let remaining = deadline
         .checked_duration_since(time::Instant::now())
         .context("tunnel validation timed out before TCP connect")?;
-    let mut stream = proxy.connect_timeout(remaining).await?.inner;
+    let mut stream = BufReader::new(proxy.connect_timeout(remaining).await?.inner);
 
     let mut probe = ProtocolProbe {
         status: ValidationStatus::TcpReachable,
@@ -214,7 +214,7 @@ async fn probe_once(
     probe.advance(ValidationStatus::HandshakePassed);
     let body = time::timeout_at(deadline, async {
         if target.scheme == "https" {
-            verify_tls_judge(stream, &target, insecure).await
+            verify_tls_judge(stream.into_inner(), &target, insecure).await
         } else {
             verify_judge(&mut stream, &target).await
         }
@@ -227,7 +227,7 @@ async fn probe_once(
 }
 
 async fn negotiate_http_connect(
-    stream: &mut TcpStream,
+    stream: &mut BufReader<TcpStream>,
     target: &JudgeTarget,
 ) -> anyhow::Result<()> {
     let authority = target.authority();
@@ -244,7 +244,10 @@ async fn negotiate_http_connect(
     Ok(())
 }
 
-async fn negotiate_socks4(stream: &mut TcpStream, target: &JudgeTarget) -> anyhow::Result<()> {
+async fn negotiate_socks4(
+    stream: &mut BufReader<TcpStream>,
+    target: &JudgeTarget,
+) -> anyhow::Result<()> {
     let ip = target.host.parse::<Ipv4Addr>();
     let mut request = Vec::with_capacity(10 + target.host.len());
     request.extend_from_slice(&[4, 1]);
@@ -271,7 +274,10 @@ async fn negotiate_socks4(stream: &mut TcpStream, target: &JudgeTarget) -> anyho
     Ok(())
 }
 
-async fn negotiate_socks5(stream: &mut TcpStream, target: &JudgeTarget) -> anyhow::Result<()> {
+async fn negotiate_socks5(
+    stream: &mut BufReader<TcpStream>,
+    target: &JudgeTarget,
+) -> anyhow::Result<()> {
     stream.write_all(&[5, 1, 0]).await?;
     let mut method = [0u8; 2];
     stream.read_exact(&mut method).await?;
@@ -318,7 +324,7 @@ async fn negotiate_socks5(stream: &mut TcpStream, target: &JudgeTarget) -> anyho
     read_discard(stream, 2).await
 }
 
-async fn read_discard(stream: &mut TcpStream, length: usize) -> anyhow::Result<()> {
+async fn read_discard(stream: &mut BufReader<TcpStream>, length: usize) -> anyhow::Result<()> {
     let mut bytes = vec![0u8; length];
     stream.read_exact(&mut bytes).await?;
     Ok(())
@@ -369,7 +375,10 @@ async fn verify_tls_judge(
     Ok(body.to_vec())
 }
 
-async fn verify_judge(stream: &mut TcpStream, target: &JudgeTarget) -> anyhow::Result<Vec<u8>> {
+async fn verify_judge(
+    stream: &mut BufReader<TcpStream>,
+    target: &JudgeTarget,
+) -> anyhow::Result<Vec<u8>> {
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nX-Fluxy-Token: {}\r\nConnection: close\r\n\r\n",
         target.path_and_query,
@@ -404,12 +413,18 @@ async fn verify_judge(stream: &mut TcpStream, target: &JudgeTarget) -> anyhow::R
     Ok(response)
 }
 
-async fn read_http_headers(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
-    let mut response = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    while response.len() < MAX_PROXY_RESPONSE_HEADER_BYTES {
-        stream.read_exact(&mut byte).await?;
-        response.push(byte[0]);
+async fn read_http_headers(stream: &mut BufReader<TcpStream>) -> anyhow::Result<Vec<u8>> {
+    let mut response = Vec::with_capacity(16 * 1024);
+    let mut line = Vec::with_capacity(64);
+    loop {
+        line.clear();
+        if stream.read_until(b'\n', &mut line).await? == 0 {
+            break;
+        }
+        if response.len().saturating_add(line.len()) > MAX_PROXY_RESPONSE_HEADER_BYTES {
+            anyhow::bail!("proxy response headers exceed limit");
+        }
+        response.extend_from_slice(&line);
         if response.ends_with(b"\r\n\r\n") {
             return Ok(response);
         }

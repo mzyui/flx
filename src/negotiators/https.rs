@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use hyper::Uri;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncWriteExt},
     net::TcpStream,
     time,
 };
@@ -53,11 +53,18 @@ impl NegotiatorTrait for HttpsNegotiator {
             stream.write_all(connect_request.as_bytes()).await?;
             runtimes.record(start_time.elapsed().as_secs_f64());
 
-            let mut buf = Vec::with_capacity(512);
-            let mut byte = [0u8; 1];
-            while buf.len() < 16 * 1024 {
-                stream.read_exact(&mut byte).await?;
-                buf.push(byte[0]);
+            let mut reader = tokio::io::BufReader::new(&mut *stream);
+            let mut buf = Vec::with_capacity(16 * 1024);
+            let mut line = Vec::with_capacity(64);
+            loop {
+                line.clear();
+                if reader.read_until(b'\n', &mut line).await? == 0 {
+                    break;
+                }
+                if buf.len().saturating_add(line.len()) > 16 * 1024 {
+                    anyhow::bail!("HTTPS proxy response headers exceed limit");
+                }
+                buf.extend_from_slice(&line);
                 if buf.ends_with(b"\r\n\r\n") {
                     break;
                 }
