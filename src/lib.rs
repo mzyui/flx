@@ -20,57 +20,49 @@ use std::{
 use std::{io::BufRead, net::Ipv4Addr, path::PathBuf};
 pub use validator::ProxyValidator;
 
-/// Initializes the logging system for the application.
+/// Initializes the logging system with the requested verbosity.
 ///
-/// This function configures the logging system with the specified verbosity level.
+/// # Errors
 ///
-/// # Arguments
-///
-/// * `log_level`: The desired verbosity level for logging. Determines which log messages will be displayed.
-///
-/// # Returns
-///
-/// A result indicating the success or failure of the logging setup.
+/// Returns an error if the `stderrlog` logger cannot be initialized.
 #[cfg(feature = "log")]
 pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
     #[cfg(feature = "log")]
     stderrlog::new()
-        .module(module_path!()) // Configures the module path for log messages.
-        .show_module_names(true) // Enables module names in log output.
-        .verbosity(log_level) // Sets the specified log verbosity level.
-        .init()?; // Initializes the logger.
+        .module(module_path!())
+        .show_module_names(true)
+        .verbosity(log_level)
+        .init()?;
     Ok(())
 }
 
-/// Represents a source of proxy servers, either from a file or a network fetcher.
+/// Source of proxies to be validated.
+///
+/// Wraps either a plaintext file of `ip:port` lines or an asynchronous
+/// [`ProxyFetcher`] stream, yielding one [`Proxy`] at a time.
 pub struct ProxySource {
     lines: Lines<BufReader<File>>,
     default_proxy_types: Arc<[Protocol]>,
 }
 
 impl ProxySource {
-    /// Creates a new `ProxyFetcher` from the given configuration.
+    /// Starts a [`ProxyFetcher`] fed by every configured provider.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `config`: The configuration to use for fetching proxies.
-    ///
-    /// # Returns
-    ///
-    /// A result containing the `ProxyFetcher` or an error if the operation fails.
+    /// Returns an error when provider fetching cannot be started
+    /// (e.g. invalid configuration or a failed GeoIP setup).
     pub async fn from_fetcher(config: Config) -> anyhow::Result<ProxyFetcher> {
         ProxyFetcher::gather(config).await
     }
 
-    /// Creates a `ProxySource` from a specified file path.
+    /// Builds a `ProxySource` that reads `ip:port` lines from `filepath`.
     ///
-    /// # Arguments
+    /// Each parsed proxy inherits the source-wide default protocol set.
     ///
-    /// * `filepath`: The path to the file containing proxy server information.
+    /// # Errors
     ///
-    /// # Returns
-    ///
-    /// A result containing the `ProxySource` or an error if the operation fails.
+    /// Returns an error if `filepath` cannot be opened.
     pub fn from_file(filepath: PathBuf) -> anyhow::Result<Self> {
         let file = anyhow::Context::with_context(File::open(&filepath), || {
             format!("failed to open proxy file {}", filepath.display())
@@ -98,13 +90,10 @@ impl ProxySource {
 impl Iterator for ProxySource {
     type Item = Proxy;
 
-    /// Retrieves the next proxy from the source.
+    /// Parses the next line into a [`Proxy`], inheriting the source-wide
+    /// default protocol set.
     ///
-    /// This method attempts to parse the next line into a `Proxy` object.
-    ///
-    /// # Returns
-    ///
-    /// An optional `Proxy` if one was successfully parsed, otherwise `None`.
+    /// Returns `None` once no parseable `ip:port` line remains.
     fn next(&mut self) -> Option<Self::Item> {
         for line in self.lines.by_ref().flatten() {
             let mut parts = line.split(':');

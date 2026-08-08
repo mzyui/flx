@@ -18,7 +18,6 @@ impl ProxyProvider for ProxyNovaProvider {
         "proxynova"
     }
 
-    /// Returns a list of sources from which proxies can be fetched.
     fn sources(&self) -> Vec<Source> {
         valid_sources(vec![Source::typed(
             "https://api.proxynova.com/proxylist",

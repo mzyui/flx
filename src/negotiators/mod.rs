@@ -1,3 +1,10 @@
+//! Proxy handshake negotiators.
+//!
+//! Each negotiator implements the transport handshake a given proxy protocol
+//! requires ([`HttpsNegotiator`] and the SOCKS family establish a tunnel or
+//! relay, while plain HTTP needs none). Validation and sending reuse these via
+//! the [`NegotiatorTrait`] bound.
+
 mod http;
 mod https;
 mod socks4;
@@ -15,21 +22,22 @@ use tokio::net::TcpStream;
 
 use crate::proxy::models::RuntimeStats;
 
-/// Trait defining the negotiation behavior for different proxy types.
+/// Handshake behaviour for a proxy protocol class.
 #[async_trait]
 pub trait NegotiatorTrait {
-    /// Negotiates a connection with the proxy.
+    /// Establishes the protocol handshake over the connected `stream`.
     ///
-    /// # Arguments
+    /// # Parameters
     ///
-    /// * `stream`: The TCP stream to negotiate.
-    /// * `runtimes`: Running timing statistics, updated with each phase.
-    /// * `proxy_host`: The proxy address (ip:port).
-    /// * `uri`: The URI to be accessed through the proxy.
+    /// * `stream`: open TCP connection to the proxy.
+    /// * `runtimes`: per-phase latency accumulator updated by the handshake.
+    /// * `proxy_host`: the proxy's `ip:port`, used in diagnostic messages.
+    /// * `uri`: target the caller plans to reach through the proxy.
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// A result indicating success or failure of the negotiation.
+    /// Returns an error when the proxy rejects the handshake, times out, or
+    /// answers with an unexpected protocol.
     async fn negotiate(
         &self,
         _stream: &mut TcpStream,
@@ -40,12 +48,12 @@ pub trait NegotiatorTrait {
         Ok(())
     }
 
-    /// Determines if the negotiator requires TLS.
+    /// Whether the connection must be upgraded to TLS after negotiation.
     fn with_tls(&self) -> bool {
         false
     }
 
-    /// Logs a trace message.
+    /// Emits a `trace`-level log line prefixed with `proxy_host`.
     fn log_trace<S>(&self, _proxy_host: &str, _msg: S)
     where
         S: Display,
@@ -54,7 +62,10 @@ pub trait NegotiatorTrait {
         log::trace!("{}: {}", _proxy_host, _msg);
     }
 
-    /// Logs an error message.
+    /// Emits an `error`-level log line prefixed with `proxy_host`.
+    ///
+    /// Only forwarded when the configured level is `Trace`, so a noisy error
+    /// cannot drown out genuinely higher-priority messages.
     fn log_error<S>(&self, _proxy_host: &str, _msg: S)
     where
         S: Display,

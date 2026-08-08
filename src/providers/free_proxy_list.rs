@@ -16,7 +16,6 @@ impl ProxyProvider for FreeProxyListProvider {
         "free-proxy-list"
     }
 
-    /// Returns a list of sources from which proxies can be fetched.
     fn sources(&self) -> Vec<Source> {
         let sites = [
             (

@@ -70,7 +70,7 @@ pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
     ]
 }
 
-/// Trait defining the behavior of proxy providers.
+/// Contract for fetching proxies from a family of sources.
 #[async_trait]
 pub trait ProxyProvider {
     /// A short, stable identifier used in logs and diagnostics.
@@ -91,19 +91,16 @@ pub trait ProxyProvider {
     /// A vector of `Source` objects representing the proxy sources.
     fn sources(&self) -> Vec<Source>;
 
-    /// Fetches the HTML content from the specified URL.
+    /// Fetches a source's response body, following redirects up to
+    /// `MAX_REDIRECTS` and buffering the UTF-8 content across all frames.
     ///
-    /// This method handles redirects and accumulates the HTML content from all frames.
+    /// The request and every frame share a single `timeout` budget, so a stalled
+    /// body cannot pin a semaphore permit forever.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `client`: The HTTP client used for making requests.
-    /// * `url`: The URL from which to fetch the HTML content.
-    /// * `timeout`: The duration to wait before timing out the request.
-    ///
-    /// # Returns
-    ///
-    /// A result containing the parsed HTML document or an error if the fetch fails.
+    /// Returns an error when the URL is invalid, a redirect loop is detected,
+    /// the body exceeds `MAX_SOURCE_BODY_BYTES`, or the deadline is exceeded.
     async fn fetch(
         &self,
         client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
@@ -188,18 +185,11 @@ pub trait ProxyProvider {
         ))
     }
 
-    /// Scrapes proxy information from the fetched HTML content.
+    /// Scrapes proxies from a response body, using the source's `default_types`.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `html`: The HTML document containing proxy information.
-    /// * `tx`: The channel to send found proxies.
-    /// * `counter`: A counter to track the number of proxies found.
-    /// * `default_types`: Default protocol types for the proxies.
-    ///
-    /// # Returns
-    ///
-    /// A result indicating success or failure of the scraping operation.
+    /// Returns an error when the parsing task fails.
     async fn scrape(
         &self,
         html: Cow<'static, str>,
@@ -212,8 +202,10 @@ pub trait ProxyProvider {
 
     /// Parses a response body according to `mode` and forwards every proxy.
     ///
-    /// When the source reports a per-row protocol it replaces `default_types`
-    /// for that row; otherwise the source defaults apply.
+    /// When a row carries its own protocol it replaces `default_types` for that
+    /// proxy, otherwise the source defaults apply. The parser runs on a
+    /// blocking thread (`spawn_blocking`) so CPU-bound scraping never starves
+    /// the async runtime.
     async fn scrape_with(
         &self,
         body: Cow<'static, str>,

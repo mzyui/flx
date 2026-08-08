@@ -1,12 +1,13 @@
-//! Lightweight User-Agent rotation without external crates.
+//! Dependency-free browser User-Agent rotation.
 //!
-//! Replaces the `fake` crate: we only ever needed a plausible browser UA
-//! string, not a full fake-data generator. A small static pool rotated with an
-//! atomic counter is deterministic, allocation-free and dependency-free.
+//! Replaces the `fake` crate: validation and fetching only ever need a
+//! plausible browser UA string, not a full fake-data generator. A small static
+//! pool rotated with an atomic counter is deterministic, allocation-free and
+//! dependency-free.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A pool of realistic desktop browser User-Agent strings.
+/// Pool of realistic desktop-browser User-Agent strings.
 static USER_AGENTS: [&str; 8] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -20,7 +21,10 @@ static USER_AGENTS: [&str; 8] = [
 
 static CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-/// Returns the next User-Agent from the pool, round-robin.
+/// Returns the next browser User-Agent string from the pool.
+///
+/// Callers may reuse the returned string concurrently; the rotation cursor is
+/// shared and advanced atomically.
 pub fn random_user_agent() -> &'static str {
     let index = CURSOR.fetch_add(1, Ordering::Relaxed) % USER_AGENTS.len();
     USER_AGENTS[index]

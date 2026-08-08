@@ -105,7 +105,8 @@ impl Drop for ConnectionDriver {
     }
 }
 
-/// A value together with the timing samples collected while obtaining it.
+/// The result of establishing a connection: the connected value plus the
+/// latency samples collected on the way.
 #[derive(Debug)]
 pub struct ProxyRuntimes<T> {
     pub inner: T,

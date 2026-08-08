@@ -1,16 +1,19 @@
 use serde::Serialize;
 
-/// Contains geographical data related to a proxy.
+/// Geographic data resolved for a proxy IP address.
+///
+/// Every field is optional: the MaxMind database does not cover all addresses,
+/// and a lookup may legitimately produce a partial record.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct GeoData {
-    /// ISO country code.
+    /// Two-letter ISO 3166 country code (e.g. `ID`).
     pub iso_code: Option<String>,
-    /// Country name.
+    /// English country name.
     pub name: Option<String>,
-    /// ISO code for the region.
+    /// ISO code of the first-level region (e.g. US state).
     pub region_iso_code: Option<String>,
-    /// Name of the region.
+    /// English name of the region.
     pub region_name: Option<String>,
-    /// Name of the city.
+    /// English name of the city.
     pub city_name: Option<String>,
 }

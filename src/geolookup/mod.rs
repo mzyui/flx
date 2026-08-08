@@ -1,3 +1,9 @@
+//! GeoIP lookup backed by a locally cached GeoLite2-City database.
+//!
+//! The database is downloaded from the P3TERX mirror on first use into the
+//! platform data directory, locked against concurrent processes, and cached for
+//! the rest of the run.
+
 pub mod models;
 
 use std::{
@@ -41,6 +47,7 @@ fn download_lock() -> &'static tokio::sync::Mutex<()> {
     DOWNLOAD_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// Derives the path of the `.part` scratch file used while downloading.
 fn temporary_path(path: &Path) -> PathBuf {
     let mut temporary = path.to_path_buf();
     let file_name = path
@@ -51,6 +58,7 @@ fn temporary_path(path: &Path) -> PathBuf {
     temporary
 }
 
+/// Derives the path of the cross-process lock file guarding a download.
 fn lock_path(path: &Path) -> PathBuf {
     let mut lock = path.to_path_buf();
     lock.set_file_name(format!(
@@ -62,6 +70,10 @@ fn lock_path(path: &Path) -> PathBuf {
     lock
 }
 
+/// Acquires an exclusive advisory lock on the database's lock file.
+///
+/// The lock keeps two concurrent processes from downloading the database at
+/// the same time. It is released when the returned [`std::fs::File`] drops.
 async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     let lock = lock_path(path);
     tokio::task::spawn_blocking(move || {
@@ -81,6 +93,12 @@ async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     .context("GeoLite2 lock task failed")?
 }
 
+/// Streams a downloaded database into a scratch file, validates it, and
+/// atomically renames it into place.
+///
+/// The body is bounded by `max_size` and `deadline`, and every progress update
+/// is reported through `progress`. On any failure the partial file is removed
+/// so a corrupt half-written database never shadows the real one.
 async fn write_database_chunks<S, E, P>(
     mmdb_path: &Path,
     chunks: S,
@@ -164,12 +182,12 @@ where
     result
 }
 
+/// Renders the GeoLite2 download progress on the terminal.
 #[cfg(feature = "progress_bar")]
-/// Struct to manage and display progress for downloading the GeoLite2 database.
 struct Progress {
-    progress: AtomicUsize, // Tracks the current progress.
-    max: f64,              // Maximum size of the download.
-    timer: time::Instant,  // Timer to measure download duration.
+    progress: AtomicUsize, // Bytes downloaded so far.
+    max: f64,              // Expected total size of the download.
+    timer: time::Instant,  // When the download started.
 }
 
 #[cfg(feature = "progress_bar")]
@@ -217,15 +235,13 @@ fn data_dir() -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Downloads the GeoLite2 database from the specified endpoint if it does not exist.
+/// Downloads the GeoLite2 city database from the P3TERX mirror into
+/// `mmdb_path`, enforcing a 120s deadline and a 128MB size cap.
 ///
-/// # Arguments
+/// # Errors
 ///
-/// * `mmdb_path`: The path where the database file will be saved.
-///
-/// # Returns
-///
-/// A result indicating success or failure.
+/// Returns an error when the download fails, times out, exceeds the size cap,
+/// or produces a file that cannot be opened as an MMDB database.
 pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
     let https_connector = HttpsConnector::new();
@@ -314,9 +330,9 @@ pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
     .await
 }
 
-/// Manages the GeoIP database and provides lookup functionality.
+/// Geographically resolves proxy IP addresses against the GeoLite2 database.
 pub struct GeoLookup {
-    reader: Reader<Vec<u8>>, // Reader for the GeoLite2 database.
+    reader: Reader<Vec<u8>>,
 }
 
 impl GeoLookup {
@@ -358,15 +374,10 @@ impl GeoLookup {
         }
     }
 
-    /// Looks up geographical data for a given IPv4 address.
+    /// Looks up the geographical data for `ip`.
     ///
-    /// # Arguments
-    ///
-    /// * `ip`: The IPv4 address to look up.
-    ///
-    /// # Returns
-    ///
-    /// A `GeoData` instance containing the geographic information.
+    /// Returns a blank [`GeoData`] when the database has no record for the
+    /// address.
     pub fn lookup(&self, ip: &Ipv4Addr) -> GeoData {
         let mut geodata = GeoData::default();
         if let Ok(lookup) = self.reader.lookup::<City>(std::net::IpAddr::V4(*ip)) {
@@ -377,12 +388,8 @@ impl GeoLookup {
         geodata
     }
 
-    /// Extracts country data from the lookup result and populates the `GeoData`.
-    ///
-    /// # Arguments
-    ///
-    /// * `lookup`: The lookup result containing geographic information.
-    /// * `geodata`: The `GeoData` instance to populate with country information.
+    /// Fills `geodata` with the country (or continent when no country is
+    /// reported) resolved for the address.
     fn extract_country_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(country) = &lookup.country {
             geodata.iso_code = country.iso_code.map(ToString::to_string);
@@ -397,12 +404,7 @@ impl GeoLookup {
         }
     }
 
-    /// Extracts region data from the lookup result and populates the `GeoData`.
-    ///
-    /// # Arguments
-    ///
-    /// * `lookup`: The lookup result containing geographic information.
-    /// * `geodata`: The `GeoData` instance to populate with region information.
+    /// Fills `geodata` with the first subdivision's region identifiers.
     fn extract_region_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(subdivisions) = &lookup.subdivisions {
             if let Some(division) = subdivisions.first() {
@@ -414,12 +416,7 @@ impl GeoLookup {
         }
     }
 
-    /// Extracts city data from the lookup result and populates the `GeoData`.
-    ///
-    /// # Arguments
-    ///
-    /// * `lookup`: The lookup result containing geographic information.
-    /// * `geodata`: The `GeoData` instance to populate with city information.
+    /// Fills `geodata` with the resolved city name.
     fn extract_city_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(city) = &lookup.city {
             if let Some(city_names) = &city.names {

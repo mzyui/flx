@@ -18,7 +18,6 @@ impl ProxyProvider for ProxyscrapeProvider {
         "proxyscrape"
     }
 
-    /// Returns a list of sources from which proxies can be fetched.
     fn sources(&self) -> Vec<Source> {
         valid_sources(vec![
             Source::typed(

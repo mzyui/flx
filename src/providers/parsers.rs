@@ -133,6 +133,9 @@ where
     }
 }
 
+/// Walks a JSON response whose top-level object holds a `data` array, feeding
+/// each row to `visit`. A `false` return aborts the walk early without the
+/// deserializer having to parse the rest of the document.
 fn visit_json_data<T>(body: &str, mut visit: impl FnMut(T) -> bool) -> anyhow::Result<()>
 where
     T: DeserializeOwned,
@@ -150,7 +153,7 @@ where
     }
 }
 
-// ── Compiled-once regexen ──────────────────────────────────────────────
+// ── Compile-once regexes ──────────────────────────────────────────────
 
 /// Extracts the `code-N` offset from a ProxyNova `String.fromCharCode` clause.
 static RE_PROXYNOVA_OFFSET: LazyLock<Regex> =
@@ -354,6 +357,8 @@ fn header_index(header: &[String], names: &[&str]) -> Option<usize> {
     })
 }
 
+/// Normalizes an HTML fragment's text: whitespace runs collapse to single
+/// spaces and empty text nodes are dropped.
 fn normalized_text(element: scraper::ElementRef<'_>) -> String {
     let mut normalized = String::new();
     for fragment in element.text() {

@@ -15,7 +15,6 @@ impl ProxyProvider for MyProxyProvider {
         "my-proxy"
     }
 
-    /// Returns a list of sources from which proxies can be fetched.
     fn sources(&self) -> Vec<Source> {
         valid_sources(vec![Source::typed(
             "https://www.my-proxy.com/free-proxy-list.html",

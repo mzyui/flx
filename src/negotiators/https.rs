@@ -9,11 +9,11 @@ use tokio::{
 use super::NegotiatorTrait;
 use crate::proxy::models::RuntimeStats;
 
-/// A negotiator for HTTPS proxies.
+/// Negotiator for HTTPS (HTTP CONNECT tunnel) proxies.
 pub struct HttpsNegotiator;
 
 impl HttpsNegotiator {
-    /// Generates a CONNECT request to be sent to the proxy server.
+    /// Builds the HTTP `CONNECT` request sent to the proxy.
     fn generate_connect_request(&self, authority: &str) -> String {
         format!(
             "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
@@ -30,6 +30,7 @@ impl NegotiatorTrait for HttpsNegotiator {
         proxy_host: &str,
         uri: &Uri,
     ) -> anyhow::Result<()> {
+        // Configure the connect authority from the target URI.
         if let Some(host) = uri.host() {
             let port = uri.port_u16().unwrap_or(443);
             let authority = if host.contains(':') {
@@ -39,7 +40,7 @@ impl NegotiatorTrait for HttpsNegotiator {
             };
             let connect_request = self.generate_connect_request(&authority);
 
-            // Ensure the request uses HTTPS
+            // CONNECT only makes sense when tunnelling to an HTTPS target.
             if !uri.scheme().is_some_and(|s| s.as_str() == "https") {
                 anyhow::bail!("Scheme is empty or not https");
             }
@@ -85,7 +86,7 @@ impl NegotiatorTrait for HttpsNegotiator {
         Ok(())
     }
 
-    /// Indicates that this negotiator requires TLS.
+    /// HTTPS proxies require a TLS upgrade on the tunnel.
     fn with_tls(&self) -> bool {
         true
     }

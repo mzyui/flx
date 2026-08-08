@@ -26,7 +26,7 @@ pub enum ProxyParseError {
 /// Errors produced while parsing a [`crate::proxy::models::Protocol`] from text.
 #[derive(Debug, Error)]
 pub enum ProtocolParseError {
-    /// The protocol token was not recognised.
+    /// The protocol token was not recognized.
     #[error("unknown protocol `{0}`")]
     Unknown(String),
     /// A `CONNECT:<port>` value carried an invalid port.

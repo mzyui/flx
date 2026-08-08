@@ -36,21 +36,25 @@ pub enum ProviderTier {
     Fallback,
 }
 
-/// Represents a source of proxy information, such as a URL and default protocol types.
+/// A single fetchable proxy list.
 pub struct Source {
-    pub url: Uri,                       // URL of the proxy source.
-    pub default_types: Arc<[Protocol]>, // Default protocol types, shared across proxies.
-    pub timeout: Duration,              // Time before giving up on a request.
-    pub mode: ScrapeMode,               // How to parse the response body.
+    /// URL of the proxy list.
+    pub url: Uri,
+    /// Default protocol types assigned to proxies that do not specify one,
+    /// shared across every proxy from this source.
+    pub default_types: Arc<[Protocol]>,
+    /// Overall budget for fetching this source.
+    pub timeout: Duration,
+    /// How the response body is parsed into proxies.
+    pub mode: ScrapeMode,
 }
 
 impl Source {
-    /// Creates a new `Source` with a specified URL and protocol types.
+    /// Creates a source from a URL and the protocol types it advertises.
     ///
-    /// # Arguments
-    ///
-    /// * `url`: The URL of the proxy source.
-    /// * `types`: A vector of `Protocol` types.
+    /// When `types` is empty, the source reflects that no specific protocol is
+    /// known and the full common set (`HTTP`, `HTTPS`, `SOCKS4`, `SOCKS5`,
+    /// `CONNECT:25`, `CONNECT:80`) is used, subject to verification.
     ///
     /// # Errors
     ///

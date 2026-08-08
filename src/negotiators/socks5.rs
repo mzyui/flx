@@ -11,7 +11,7 @@ use tokio::{
 use super::NegotiatorTrait;
 use crate::proxy::models::RuntimeStats;
 
-/// A negotiator for SOCKS5 proxies.
+/// Negotiator for SOCKS5 proxies.
 pub struct Socks5Negotiator;
 
 #[async_trait]
@@ -23,14 +23,14 @@ impl NegotiatorTrait for Socks5Negotiator {
         _proxy_host: &str,
         uri: &hyper::Uri,
     ) -> anyhow::Result<()> {
-        // Prepare the initial SOCKS5 handshake packet
-        let handshake_packet = [5, 1, 0]; // Version, number of methods, no authentication
+        // Method selection: VER=5, NMETHODS=1, METHOD=0 (no authentication).
+        let handshake_packet = [5, 1, 0];
 
         let start_time = Instant::now();
         stream.write_all(&handshake_packet).await?;
         runtimes.record(start_time.elapsed().as_secs_f64());
 
-        // Read the response from the SOCKS5 server
+        // Reply is a two-byte [VER, METHOD] selection.
         let mut response_buf = [0; 2];
         let start_time = Instant::now();
         stream.read_exact(&mut response_buf).await?;
@@ -55,8 +55,7 @@ impl NegotiatorTrait for Socks5Negotiator {
             })
             .context("SOCKS5 target URI has no port")?;
 
-        // SOCKS5 CONNECT: VER=5, CMD=1, RSV=0, ATYP=1 (IPv4), DST.ADDR,
-        // DST.PORT (big-endian).
+        // CONNECT request: VER=5, CMD=1, RSV=0, ATYP, DST.ADDR, DST.PORT (BE).
         let mut connection_packet = Vec::with_capacity(22 + host.len());
         connection_packet.extend_from_slice(&[5u8, 1u8, 0u8]);
         match host.parse::<IpAddr>() {
@@ -81,7 +80,8 @@ impl NegotiatorTrait for Socks5Negotiator {
         stream.write_all(&connection_packet).await?;
         runtimes.record(start_time.elapsed().as_secs_f64());
 
-        // Parse variable-length SOCKS5 reply address and trailing port.
+        // Parse the reply header [VER, REP, RSV, ATYP], then discard the
+        // variable-length bound address and trailing port.
         let mut response_buf = [0; 4];
         let start_time = Instant::now();
         stream.read_exact(&mut response_buf).await?;

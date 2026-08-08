@@ -29,6 +29,9 @@ static HTTP_IP_ENDPOINTS: [&str; 3] = [
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IP_BODY_BYTES: usize = 64;
 
+/// Validates and normalizes a public-IP response body.
+///
+/// Rejects bodies that are too large, not UTF-8, or not a parseable [`IpAddr`].
 fn parse_ip_body(body: &[u8]) -> anyhow::Result<String> {
     if body.len() > MAX_IP_BODY_BYTES {
         anyhow::bail!("public-IP response exceeds {MAX_IP_BODY_BYTES} bytes");
@@ -41,6 +44,10 @@ fn parse_ip_body(body: &[u8]) -> anyhow::Result<String> {
     Ok(ip.to_string())
 }
 
+/// Fetches one HTTPS IP-echo endpoint and validates its body.
+///
+/// Applies a shared absolute `deadline` so a stalled peer cannot run past the
+/// overall lookup budget.
 async fn fetch_ip_endpoint(
     client: Client<
         HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
