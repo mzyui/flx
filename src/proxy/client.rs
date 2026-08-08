@@ -128,7 +128,7 @@ impl<T> ProxyRuntimes<T> {
 
 #[async_trait]
 pub trait ProxyClient {
-    fn host(&self) -> Cow<'static, str>;
+    fn host(&self) -> Cow<'_, str>;
 
     /// Establishes a TCP connection to the proxy server.
     ///
@@ -262,7 +262,7 @@ pub trait ProxyClient {
                 .await
                 .context("HTTP/1 handshake over TLS failed")?;
             runtimes.record(start_time.elapsed().as_secs_f64());
-            let driver = spawn_connection_driver(conn, host, CONNECTION_LINGER);
+            let driver = spawn_connection_driver(conn, host.into_owned().into(), CONNECTION_LINGER);
 
             self.log_trace(format!("Sending request: {:?}", req));
             let start_time = time::Instant::now();
@@ -283,7 +283,7 @@ pub trait ProxyClient {
         let io = TokioIo::new(stream);
         let (mut sender, conn) = handshake(io).await.context("HTTP/1 handshake failed")?;
         runtimes.record(start_time.elapsed().as_secs_f64());
-        let driver = spawn_connection_driver(conn, host, CONNECTION_LINGER);
+        let driver = spawn_connection_driver(conn, host.into_owned().into(), CONNECTION_LINGER);
 
         self.log_trace(format!("Sending request: {:?}", req));
         let start_time = time::Instant::now();
@@ -322,10 +322,9 @@ pub trait ProxyClient {
 }
 
 impl ProxyClient for Proxy {
-    fn host(&self) -> Cow<'static, str> {
-        // `text` is already a precomputed `ip:port` String (see Proxy::new),
-        // so cloning it is a single allocation-free-of-formatting copy — far
-        // cheaper than re-formatting on every connection attempt.
-        Cow::Owned(self.as_text().to_owned())
+    fn host(&self) -> Cow<'_, str> {
+        // `text` is a precomputed `ip:port` Arc<str> (see Proxy::new), so the
+        // borrowed form avoids a `String` allocation on every call.
+        Cow::Borrowed(self.as_text())
     }
 }
