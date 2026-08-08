@@ -84,27 +84,9 @@ async fn fetch_ip_endpoint(
 
 /// Resolves our public IP over DNS using OpenDNS.
 async fn my_ip_via_dns() -> anyhow::Result<String> {
-    // `myip.opendns.com` only publishes an A record; the default strategy also
-    // queries AAAA and would fail the whole lookup with "no record found".
-    let mut opts = ResolverOpts::default();
-    opts.ip_strategy = LookupIpStrategy::Ipv4Only;
-    opts.timeout = LOOKUP_TIMEOUT;
-    opts.attempts = 1;
-
-    let resolver = TokioAsyncResolver::tokio(
-        ResolverConfig::from_parts(
-            None,
-            vec![],
-            NameServerConfigGroup::from_ips_clear(
-                &[IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222))], // OpenDNS server
-                53,
-                false,
-            ),
-        ),
-        opts,
-    );
-
-    let response = resolver
+    let response = DNS_RESOLVER
+        .get_or_init(|| async { build_dns_resolver() })
+        .await
         .lookup_ip("myip.opendns.com")
         .await
         .context("failed to resolve public IP via OpenDNS (myip.opendns.com)")?;
@@ -115,6 +97,36 @@ async fn my_ip_via_dns() -> anyhow::Result<String> {
         .context("OpenDNS returned no address record for myip.opendns.com")?;
 
     Ok(ip.to_string())
+}
+
+/// Lazily-built resolver for `my_ip_via_dns`, constructed once per process.
+///
+/// Building a `TokioAsyncResolver` is comparatively heavy, so it must not be
+/// recreated on every DNS lookup (`my_ip` is called once per accepted HTTPS
+/// proxy).
+static DNS_RESOLVER: OnceCell<TokioAsyncResolver> = OnceCell::const_new();
+
+/// Builds the cached DNS resolver targeting OpenDNS's A-record-only server.
+fn build_dns_resolver() -> TokioAsyncResolver {
+    // `myip.opendns.com` only publishes an A record; the default strategy also
+    // queries AAAA and would fail the whole lookup with "no record found".
+    let mut opts = ResolverOpts::default();
+    opts.ip_strategy = LookupIpStrategy::Ipv4Only;
+    opts.timeout = LOOKUP_TIMEOUT;
+    opts.attempts = 1;
+
+    TokioAsyncResolver::tokio(
+        ResolverConfig::from_parts(
+            None,
+            vec![],
+            NameServerConfigGroup::from_ips_clear(
+                &[IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222))], // OpenDNS server
+                53,
+                false,
+            ),
+        ),
+        opts,
+    )
 }
 
 /// Resolves our public IP over HTTPS.
