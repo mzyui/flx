@@ -1,5 +1,5 @@
 use clap::builder::styling::AnsiColor;
-use clap::builder::{PossibleValue, Styles};
+use clap::builder::{PossibleValue, Styles, TypedValueParser};
 use clap::Parser;
 
 fn get_styles() -> Styles {
@@ -18,6 +18,61 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
         Err("must be greater than zero".to_owned())
     } else {
         Ok(parsed)
+    }
+}
+
+/// Protocol values accepted by `--types`, without the dynamic `CONNECT:<port>`.
+const VALID_TYPE_NAMES: &[&str] = &[
+    "HTTP",
+    "HTTP:Transparent",
+    "HTTP:Anonymous",
+    "HTTP:Elite",
+    "HTTPS",
+    "HTTPS:Transparent",
+    "HTTPS:Anonymous",
+    "HTTPS:Elite",
+    "SOCKS4",
+    "SOCKS5",
+];
+
+/// Validates a single `--types` value against the fixed protocol names plus
+/// the dynamic `CONNECT:<port>` form.
+fn is_valid_type_value(value: &str) -> bool {
+    VALID_TYPE_NAMES.contains(&value)
+        || value
+            .strip_prefix("CONNECT:")
+            .is_some_and(|port| port.parse::<u16>().is_ok())
+}
+
+/// `value_parser` for `--types`.
+///
+/// A static `[PossibleValue]` list cannot express `CONNECT:<port>` (the port is
+/// dynamic), so validation is a typed parser over the same documented set.
+#[derive(Clone)]
+struct TypesValueParser;
+
+impl TypedValueParser for TypesValueParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let value = value
+            .to_str()
+            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::ValueValidation))?;
+        if is_valid_type_value(value) {
+            Ok(value.to_owned())
+        } else {
+            Err(clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!(
+                    "invalid proxy type `{value}`; expected one of {VALID_TYPE_NAMES:?} or CONNECT:<port>"
+                ),
+            ))
+        }
     }
 }
 
@@ -112,6 +167,7 @@ pub struct Cli {
         long = "types",
         help_heading = "Validate",
         num_args(1..),
+        value_parser = TypesValueParser,
     )]
     pub types: Vec<String>,
 
