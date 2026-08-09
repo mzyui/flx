@@ -49,6 +49,20 @@ pub struct Cli {
     #[arg(long, default_value = "25", value_parser = clap::value_parser!(u64).range(1..))]
     pub fetch_concurrency: u64,
 
+    /// Freshness in minutes for the local provider-source cache.
+    ///
+    /// Fetched source bodies are stored under the platform data dir and reused
+    /// within this window, so repeat runs skip most of the network startup cost.
+    /// `0` disables the cache entirely.
+    #[arg(long, default_value = "15", value_parser = clap::value_parser!(u64))]
+    pub cache_ttl: u64,
+
+    /// Ignore the local provider-source cache and fetch every source again.
+    ///
+    /// The freshly fetched bodies still repopulate the cache.
+    #[arg(long, default_value_t = false)]
+    pub refresh_cache: bool,
+
     /// Timeout duration in seconds before giving up.
     #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout: u64,
@@ -56,7 +70,7 @@ pub struct Cli {
     /// Log level for application output.
     #[arg(
         long = "log",
-        default_value = "off",
+        default_value = "info",
         value_parser([
             PossibleValue::new("debug"),
             PossibleValue::new("info"),
