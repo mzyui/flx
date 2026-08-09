@@ -363,7 +363,7 @@ impl Drop for ProxyValidator {
         self.receiver.close();
         self.task_handle.abort();
         #[cfg(feature = "log")]
-        log::debug!(
+        log::info!(
             "Proxy validator completed: {}/{} proxies validated ({:?})",
             self.counter.load(Ordering::Acquire),
             self.total.load(Ordering::Acquire),
