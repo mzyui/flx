@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
     time::Instant,
 };
@@ -82,14 +83,33 @@ async fn fetch_ip_endpoint(
     parse_ip_body(&bytes).with_context(|| format!("invalid response from {endpoint}"))
 }
 
+/// Set once the OpenDNS lookup fails, so a known-broken DNS path is not
+/// retried on every subsequent `my_ip()` call.
+///
+/// `my_ip` is called once per accepted HTTPS proxy; the public IP is constant
+/// for the process lifetime, so re-attempting a deterministic DNS failure per
+/// proxy only burns part of each per-validation deadline (and spams logs).
+static DNS_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
 /// Resolves our public IP over DNS using OpenDNS.
 async fn my_ip_via_dns() -> anyhow::Result<String> {
-    let response = DNS_RESOLVER
+    if DNS_UNAVAILABLE.load(Ordering::Relaxed) {
+        anyhow::bail!("OpenDNS lookup previously failed; DNS discovery disabled");
+    }
+    let response = match DNS_RESOLVER
         .get_or_init(|| async { build_dns_resolver() })
         .await
         .lookup_ip("myip.opendns.com")
         .await
-        .context("failed to resolve public IP via OpenDNS (myip.opendns.com)")?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            DNS_UNAVAILABLE.store(true, Ordering::Relaxed);
+            return Err(anyhow::anyhow!(
+                "failed to resolve public IP via OpenDNS (myip.opendns.com): {error}"
+            ));
+        }
+    };
 
     let ip = response
         .iter()
@@ -154,8 +174,9 @@ async fn my_ip_via_https() -> anyhow::Result<String> {
 /// Determines the public IP address of the current host.
 ///
 /// Tries OpenDNS first, then falls back to HTTPS echo services when DNS is
-/// unavailable (e.g. outbound UDP:53 is blocked). Successful lookups are
-/// cached; failures are not, so a transient outage can be retried.
+/// unavailable (e.g. outbound UDP:53 is blocked). A failed DNS lookup is
+/// remembered for the rest of the process so subsequent calls skip straight to
+/// HTTPS instead of repeating the doomed DNS attempt.
 ///
 /// # Errors
 ///
