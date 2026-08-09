@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex,
     },
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
@@ -194,14 +194,22 @@ impl ValidationTarget {
 /// A verified pool of judges for a single protocol class (HTTP or tunnel).
 ///
 /// Each judge is independently preflighted at startup; only those that echo the
-/// unique token within the deadline enter the pool. Live requests pick the next
-/// healthy judge round-robin, so a single dead endpoint degrades gracefully
-/// instead of failing every probe or silently swapping to an unverified one.
+/// unique token within the deadline enter the pool. Preflight is streaming: the
+/// pool starts empty and judges are appended as soon as they pass, so
+/// validation can begin with the first verified judge instead of waiting for
+/// the slowest candidate. Live requests pick the next healthy judge
+/// round-robin, so a single dead endpoint degrades gracefully instead of
+/// failing every probe or silently swapping to an unverified one.
 pub struct JudgePool {
-    judges: Vec<Arc<ValidationTarget>>,
+    inner: Mutex<PoolInner>,
     cursor: AtomicUsize,
-    cooldown_until_ms: Vec<AtomicU64>,
     epoch: time::Instant,
+}
+
+/// The append-only judge list plus per-judge cooldown timestamps.
+struct PoolInner {
+    judges: Vec<Arc<ValidationTarget>>,
+    cooldown_until_ms: Vec<AtomicU64>,
 }
 
 impl JudgePool {
@@ -210,14 +218,17 @@ impl JudgePool {
     /// Judges that fail preflight are reported via `on_dropped` and excluded.
     /// If no judge survives, this returns an error so the caller can fail fast
     /// with a message telling the user to supply a working `--*judge-url`.
+    ///
+    /// Returns as soon as the first candidate passes; the remaining candidates
+    /// keep preflighting in the background and are appended when they pass.
     pub async fn build<F>(
         urls: &[String],
         timeout: Duration,
         insecure: bool,
         mut on_dropped: F,
-    ) -> anyhow::Result<Self>
+    ) -> anyhow::Result<Arc<Self>>
     where
-        F: FnMut(&str, &str),
+        F: FnMut(&str, &str) + Send + 'static,
     {
         if urls.is_empty() {
             anyhow::bail!("judge pool must contain at least one candidate URL");
@@ -234,45 +245,71 @@ impl JudgePool {
             }
         }
 
-        // Preflight every candidate concurrently so an N-judge pool pays one
-        // timeout instead of N sequential ones (startup cost is bounded by the
-        // slowest judge, not the sum).
+        // Preflight every candidate concurrently; a passing judge is appended
+        // to the shared pool the moment it verifies, so validation never waits
+        // for the slowest candidate.
+        let pool = Arc::new(Self::empty());
         let mut tasks = JoinSet::new();
         for (url, target) in candidates {
+            let pool = Arc::clone(&pool);
             tasks.spawn(async move {
                 let result = target.verify_online(timeout, insecure).await;
-                (url, target, result)
+                if result.is_ok() {
+                    pool.append(Arc::new(target));
+                }
+                (url, result)
             });
         }
 
-        let mut judges = Vec::with_capacity(tasks.len());
-        while let Some(joined) = tasks.join_next().await {
-            let (url, target, result) = joined.context("online judge preflight task failed")?;
-            match result {
-                Ok(()) => judges.push(Arc::new(target)),
-                Err(error) => on_dropped(&url, &format!("{error:#}")),
+        // Wait until the first judge has passed (appended) or every candidate
+        // has finished. Failures that land first are still reported.
+        loop {
+            if pool.len() > 0 {
+                break;
+            }
+            match tasks.join_next().await {
+                Some(Ok((_url, Ok(())))) => {} // already appended by the task
+                Some(Ok((url, Err(error)))) => on_dropped(&url, &format!("{error:#}")),
+                Some(Err(error)) => {
+                    return Err(error).context("online judge preflight task failed");
+                }
+                None => break,
             }
         }
-        if judges.is_empty() {
+        if pool.len() == 0 {
             anyhow::bail!(
                 "no online judge passed preflight; all {} candidate URL(s) failed",
                 urls.len()
             );
         }
-        Ok(Self::from_targets(judges))
+
+        // The remaining candidates finish in the background: survivors are
+        // appended as they verify, failures are reported.
+        tokio::spawn(async move {
+            while let Some(joined) = tasks.join_next().await {
+                match joined {
+                    Ok((_url, Ok(()))) => {}
+                    Ok((url, Err(error))) => on_dropped(&url, &format!("{error:#}")),
+                    Err(error) => on_dropped("<judge>", &format!("{error:#}")),
+                }
+            }
+        });
+
+        Ok(pool)
     }
 
     /// Returns the next healthy judge using a round-robin cursor.
     pub fn next(&self) -> Arc<ValidationTarget> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let now_ms = self.epoch.elapsed().as_millis() as u64;
-        for offset in 0..self.judges.len() {
-            let index = (start + offset) % self.judges.len();
-            if self.cooldown_until_ms[index].load(Ordering::Relaxed) <= now_ms {
-                return Arc::clone(&self.judges[index]);
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for offset in 0..inner.judges.len() {
+            let index = (start + offset) % inner.judges.len();
+            if inner.cooldown_until_ms[index].load(Ordering::Relaxed) <= now_ms {
+                return Arc::clone(&inner.judges[index]);
             }
         }
-        Arc::clone(&self.judges[start % self.judges.len()])
+        Arc::clone(&inner.judges[start % inner.judges.len()])
     }
 
     /// Healthy judges to try for the next attempt: the round-robin rotation
@@ -281,33 +318,62 @@ impl JudgePool {
     fn candidates(&self) -> Vec<Arc<ValidationTarget>> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let now_ms = self.epoch.elapsed().as_millis() as u64;
-        let mut candidates = Vec::with_capacity(self.judges.len());
-        for offset in 0..self.judges.len() {
-            let index = (start + offset) % self.judges.len();
-            if self.cooldown_until_ms[index].load(Ordering::Relaxed) <= now_ms {
-                candidates.push(Arc::clone(&self.judges[index]));
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut candidates = Vec::with_capacity(inner.judges.len());
+        for offset in 0..inner.judges.len() {
+            let index = (start + offset) % inner.judges.len();
+            if inner.cooldown_until_ms[index].load(Ordering::Relaxed) <= now_ms {
+                candidates.push(Arc::clone(&inner.judges[index]));
             }
         }
         if candidates.is_empty() {
-            candidates.push(Arc::clone(&self.judges[start % self.judges.len()]));
+            candidates.push(Arc::clone(&inner.judges[start % inner.judges.len()]));
         }
         candidates
     }
 
     pub fn report_failure(&self, target: &ValidationTarget) {
-        if let Some(index) = self.judges.iter().position(|judge| judge.url == target.url) {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = inner
+            .judges
+            .iter()
+            .position(|judge| judge.url == target.url)
+        {
             let until = self
                 .epoch
                 .elapsed()
                 .saturating_add(JUDGE_FAILURE_COOLDOWN)
                 .as_millis() as u64;
-            self.cooldown_until_ms[index].store(until, Ordering::Relaxed);
+            inner.cooldown_until_ms[index].store(until, Ordering::Relaxed);
         }
     }
 
     /// Number of healthy judges currently in the pool.
     pub fn len(&self) -> usize {
-        self.judges.len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .judges
+            .len()
+    }
+
+    /// Creates an empty pool that preflight tasks append to as they pass.
+    pub(crate) fn empty() -> Self {
+        Self {
+            inner: Mutex::new(PoolInner {
+                judges: Vec::new(),
+                cooldown_until_ms: Vec::new(),
+            }),
+            cursor: AtomicUsize::new(0),
+            epoch: time::Instant::now(),
+        }
+    }
+
+    /// Adds a verified judge to the pool.
+    pub(crate) fn append(&self, target: Arc<ValidationTarget>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.judges.push(target);
+        inner.cooldown_until_ms.push(AtomicU64::new(0));
     }
 
     /// Builds a pool from already-constructed targets (used by tests and the
@@ -315,9 +381,11 @@ impl JudgePool {
     pub(crate) fn from_targets(targets: Vec<Arc<ValidationTarget>>) -> Self {
         let cooldown_until_ms = (0..targets.len()).map(|_| AtomicU64::new(0)).collect();
         Self {
-            judges: targets,
+            inner: Mutex::new(PoolInner {
+                judges: targets,
+                cooldown_until_ms,
+            }),
             cursor: AtomicUsize::new(0),
-            cooldown_until_ms,
             epoch: time::Instant::now(),
         }
     }
@@ -451,7 +519,7 @@ pub async fn support_http(
 #[cfg(test)]
 mod tests {
     use super::{end_to_end_runtime, JudgePool, ValidationTarget};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use std::vec::Vec;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -494,16 +562,23 @@ mod tests {
                 .unwrap();
         });
         let urls = Vec::from([format!("http://{address}/judge")]);
-        let mut dropped = Vec::new();
+        let dropped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dropped_for_report = std::sync::Arc::clone(&dropped);
 
-        let result = JudgePool::build(&urls, Duration::from_secs(1), false, |url, reason| {
-            dropped.push((url.to_owned(), reason.to_owned()));
+        let result = JudgePool::build(&urls, Duration::from_secs(1), false, move |url, reason| {
+            dropped_for_report
+                .lock()
+                .unwrap()
+                .push((url.to_owned(), reason.to_owned()));
         })
         .await;
 
         assert!(result.is_err());
-        assert_eq!(dropped.len(), 1);
-        assert!(dropped[0].1.contains("did not echo"));
+        {
+            let dropped = dropped.lock().unwrap();
+            assert_eq!(dropped.len(), 1);
+            assert!(dropped[0].1.contains("did not echo"));
+        }
         server.await.unwrap();
     }
 
@@ -531,6 +606,49 @@ mod tests {
         assert_eq!(third.url, urls[2]);
         // wraps back to the start
         assert_eq!(fourth.url, urls[0]);
+    }
+
+    #[tokio::test]
+    async fn build_returns_once_first_judge_passes() {
+        // Regression for B.49: a judge that accepts but never responds must not
+        // hold up startup — `build` returns as soon as the first candidate
+        // passes, and the straggler is left preflighting in the background.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hanging_url = format!("http://{}/judge", listener.local_addr().unwrap());
+        let _server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            std::future::pending::<()>().await; // never reply
+        });
+
+        let fast_url = spawn_plain_echo_judge().await;
+        let started = Instant::now();
+
+        let pool = JudgePool::build(
+            &[hanging_url, fast_url],
+            Duration::from_secs(5),
+            /* insecure = */ false,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "build must not wait for the hanging judge's timeout"
+        );
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pool_appends_judges_after_empty_start() {
+        let pool = JudgePool::empty();
+        assert_eq!(pool.len(), 0);
+
+        let url = "http://a.example.com/azenv.php".to_owned();
+        pool.append(std::sync::Arc::new(ValidationTarget::online(&url).unwrap()));
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.next().url, url);
+        assert_eq!(pool.next().url, url, "round-robin wraps on a single judge");
     }
 
     #[test]
@@ -596,6 +714,49 @@ mod tests {
             std::sync::Arc::new(ValidationTarget::online(&url).unwrap()),
         ]));
         assert_eq!(pool.len(), 2);
+    }
+
+    /// Spawns a plain-HTTP judge that echoes the `X-Fluxy-Token` header.
+    ///
+    /// The header match is case-insensitive, so this works with the buggy
+    /// token extraction used by `spawn_self_signed_judge` (F-32) and is safe to
+    /// rely on for the streaming-preflight tests.
+    async fn spawn_plain_echo_judge() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let mut received = Vec::new();
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    received.extend_from_slice(&buf[..n]);
+                    if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let mut token = String::new();
+                for line in received.split(|&b| b == b'\n') {
+                    let line = String::from_utf8_lossy(line);
+                    let (name, value) = line.split_once(':').unwrap_or(("", ""));
+                    if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
+                        token = value.trim().to_owned();
+                        break;
+                    }
+                }
+                let body = format!("HTTP_X_FLUXY_TOKEN = {token}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{address}/azenv.php")
     }
 
     // Self-signed certificate + key for the F-32 end-to-end preflight test.

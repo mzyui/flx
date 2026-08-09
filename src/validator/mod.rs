@@ -41,6 +41,17 @@ fn validator_channel_capacity(concurrency_limit: usize) -> usize {
         .clamp(VALIDATOR_CHANNEL_MIN, VALIDATOR_CHANNEL_MAX)
 }
 
+/// Reports a judge that failed preflight and was excluded from the pool.
+///
+/// A plain `fn` (not a closure) so it can be moved into the background preflight
+/// tasks spawned by [`checker::JudgePool::build`].
+fn report_dropped(url: &str, reason: &str) {
+    #[cfg(feature = "log")]
+    log::warn!("warning: judge `{url}` failed preflight and was dropped: {reason}");
+    #[cfg(not(feature = "log"))]
+    let _ = (url, reason);
+}
+
 /// Validates a stream of proxies and yields the ones that pass.
 ///
 /// Consume it with [`ProxyValidator::get_one`] or as a [`Stream`]
@@ -225,41 +236,37 @@ impl ProxyValidator {
             .iter()
             .any(|protocol| !matches!(protocol, Protocol::Http(_)));
 
-        let report_dropped = |url: &str, reason: &str| {
-            #[cfg(feature = "log")]
-            log::warn!("warning: judge `{url}` failed preflight and was dropped: {reason}");
-            #[cfg(not(feature = "log"))]
-            let _ = (url, reason);
+        let http_preflight = async {
+            if !need_http {
+                return Ok::<Option<Arc<checker::JudgePool>>, anyhow::Error>(None);
+            }
+            let pool = checker::JudgePool::build(
+                &config.http_judge_urls,
+                preflight_timeout,
+                insecure,
+                report_dropped,
+            )
+            .await
+            .context("HTTP online judge pool is empty after preflight")?;
+            Ok::<_, anyhow::Error>(Some(pool))
         };
-
-        let http_target = if need_http {
-            Some(Arc::new(
-                checker::JudgePool::build(
-                    &config.http_judge_urls,
-                    preflight_timeout,
-                    insecure,
-                    &report_dropped,
-                )
-                .await
-                .context("HTTP online judge pool is empty after preflight")?,
-            ))
-        } else {
-            None
+        let tunnel_preflight = async {
+            if !need_tunnel {
+                return Ok::<Option<Arc<checker::JudgePool>>, anyhow::Error>(None);
+            }
+            let pool = checker::JudgePool::build(
+                &config.https_judge_urls,
+                preflight_timeout,
+                insecure,
+                report_dropped,
+            )
+            .await
+            .context("HTTPS online judge pool is empty after preflight")?;
+            Ok::<_, anyhow::Error>(Some(pool))
         };
-        let tunnel_target = if need_tunnel {
-            Some(Arc::new(
-                checker::JudgePool::build(
-                    &config.https_judge_urls,
-                    preflight_timeout,
-                    insecure,
-                    &report_dropped,
-                )
-                .await
-                .context("HTTPS online judge pool is empty after preflight")?,
-            ))
-        } else {
-            None
-        };
+        let (http_target, tunnel_target) = tokio::join!(http_preflight, tunnel_preflight);
+        let http_target = http_target?;
+        let tunnel_target = tunnel_target?;
         #[cfg(feature = "log")]
         if let Some(pool) = http_target.as_ref() {
             log::info!("using {} healthy HTTP judge(s)", pool.len());
