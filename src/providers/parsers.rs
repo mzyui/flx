@@ -6,7 +6,7 @@
 //!
 //! Ported from the Node implementation in `mzyui/proxy-list` (engine/src/providers).
 
-use std::{borrow::Cow, net::Ipv4Addr, sync::LazyLock};
+use std::{borrow::Cow, collections::HashMap, net::Ipv4Addr, sync::LazyLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use regex::Regex;
@@ -349,12 +349,63 @@ pub fn visit_proxynova(
     })
 }
 
+/// Header cell texts that identify each proxy column, most specific first so
+/// an exact match is preferred when several names could apply.
+const IP_HEADER_NAMES: &[&str] = &["ip address", "ip"];
+const PORT_HEADER_NAMES: &[&str] = &["port"];
+const PROTOCOL_HEADER_NAMES: &[&str] = &["version", "type", "protocol"];
+const HTTPS_HEADER_NAMES: &[&str] = &["https"];
+const ANONYMITY_HEADER_NAMES: &[&str] = &["anonymity"];
+
+/// Column indices of a proxy `<table>` header row.
+struct HeaderColumns {
+    ip: usize,
+    port: usize,
+    protocol: Option<usize>,
+    https: Option<usize>,
+    anonymity: Option<usize>,
+}
+
+/// Resolves the proxy columns from a table header.
+///
+/// Lowercases and trims every header cell exactly once, then indexes the cells
+/// by their normalized text in a `HashMap` so all five columns resolve against
+/// a single map. The previous `header_index` re-lowered and re-scanned the
+/// whole header per column (5 × cells × names, with a `String` allocation per
+/// cell per call).
+fn header_columns(header: &[String]) -> HeaderColumns {
+    let lower: Vec<String> = header
+        .iter()
+        .map(|cell| cell.trim().to_ascii_lowercase())
+        .collect();
+    let mut by_text: HashMap<&str, usize> = HashMap::with_capacity(lower.len());
+    for (index, cell) in lower.iter().enumerate() {
+        by_text.entry(cell.as_str()).or_insert(index);
+    }
+
+    HeaderColumns {
+        ip: find_column(&by_text, &lower, IP_HEADER_NAMES).unwrap_or(0),
+        port: find_column(&by_text, &lower, PORT_HEADER_NAMES).unwrap_or(1),
+        protocol: find_column(&by_text, &lower, PROTOCOL_HEADER_NAMES),
+        https: find_column(&by_text, &lower, HTTPS_HEADER_NAMES),
+        anonymity: find_column(&by_text, &lower, ANONYMITY_HEADER_NAMES),
+    }
+}
+
 /// Returns the index of the first header cell matching any of `names`.
-fn header_index(header: &[String], names: &[&str]) -> Option<usize> {
-    header.iter().position(|cell| {
-        let cell = cell.trim().to_ascii_lowercase();
-        names.iter().any(|name| cell.contains(name))
-    })
+///
+/// Cells whose normalized text equals one of `names` (the common case, e.g.
+/// "IP Address") are resolved with an O(1) map lookup; headers that only
+/// contain a name as a substring (e.g. "Proxy Type") fall back to a linear
+/// scan of the already-lowercased cells, so nothing is re-lowercased per
+/// column.
+fn find_column(by_text: &HashMap<&str, usize>, lower: &[String], names: &[&str]) -> Option<usize> {
+    if let Some(&index) = names.iter().find_map(|name| by_text.get(name)) {
+        return Some(index);
+    }
+    lower
+        .iter()
+        .position(|cell| names.iter().any(|name| cell.contains(name)))
 }
 
 /// True when `text` contains no whitespace other than single ASCII spaces, so
@@ -437,11 +488,7 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
             })
             .unwrap_or_default();
 
-        let i_ip = header_index(&header, &["ip address", "ip"]).unwrap_or(0);
-        let i_port = header_index(&header, &["port"]).unwrap_or(1);
-        let i_type = header_index(&header, &["version", "type", "protocol"]);
-        let i_https = header_index(&header, &["https"]);
-        let i_anon = header_index(&header, &["anonymity"]);
+        let columns = header_columns(&header);
 
         for row in table.select(&ROW_SELECTOR) {
             let mut ip_cell: Option<Cow<'_, str>> = None;
@@ -453,15 +500,15 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
             // Normalize only the columns we actually need, instead of
             // materializing a Vec<String> for every cell of every row.
             for (index, cell) in row.select(&CELL_SELECTOR).enumerate() {
-                if index == i_ip {
+                if index == columns.ip {
                     ip_cell = Some(normalized_text(cell));
-                } else if index == i_port {
+                } else if index == columns.port {
                     port_cell = Some(normalized_text(cell));
-                } else if Some(index) == i_type {
+                } else if Some(index) == columns.protocol {
                     type_cell = Some(normalized_text(cell));
-                } else if Some(index) == i_https {
+                } else if Some(index) == columns.https {
                     https_cell = Some(normalized_text(cell));
-                } else if Some(index) == i_anon {
+                } else if Some(index) == columns.anonymity {
                     anon_cell = Some(normalized_text(cell));
                 }
             }
@@ -661,6 +708,33 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].1, 8080);
         assert_eq!(parsed[0].2, Some(Protocol::Https(Anonymity::Unknown)));
+    }
+
+    #[test]
+    fn html_table_columns_resolve_by_exact_name_and_substring_fallback() {
+        // "IP ADDRESS" hits the exact-match map; "Proxy Type" only matches by
+        // substring, exercising the linear-scan fallback over the
+        // pre-lowercased header cells.
+        let body = r#"<table><tr><th>Proxy Type</th><th>IP ADDRESS</th><th>Port</th><th>Anonymity</th></tr>
+            <tr><td>http</td><td>1.2.3.4</td><td>8080</td><td>elite proxy</td></tr>
+            <tr><td>bad</td><td>x</td><td></td><td></td></tr></table>"#;
+        let parsed = parse_html_table(body);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.to_string(), "1.2.3.4");
+        assert_eq!(parsed[0].1, 8080);
+        assert_eq!(parsed[0].2, Some(Protocol::Http(Anonymity::Elite)));
+    }
+
+    #[test]
+    fn html_table_defaults_to_first_two_columns_when_header_unknown() {
+        // A header row that matches no known name falls back to ip=0/port=1,
+        // matching the pre-fix `header_index(..).unwrap_or(..)` behavior.
+        let body = r#"<table><tr><th>Foo</th><th>Bar</th></tr>
+            <tr><td>1.2.3.4</td><td>8080</td></tr></table>"#;
+        let parsed = parse_html_table(body);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.to_string(), "1.2.3.4");
+        assert_eq!(parsed[0].1, 8080);
     }
 
     #[test]
