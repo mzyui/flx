@@ -437,10 +437,15 @@ async fn do_work(
                     .acquire()
                     .await
                     .context("fetcher semaphore closed during shutdown")?;
-                provider
+                let body = provider
                     .fetch(client, &url, source.timeout)
                     .await
-                    .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
+                    .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
+                // Only a real network fetch is worth persisting: a cache hit
+                // that re-wrote the same body to disk every run was pure
+                // write-amplification (re-audit N1).
+                fetch_cache.store(&url, body.as_ref()).await;
+                body
             }
         }
     } else {
@@ -456,10 +461,6 @@ async fn do_work(
 
     if *stop_rx.borrow() {
         return Ok(());
-    }
-
-    if let Some(fetch_cache) = fetch_cache.as_ref() {
-        fetch_cache.store(&url, html.as_ref()).await;
     }
 
     let expected_types = Arc::clone(&source.default_types);
