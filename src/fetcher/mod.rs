@@ -530,7 +530,10 @@ impl ProxyFetcher {
         );
         if result.is_some() {
             if let Some(threshold) = self.config.fallback_threshold {
-                if self.accepted.load(Ordering::Relaxed) >= threshold {
+                // Signal the stop once; re-sending the same value on every
+                // accepted proxy just bumps the watch version pointlessly
+                // (re-audit N3).
+                if self.accepted.load(Ordering::Relaxed) >= threshold && !*self.stop_tx.borrow() {
                     let _ = self.stop_tx.send(true);
                 }
             }
