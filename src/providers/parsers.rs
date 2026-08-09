@@ -6,7 +6,7 @@
 //!
 //! Ported from the Node implementation in `mzyui/proxy-list` (engine/src/providers).
 
-use std::{net::Ipv4Addr, sync::LazyLock};
+use std::{borrow::Cow, net::Ipv4Addr, sync::LazyLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use regex::Regex;
@@ -357,11 +357,47 @@ fn header_index(header: &[String], names: &[&str]) -> Option<usize> {
     })
 }
 
+/// True when `text` contains no whitespace other than single ASCII spaces, so
+/// it is already in normalized shape (nothing to collapse, no tabs/newlines).
+fn is_simple_text(text: &str) -> bool {
+    let mut previous_space = false;
+    for ch in text.chars() {
+        if ch == ' ' {
+            if previous_space {
+                return false;
+            }
+            previous_space = true;
+        } else if ch.is_whitespace() {
+            return false;
+        } else {
+            previous_space = false;
+        }
+    }
+    true
+}
+
 /// Normalizes an HTML fragment's text: whitespace runs collapse to single
 /// spaces and empty text nodes are dropped.
-fn normalized_text(element: scraper::ElementRef<'_>) -> String {
+///
+/// Borrows the source text when a single text node is already normalized (the
+/// common case for IP/port/protocol cells), avoiding a `String` allocation per
+/// cell. Multi-node cells and cells with whitespace runs fall back to the
+/// allocating fold.
+fn normalized_text(element: scraper::ElementRef<'_>) -> Cow<'_, str> {
+    let mut fragments = element.text();
+    let first = match fragments.next() {
+        Some(first) => first,
+        None => return Cow::Borrowed(""),
+    };
+    let trimmed = first.trim();
+
+    let second = fragments.next();
+    if second.is_none() && is_simple_text(trimmed) {
+        return Cow::Borrowed(trimmed);
+    }
+
     let mut normalized = String::new();
-    for fragment in element.text() {
+    for fragment in std::iter::once(first).chain(second).chain(fragments) {
         for word in fragment.split_whitespace() {
             if !normalized.is_empty() {
                 normalized.push(' ');
@@ -369,7 +405,7 @@ fn normalized_text(element: scraper::ElementRef<'_>) -> String {
             normalized.push_str(word);
         }
     }
-    normalized
+    Cow::Owned(normalized)
 }
 
 /// Parses the HTML `<table>` markup shared by free-proxy-list.net,
@@ -385,10 +421,16 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
             .select(&ROW_SELECTOR)
             .next()
             .map(|row| {
-                let cells: Vec<String> =
-                    row.select(&HEADER_SELECTOR).map(normalized_text).collect();
+                let cells: Vec<String> = row
+                    .select(&HEADER_SELECTOR)
+                    .map(normalized_text)
+                    .map(Cow::into_owned)
+                    .collect();
                 if cells.is_empty() {
-                    row.select(&CELL_SELECTOR).map(normalized_text).collect()
+                    row.select(&CELL_SELECTOR)
+                        .map(normalized_text)
+                        .map(Cow::into_owned)
+                        .collect()
                 } else {
                     cells
                 }
@@ -402,7 +444,11 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
         let i_anon = header_index(&header, &["anonymity"]);
 
         for row in table.select(&ROW_SELECTOR) {
-            let cells: Vec<String> = row.select(&CELL_SELECTOR).map(normalized_text).collect();
+            let cells: Vec<String> = row
+                .select(&CELL_SELECTOR)
+                .map(normalized_text)
+                .map(Cow::into_owned)
+                .collect();
             if cells.len() < 2 {
                 continue;
             }
