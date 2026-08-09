@@ -60,13 +60,13 @@ impl TypedValueParser for TypesValueParser {
         arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        let value = value.to_str().ok_or_else(|| {
-            clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd)
-        })?;
+        let value = value
+            .to_str()
+            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidValue).with_cmd(cmd))?;
         if is_valid_type_value(value) {
             Ok(value.to_owned())
         } else {
-            let mut error = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+            let mut error = clap::Error::new(clap::error::ErrorKind::InvalidValue).with_cmd(cmd);
             error.insert(
                 clap::error::ContextKind::InvalidArg,
                 clap::error::ContextValue::String(
@@ -77,6 +77,16 @@ impl TypedValueParser for TypesValueParser {
             error.insert(
                 clap::error::ContextKind::InvalidValue,
                 clap::error::ContextValue::String(value.to_string()),
+            );
+            error.insert(
+                clap::error::ContextKind::ValidValue,
+                clap::error::ContextValue::Strings(
+                    VALID_TYPE_NAMES
+                        .iter()
+                        .map(|name| name.to_string())
+                        .chain(std::iter::once("CONNECT:<port>".to_string()))
+                        .collect(),
+                ),
             );
             Err(error)
         }
