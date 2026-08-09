@@ -70,7 +70,7 @@ pub struct Cli {
     /// Log level for application output.
     #[arg(
         long = "log",
-        default_value = "info",
+        default_value = "off",
         value_parser([
             PossibleValue::new("debug"),
             PossibleValue::new("info"),
