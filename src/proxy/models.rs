@@ -3,7 +3,7 @@ use std::{
     io::{Cursor, Write},
     net::Ipv4Addr,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -204,6 +204,15 @@ pub struct Proxy {
     pub(crate) text: Arc<str>,
 }
 
+/// Empty geo record shared by every proxy built without a geo lookup.
+///
+/// `Proxy::new` used to allocate a fresh `Arc<GeoData>` per proxy even when
+/// geo lookup is disabled (the default), leaving one heap allocation per
+/// proxy in the hottest path after A.5. Geo data is only ever replaced (e.g.
+/// in `accept_proxy`), never mutated in place, so a single shared default is
+/// safe and allocation-free for the common case (re-audit N6).
+static DEFAULT_GEO: LazyLock<Arc<GeoData>> = LazyLock::new(|| Arc::new(GeoData::default()));
+
 impl Proxy {
     /// Builds a proxy, precomputing its `ip:port` text representation.
     pub fn new(ip: Ipv4Addr, port: u16) -> Self {
@@ -215,7 +224,7 @@ impl Proxy {
         Self {
             ip,
             port,
-            geo: Arc::new(GeoData::default()),
+            geo: Arc::clone(&DEFAULT_GEO),
             runtimes: RuntimeStats::default(),
             expected_types: Arc::from([]),
             proxy_type: None,
