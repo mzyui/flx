@@ -321,6 +321,9 @@ fn fetcher_config(options: &Cli) -> fluxy::fetcher::Config {
         concurrency_limit: options.fetch_concurrency as usize,
         enable_geo_lookup: options.with_geo || !options.countries.is_empty(),
         countries: options.countries.clone(),
+        cache_ttl: (options.cache_ttl > 0)
+            .then(|| std::time::Duration::from_secs(options.cache_ttl * 60)),
+        refresh_cache: options.refresh_cache,
         ..Default::default()
     }
 }
@@ -345,7 +348,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    runtime.block_on(async {
+    let outcome = runtime.block_on(async {
         let proxy_source: std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send + 'static>> =
             if let Some(file) = &options.file {
                 let file = file.clone();
@@ -401,7 +404,9 @@ fn run_application() -> anyhow::Result<RunOutcome> {
                 .context("failed to write results")?;
             Ok(outcome)
         }
-    })
+    });
+    runtime.shutdown_background();
+    outcome
 }
 
 #[cfg(test)]
@@ -429,6 +434,33 @@ mod tests {
         let config = fetcher_config(&combined);
         assert!(config.enable_geo_lookup);
         assert_eq!(config.countries, vec!["ID"]);
+    }
+
+    #[test]
+    fn cache_ttl_maps_to_minutes_and_zero_disables() {
+        let enabled = Cli::parse_from(["fluxy", "--cache-ttl", "10"]);
+        assert_eq!(
+            fetcher_config(&enabled).cache_ttl,
+            Some(std::time::Duration::from_secs(600))
+        );
+
+        let disabled = Cli::parse_from(["fluxy", "--cache-ttl", "0"]);
+        assert_eq!(fetcher_config(&disabled).cache_ttl, None);
+
+        let default = Cli::parse_from(["fluxy"]);
+        assert_eq!(
+            fetcher_config(&default).cache_ttl,
+            Some(std::time::Duration::from_secs(900))
+        );
+    }
+
+    #[test]
+    fn refresh_cache_flag_bypasses_cache() {
+        let refreshed = Cli::parse_from(["fluxy", "--refresh-cache"]);
+        assert!(fetcher_config(&refreshed).refresh_cache);
+
+        let default = Cli::parse_from(["fluxy"]);
+        assert!(!fetcher_config(&default).refresh_cache);
     }
 
     #[test]
