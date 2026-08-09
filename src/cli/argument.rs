@@ -69,7 +69,7 @@ impl TypedValueParser for TypesValueParser {
             Err(clap::Error::raw(
                 clap::error::ErrorKind::ValueValidation,
                 format!(
-                    "invalid proxy type `{value}`; expected one of {VALID_TYPE_NAMES:?} or CONNECT:<port>"
+                    "invalid proxy type `{value}`; expected one of {VALID_TYPE_NAMES:?} or CONNECT:<port>\n"
                 ),
             ))
         }
