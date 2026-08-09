@@ -46,6 +46,10 @@ pools. Every candidate must echo Fluxy's unique `X-Fluxy-Token`; unhealthy or
 incompatible candidates are removed before validation starts, and healthy judges
 are selected round-robin.
 
+Preflight is streaming: validation begins as soon as the first judge passes,
+while the remaining candidates finish preflighting in the background — a dead
+judge no longer holds up startup until its timeout.
+
 The built-in defaults work without a local judge binary or shared secret:
 
 ```sh
@@ -58,3 +62,17 @@ Custom pools can be supplied with comma-separated `--http-judge-urls` and
 `--https-judge-urls`. HTTPS certificate validation is enabled by default. Use
 `--insecure` only for an explicitly trusted self-signed judge; HTTP judges do not
 provide transport authentication and should be treated accordingly.
+
+## Provider source cache
+
+Fetching every proxy list is the slowest part of startup. Fluxy caches each
+source body under the platform data dir and reuses it within a freshness window,
+so repeat runs skip most of the network startup cost.
+
+- `--cache-ttl <minutes>` — reuse cached source bodies within this window
+  (default `15`; `0` disables the cache entirely).
+- `--refresh-cache` — ignore the cache and fetch every source again; the freshly
+  fetched bodies still repopulate the cache.
+
+The public IP used for anonymity classification is cached to disk for 24 hours
+the same way, so DNS/HTTPS discovery runs at most once per day.
