@@ -218,7 +218,7 @@ impl Drop for Progress {
 /// # Returns
 ///
 /// A `PathBuf` representing the path to the data directory.
-fn data_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn data_dir() -> anyhow::Result<PathBuf> {
     if let Some(base_dirs) = directories::BaseDirs::new() {
         let mut dir = base_dirs.data_dir().to_path_buf();
         dir.push(env!("CARGO_PKG_NAME"));
