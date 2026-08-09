@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// Configuration for the proxy fetching pipeline.
 pub struct Config {
     /// Deduplicate proxies that share the same endpoint (ip, port, protocol
@@ -17,6 +19,10 @@ pub struct Config {
     /// `None` runs the fallback providers unconditionally — still only after
     /// every primary provider has finished.
     pub fallback_threshold: Option<usize>,
+    /// Freshness window for the local source-body cache; `None` disables it.
+    pub cache_ttl: Option<Duration>,
+    /// Bypass the cache and refetch every source, repopulating it afterwards.
+    pub refresh_cache: bool,
 }
 
 impl Config {
@@ -38,6 +44,8 @@ impl Default for Config {
             enable_geo_lookup: false,
             countries: Vec::new(),
             fallback_threshold: None,
+            cache_ttl: None,
+            refresh_cache: false,
         }
     }
 }
