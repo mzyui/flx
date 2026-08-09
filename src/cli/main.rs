@@ -181,6 +181,11 @@ where
     let mut cancelled = false;
     let mut source = std::pin::pin!(source.enumerate());
 
+    // One stdout lock for the whole run instead of `print!` re-acquiring the
+    // global lock (`std::io::_print`) for every proxy (re-audit N5).
+    let mut stdout = std::io::stdout().lock();
+    use std::io::Write as _;
+
     // When `cancel` resolves (Ctrl+C in the real binary), the run finalizes a
     // valid JSON document instead of leaving an unterminated array behind.
     let mut cancel = std::pin::pin!(cancel);
@@ -245,7 +250,11 @@ where
                         break;
                     }
                 } else {
-                    print!("{output}");
+                    // `print!` panics on a broken pipe; keep that behaviour by
+                    // panicking here too (re-audit N5).
+                    stdout
+                        .write_all(output.as_bytes())
+                        .expect("failed to write proxy to stdout");
                 }
 
                 found_proxy = true;
@@ -261,11 +270,11 @@ where
         // yield valid JSON, but a failure here is only interesting when nothing
         // else already went wrong.
         if write_error.is_none() {
-            write_error = finalize_json_output(&mut output_file, found_proxy)
+            write_error = finalize_json_output(&mut output_file, &mut stdout, found_proxy)
                 .await
                 .err();
         } else {
-            let _ = finalize_json_output(&mut output_file, found_proxy).await;
+            let _ = finalize_json_output(&mut output_file, &mut stdout, found_proxy).await;
         }
     }
     if let Some(file) = output_file.as_mut() {
@@ -273,8 +282,7 @@ where
     }
     // Flush stdout explicitly so a cancelled/failed run still delivers the
     // final bytes (e.g. the closing `]`) before we exit or report an error.
-    use std::io::Write as _;
-    let _ = std::io::stdout().flush();
+    let _ = stdout.flush();
 
     if cancelled {
         // Ctrl+C: the document above has been finalized; report the
@@ -295,15 +303,17 @@ where
 /// receive an unterminated array.
 async fn finalize_json_output(
     output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
+    stdout: &mut std::io::StdoutLock<'static>,
     found_proxy: bool,
 ) -> anyhow::Result<()> {
     let close = if found_proxy { "\n]\n" } else { "[]\n" };
-    write_output(output_file, close).await
+    write_output(output_file, stdout, close).await
 }
 
 /// Writes `content` to the output file if present, otherwise to stdout.
 async fn write_output(
     output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
+    stdout: &mut std::io::StdoutLock<'static>,
     content: &str,
 ) -> anyhow::Result<()> {
     if let Some(ref mut file) = output_file {
@@ -311,7 +321,10 @@ async fn write_output(
             .await
             .context("failed to write proxy to output file")?;
     } else {
-        print!("{content}");
+        use std::io::Write as _;
+        stdout
+            .write_all(content.as_bytes())
+            .context("failed to write proxy to stdout")?;
     }
     Ok(())
 }
