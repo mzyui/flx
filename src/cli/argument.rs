@@ -56,22 +56,29 @@ impl TypedValueParser for TypesValueParser {
 
     fn parse_ref(
         &self,
-        _cmd: &clap::Command,
-        _arg: Option<&clap::Arg>,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        let value = value
-            .to_str()
-            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::ValueValidation))?;
+        let value = value.to_str().ok_or_else(|| {
+            clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd)
+        })?;
         if is_valid_type_value(value) {
             Ok(value.to_owned())
         } else {
-            Err(clap::Error::raw(
-                clap::error::ErrorKind::ValueValidation,
-                format!(
-                    "invalid proxy type `{value}`; expected one of {VALID_TYPE_NAMES:?} or CONNECT:<port>\n"
+            let mut error = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+            error.insert(
+                clap::error::ContextKind::InvalidArg,
+                clap::error::ContextValue::String(
+                    arg.map(|arg| format!("--{}", arg.get_id()))
+                        .unwrap_or_else(|| "--types".to_owned()),
                 ),
-            ))
+            );
+            error.insert(
+                clap::error::ContextKind::InvalidValue,
+                clap::error::ContextValue::String(value.to_string()),
+            );
+            Err(error)
         }
     }
 }
