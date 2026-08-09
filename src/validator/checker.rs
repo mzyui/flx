@@ -299,6 +299,11 @@ impl JudgePool {
     }
 
     /// Returns the next healthy judge using a round-robin cursor.
+    ///
+    /// Production probing goes through [`Self::candidates`] (which snapshots
+    /// the healthy judges once per proxy); this single-pick primitive is only
+    /// exercised by the round-robin/cooldown tests now.
+    #[cfg(test)]
     pub fn next(&self) -> Arc<ValidationTarget> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let now_ms = self.epoch.elapsed().as_millis() as u64;
@@ -315,7 +320,7 @@ impl JudgePool {
     /// Healthy judges to try for the next attempt: the round-robin rotation
     /// minus any judges currently in cooldown. Falls back to a single judge
     /// when all are cooling down.
-    fn candidates(&self) -> Vec<Arc<ValidationTarget>> {
+    pub(crate) fn candidates(&self) -> Vec<Arc<ValidationTarget>> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

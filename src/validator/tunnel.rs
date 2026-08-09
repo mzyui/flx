@@ -1,4 +1,7 @@
 use std::{
+    borrow::Cow,
+    collections::HashSet,
+    io::Write as _,
     net::{IpAddr, Ipv4Addr},
     time::Duration,
 };
@@ -20,11 +23,39 @@ use crate::resolver::my_ip;
 const MAX_PROXY_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_JUDGE_RESPONSE_BYTES: usize = 576 * 1024;
 
+/// Renders `host:port`, bracketing IPv6 hosts.
+fn authority_for(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Renders a small handshake request line into a stack buffer when it fits,
+/// falling back to an owned `String` for pathologically overlong inputs. The
+/// common case is allocation-free (re-audit B.29/B.30).
+fn write_request<'a>(buf: &'a mut [u8], args: std::fmt::Arguments<'_>) -> Cow<'a, str> {
+    let mut writer = std::io::Cursor::new(buf);
+    match writer.write_fmt(args) {
+        Ok(()) => {
+            let len = writer.position() as usize;
+            Cow::Borrowed(
+                std::str::from_utf8(&writer.into_inner()[..len]).expect("request is ASCII"),
+            )
+        }
+        Err(_) => Cow::Owned(args.to_string()),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct JudgeTarget {
     scheme: String,
     host: String,
     port: u16,
+    /// Cached `host:port` (bracketed for IPv6), computed once at construction
+    /// instead of `format!`-ed on every probe (re-audit B.28).
+    authority: String,
     path_and_query: String,
     response_marker: String,
     request_token: String,
@@ -74,23 +105,17 @@ impl JudgeTarget {
             .path_and_query()
             .map(|value| value.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
+        let authority = authority_for(&host, port);
 
         Ok(Self {
             scheme: uri.scheme_str().unwrap_or("http").to_owned(),
             host,
             port,
+            authority,
             path_and_query,
             response_marker: target.response_marker.clone(),
             request_token: target.request_token.clone(),
         })
-    }
-
-    fn authority(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
     }
 }
 
@@ -111,15 +136,28 @@ pub(super) async fn support_tunnel(
     // never pays for a network round-trip it does not need.
     let needs_anonymity = matches!(protocol, Protocol::Https(_));
 
-    let total_attempts = max_attempts.saturating_mul(pool.len());
-    for _ in 0..total_attempts {
-        let validation_target = pool.next();
+    // Build every judge's fixed fields once per proxy instead of re-parsing
+    // each judge URL (six `String` allocations) on every attempt (B.33/B.34).
+    let mut candidates = Vec::new();
+    for validation_target in pool.candidates() {
         let target = JudgeTarget::from_validation_target(&validation_target)?;
+        candidates.push((validation_target, target));
+    }
+    let total_attempts = max_attempts.saturating_mul(candidates.len());
+    // Judges this proxy has already reported as failing (now cooling down);
+    // re-probing them within this loop would only burn another connect.
+    let mut cooling_down = HashSet::with_capacity(candidates.len());
+
+    for offset in 0..total_attempts {
+        let (validation_target, target) = &candidates[offset % candidates.len()];
+        if cooling_down.contains(&validation_target.url) {
+            continue;
+        }
         let started = time::Instant::now();
         let deadline = started + timeout;
         match time::timeout_at(
             deadline,
-            probe_once(proxy, &protocol, &target, deadline, insecure),
+            probe_once(proxy, &protocol, target, deadline, insecure),
         )
         .await
         {
@@ -135,7 +173,7 @@ pub(super) async fn support_tunnel(
                         .context(
                             "cannot determine anonymity level without knowing our own public IP",
                         )?;
-                    let anon = classify_anonymity(&String::from_utf8_lossy(&body), &my_ip);
+                    let anon = classify_anonymity(&body, &my_ip);
                     Protocol::Https(anon)
                 } else {
                     protocol
@@ -158,7 +196,8 @@ pub(super) async fn support_tunnel(
                 // Put the failing judge on cooldown so subsequent attempts
                 // (and other proxies) round-robin away from it, mirroring the
                 // HTTP path's `report_failure` behaviour (F-33).
-                pool.report_failure(&validation_target);
+                pool.report_failure(validation_target);
+                cooling_down.insert(validation_target.url.clone());
             }
             Err(_elapsed) => {
                 #[cfg(feature = "log")]
@@ -168,7 +207,8 @@ pub(super) async fn support_tunnel(
                     protocol,
                     timeout
                 );
-                pool.report_failure(&validation_target);
+                pool.report_failure(validation_target);
+                cooling_down.insert(validation_target.url.clone());
             }
         }
     }
@@ -182,18 +222,20 @@ async fn probe_once(
     target: &JudgeTarget,
     deadline: time::Instant,
     insecure: bool,
-) -> anyhow::Result<Vec<u8>> {
-    let target = match protocol {
-        Protocol::Connect(port) => JudgeTarget {
-            port: *port,
-            ..target.clone()
-        },
-        _ => target.clone(),
-    };
+) -> anyhow::Result<String> {
     let remaining = deadline
         .checked_duration_since(time::Instant::now())
         .context("tunnel validation timed out before TCP connect")?;
     let mut stream = BufReader::new(proxy.connect_timeout(remaining).await?.inner);
+
+    // CONNECT tunnels target the requested port rather than the judge's own,
+    // so only that variant pays for an owned authority string; every other
+    // protocol reuses the one cached on the `JudgeTarget` (B.28).
+    let authority = match protocol {
+        Protocol::Connect(port) => Cow::Owned(authority_for(&target.host, *port)),
+        _ => Cow::Borrowed(&target.authority),
+    };
+    let authority = authority.as_ref();
 
     let mut probe = ProtocolProbe {
         status: ValidationStatus::TcpReachable,
@@ -202,10 +244,10 @@ async fn probe_once(
     time::timeout_at(deadline, async {
         match protocol {
             Protocol::Https(_) | Protocol::Connect(_) => {
-                negotiate_http_connect(&mut stream, &target).await
+                negotiate_http_connect(&mut stream, authority).await
             }
-            Protocol::Socks4 => negotiate_socks4(&mut stream, &target).await,
-            Protocol::Socks5 => negotiate_socks5(&mut stream, &target).await,
+            Protocol::Socks4 => negotiate_socks4(&mut stream, target).await,
+            Protocol::Socks5 => negotiate_socks5(&mut stream, target).await,
             Protocol::Http(_) => anyhow::bail!("HTTP must be validated by support_http"),
         }
     })
@@ -214,9 +256,9 @@ async fn probe_once(
     probe.advance(ValidationStatus::HandshakePassed);
     let body = time::timeout_at(deadline, async {
         if target.scheme == "https" {
-            verify_tls_judge(stream.into_inner(), &target, insecure).await
+            verify_tls_judge(stream.into_inner(), target, insecure, authority).await
         } else {
-            verify_judge(&mut stream, &target).await
+            verify_judge(&mut stream, target, authority).await
         }
     })
     .await
@@ -228,11 +270,14 @@ async fn probe_once(
 
 async fn negotiate_http_connect(
     stream: &mut BufReader<TcpStream>,
-    target: &JudgeTarget,
+    authority: &str,
 ) -> anyhow::Result<()> {
-    let authority = target.authority();
-    let request = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    let mut buf = [0u8; 1024];
+    let request = write_request(
+        &mut buf,
+        format_args!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+        ),
     );
     stream.write_all(request.as_bytes()).await?;
 
@@ -325,8 +370,14 @@ async fn negotiate_socks5(
 }
 
 async fn read_discard(stream: &mut BufReader<TcpStream>, length: usize) -> anyhow::Result<()> {
-    let mut bytes = vec![0u8; length];
-    stream.read_exact(&mut bytes).await?;
+    // ATYP-bound addresses are at most 255 bytes (domain names); a stack
+    // buffer avoids a heap allocation per SOCKS handshake (re-audit B.32).
+    let mut bytes = [0u8; 256];
+    if length > bytes.len() {
+        anyhow::bail!("SOCKS reply address exceeds 256 bytes");
+    }
+    let slice = &mut bytes[..length];
+    stream.read_exact(slice).await?;
     Ok(())
 }
 
@@ -336,7 +387,8 @@ async fn verify_tls_judge(
     stream: TcpStream,
     target: &JudgeTarget,
     insecure: bool,
-) -> anyhow::Result<Vec<u8>> {
+    authority: &str,
+) -> anyhow::Result<String> {
     use hyper::client::conn::http1::handshake;
     use hyper_util::rt::TokioIo;
 
@@ -350,11 +402,11 @@ async fn verify_tls_judge(
         .context("HTTP handshake with TLS judge failed")?;
     let _driver = spawn_connection_driver(
         connection,
-        std::borrow::Cow::Owned(target.authority()),
+        std::borrow::Cow::Owned(authority.to_owned()),
         Duration::from_secs(30),
     );
     let request = hyper::Request::get(&target.path_and_query)
-        .header(hyper::header::HOST, target.authority())
+        .header(hyper::header::HOST, authority)
         .header(hyper::header::CONNECTION, "close")
         .header("X-Fluxy-Token", &target.request_token)
         .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
@@ -366,24 +418,28 @@ async fn verify_tls_judge(
     if body.len() > MAX_JUDGE_RESPONSE_BYTES {
         anyhow::bail!("TLS judge response exceeds validation limit");
     }
-    if !body
-        .windows(target.response_marker.len())
-        .any(|window| window == target.response_marker.as_bytes())
-    {
+    // The marker is pure ASCII and the lossy string preserves ASCII runs, so a
+    // token echoed in the raw bytes is found by this O(n) sub-string scan
+    // (Two-Way), replacing the previous per-window byte comparison (B.24).
+    let body = String::from_utf8_lossy(&body);
+    if !body.contains(&target.response_marker) {
         anyhow::bail!("response did not originate from the TLS judge");
     }
-    Ok(body.to_vec())
+    Ok(body.into_owned())
 }
 
 async fn verify_judge(
     stream: &mut BufReader<TcpStream>,
     target: &JudgeTarget,
-) -> anyhow::Result<Vec<u8>> {
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nX-Fluxy-Token: {}\r\nConnection: close\r\n\r\n",
-        target.path_and_query,
-        target.authority(),
-        target.request_token
+    authority: &str,
+) -> anyhow::Result<String> {
+    let mut buf = [0u8; 2048];
+    let request = write_request(
+        &mut buf,
+        format_args!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nX-Fluxy-Token: {}\r\nConnection: close\r\n\r\n",
+            target.path_and_query, authority, target.request_token
+        ),
     );
     stream.write_all(request.as_bytes()).await?;
 
@@ -404,13 +460,11 @@ async fn verify_judge(
     if status != 200 {
         anyhow::bail!("local judge returned status {status} through tunnel");
     }
-    if !response
-        .windows(target.response_marker.len())
-        .any(|window| window == target.response_marker.as_bytes())
-    {
+    let response = String::from_utf8_lossy(&response);
+    if !response.contains(&target.response_marker) {
         anyhow::bail!("response did not originate from the local judge");
     }
-    Ok(response)
+    Ok(response.into_owned())
 }
 
 async fn read_http_headers(stream: &mut BufReader<TcpStream>) -> anyhow::Result<Vec<u8>> {
