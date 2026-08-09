@@ -17,7 +17,10 @@ use anyhow::Context as _;
 use futures_util::{Stream, StreamExt};
 #[cfg(feature = "log")]
 use tokio::time::Instant;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, Semaphore},
+    task::JoinHandle,
+};
 
 pub use config::Config;
 pub use tunnel::ValidationStatus;
@@ -64,6 +67,10 @@ struct WorkParams {
     max_attempts: usize,
     request_timeout: u64,
     insecure: bool,
+    /// Bounds the number of concurrent TCP connects across all workers,
+    /// mirroring the fetcher's network semaphore. Holds one permit for the
+    /// whole probe (connect + negotiate + judge round-trip are all network).
+    tcp_semaphore: Arc<Semaphore>,
 }
 
 /// Whether a protocol advertised by a source is eligible for a specific user
@@ -105,6 +112,11 @@ async fn do_work(
     targets: JudgeTargets,
     params: WorkParams,
 ) -> anyhow::Result<()> {
+    let _tcp_permit = params
+        .tcp_semaphore
+        .acquire()
+        .await
+        .context("validator TCP semaphore closed during shutdown")?;
     let mut proxy = proxy.validation_probe();
     let timeout = Duration::from_secs(params.request_timeout);
     if let Protocol::Http(_) = protocol {
@@ -201,6 +213,10 @@ impl ProxyValidator {
         let request_timeout = config.request_timeout;
         let concurrency_limit = config.concurrency_limit;
         let insecure = config.insecure;
+        // Mirror the fetcher: a shared semaphore caps simultaneous TCP connects
+        // (plus their negotiation and judge round-trips) at the worker count
+        // instead of letting an unbounded burst overwhelm the OS.
+        let tcp_semaphore = Arc::new(Semaphore::new(concurrency_limit));
         let preflight_timeout = Duration::from_secs(config.request_timeout);
         let need_http = expected
             .iter()
@@ -290,6 +306,7 @@ impl ProxyValidator {
                 let sender = sender.clone();
                 let counter = Arc::clone(&manager_counter);
                 let targets = targets.clone();
+                let tcp_semaphore = Arc::clone(&tcp_semaphore);
                 async move {
                     if let Err(_e) = do_work(
                         proxy,
@@ -302,6 +319,7 @@ impl ProxyValidator {
                             max_attempts,
                             request_timeout,
                             insecure,
+                            tcp_semaphore,
                         },
                     )
                     .await

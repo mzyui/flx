@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use tokio::time;
+use tokio::{task::JoinSet, time};
 
 use anyhow::Context;
 
@@ -222,18 +222,35 @@ impl JudgePool {
         if urls.is_empty() {
             anyhow::bail!("judge pool must contain at least one candidate URL");
         }
-        let mut judges = Vec::with_capacity(urls.len());
         let mut seen = HashSet::with_capacity(urls.len());
+        let mut candidates = Vec::with_capacity(urls.len());
         for url in urls {
             if !seen.insert(url.clone()) {
                 continue; // de-duplicate without a redundant preflight
             }
             match ValidationTarget::online(url) {
-                Ok(target) => match target.verify_online(timeout, insecure).await {
-                    Ok(()) => judges.push(Arc::new(target)),
-                    Err(error) => on_dropped(url, &format!("{error:#}")),
-                },
+                Ok(target) => candidates.push((url.clone(), target)),
                 Err(error) => on_dropped(url, &format!("{error:#}")),
+            }
+        }
+
+        // Preflight every candidate concurrently so an N-judge pool pays one
+        // timeout instead of N sequential ones (startup cost is bounded by the
+        // slowest judge, not the sum).
+        let mut tasks = JoinSet::new();
+        for (url, target) in candidates {
+            tasks.spawn(async move {
+                let result = target.verify_online(timeout, insecure).await;
+                (url, target, result)
+            });
+        }
+
+        let mut judges = Vec::with_capacity(tasks.len());
+        while let Some(joined) = tasks.join_next().await {
+            let (url, target, result) = joined.context("online judge preflight task failed")?;
+            match result {
+                Ok(()) => judges.push(Arc::new(target)),
+                Err(error) => on_dropped(&url, &format!("{error:#}")),
             }
         }
         if judges.is_empty() {
