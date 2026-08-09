@@ -1,6 +1,8 @@
+mod cache;
 mod config;
 
 use std::{
+    borrow::Cow,
     collections::{hash_map::DefaultHasher, VecDeque},
     hash::{Hash, Hasher},
     net::Ipv4Addr,
@@ -213,6 +215,21 @@ impl ProxyFetcher {
         let concurrency_limit = config.concurrency_limit;
         let fallback_threshold = config.fallback_threshold;
 
+        // The local body cache is optional and best-effort: if the cache dir
+        // cannot be prepared the run simply proceeds without caching.
+        let fetch_cache = match config.cache_ttl {
+            Some(ttl) => match cache::Cache::new(ttl, config.refresh_cache) {
+                Ok(cache) => Some(Arc::new(cache)),
+                Err(error) => {
+                    #[cfg(feature = "log")]
+                    log::warn!("provider fetch cache disabled: {error:#}");
+                    let _ = error;
+                    None
+                }
+            },
+            None => None,
+        };
+
         // Proxies are counted by the consumer as they are accepted, so the
         // coordinator can size up the primary phase without any extra channel
         // hop or forwarding task. The tally reflects proxies that survived
@@ -236,8 +253,14 @@ impl ProxyFetcher {
             async move {
                 let mut stop_rx_coordinator = stop_rx_coordinator;
                 let sem = Arc::new(Semaphore::new(concurrency_limit));
-                let mut primary_handles =
-                    spawn_phase(primary, &client, &sem, sender.clone(), stop_rx_primary);
+                let mut primary_handles = spawn_phase(
+                    primary,
+                    &client,
+                    &sem,
+                    sender.clone(),
+                    stop_rx_primary,
+                    fetch_cache.clone(),
+                );
 
                 let mut primary_aborted = false;
                 tokio::select! {
@@ -299,8 +322,14 @@ impl ProxyFetcher {
                     fallback.len()
                 );
 
-                let mut fallback_handles =
-                    spawn_phase(fallback, &client, &sem, sender, stop_rx_fallback);
+                let mut fallback_handles = spawn_phase(
+                    fallback,
+                    &client,
+                    &sem,
+                    sender,
+                    stop_rx_fallback,
+                    fetch_cache,
+                );
                 while fallback_handles.join_next().await.is_some() {}
             }
         });
@@ -352,6 +381,7 @@ fn spawn_phase(
     sem: &Arc<Semaphore>,
     tx: mpsc::Sender<Proxy>,
     stop_rx: watch::Receiver<bool>,
+    fetch_cache: Option<Arc<cache::Cache>>,
 ) -> JoinSet<()> {
     let mut handles = JoinSet::new();
     for (source, provider) in tasks {
@@ -359,10 +389,13 @@ fn spawn_phase(
         let client = Arc::clone(client);
         let tx = tx.clone();
         let stop_rx = stop_rx.clone();
+        let fetch_cache = fetch_cache.clone();
 
         handles.spawn(async move {
             let url = source.url.to_string();
-            if let Err(e) = do_work(provider, client, source, tx, permit, stop_rx).await {
+            if let Err(e) =
+                do_work(provider, client, source, tx, permit, stop_rx, fetch_cache).await
+            {
                 #[cfg(feature = "log")]
                 log::error!("{}: {}", url, e);
                 let _ = (url, e);
@@ -376,7 +409,8 @@ fn spawn_phase(
 ///
 /// The semaphore permit covers the network fetch only. Parsing is CPU-bound
 /// and needs no network slot, so the permit is released before `scrape_with`
-/// runs — otherwise a slow parser would idle a connection slot.
+/// runs — otherwise a slow parser would idle a connection slot. A fresh cache
+/// hit skips both the network and the permit entirely.
 async fn do_work(
     provider: Arc<dyn ProxyProvider + Send + Sync>,
     client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
@@ -384,23 +418,48 @@ async fn do_work(
     tx: mpsc::Sender<Proxy>,
     sem: Arc<Semaphore>,
     stop_rx: watch::Receiver<bool>,
+    fetch_cache: Option<Arc<cache::Cache>>,
 ) -> anyhow::Result<()> {
     if *stop_rx.borrow() {
         return Ok(());
     }
-    let html = {
+    let url = source.url.to_string();
+
+    let html = if let Some(fetch_cache) = fetch_cache.as_ref() {
+        match fetch_cache.load(&url).await {
+            Some(body) => {
+                #[cfg(feature = "log")]
+                log::debug!("using cached body for {url}");
+                Cow::Owned(body)
+            }
+            None => {
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .context("fetcher semaphore closed during shutdown")?;
+                provider
+                    .fetch(client, &url, source.timeout)
+                    .await
+                    .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
+            }
+        }
+    } else {
         let _permit = sem
             .acquire()
             .await
             .context("fetcher semaphore closed during shutdown")?;
         provider
-            .fetch(client, &source.url.to_string(), source.timeout)
+            .fetch(client, &url, source.timeout)
             .await
             .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
     };
 
     if *stop_rx.borrow() {
         return Ok(());
+    }
+
+    if let Some(fetch_cache) = fetch_cache.as_ref() {
+        fetch_cache.store(&url, html.as_ref()).await;
     }
 
     let expected_types = Arc::clone(&source.default_types);
