@@ -1,8 +1,8 @@
 use std::{
     net::{IpAddr, Ipv4Addr},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::Context;
@@ -29,6 +29,53 @@ static HTTP_IP_ENDPOINTS: [&str; 3] = [
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IP_BODY_BYTES: usize = 64;
+
+/// Freshness window for the on-disk public-IP cache.
+///
+/// The host's public address rarely changes, so reusing it across runs skips
+/// the per-run DNS/HTTPS discovery (up to 5s on filtered networks).
+const PUBLIC_IP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Path of the cached public IP under the platform data dir.
+fn public_ip_cache_path() -> Option<PathBuf> {
+    let mut path = crate::geolookup::data_dir().ok()?;
+    path.push("public-ip");
+    Some(path)
+}
+
+/// Reads a fresh, parseable public IP from the on-disk cache, if any.
+async fn load_cached_public_ip(path: &Path) -> Option<String> {
+    let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+    let age = SystemTime::now().duration_since(modified).ok()?;
+    if age > PUBLIC_IP_CACHE_TTL {
+        return None;
+    }
+    let body = tokio::fs::read_to_string(path).await.ok()?;
+    let ip = body.trim();
+    if ip.parse::<IpAddr>().is_ok() {
+        Some(ip.to_string())
+    } else {
+        None
+    }
+}
+
+/// Best-effort store of the resolved public IP. Atomic via temp-file + rename.
+async fn store_public_ip(path: &Path, ip: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("public-ip");
+    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    if tokio::fs::write(&tmp, format!("{ip}\n")).await.is_err() {
+        return;
+    }
+    if tokio::fs::rename(&tmp, path).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+}
 
 /// Validates and normalizes a public-IP response body.
 ///
@@ -193,7 +240,15 @@ pub async fn my_ip() -> anyhow::Result<String> {
 async fn resolve_public_ip() -> anyhow::Result<String> {
     let start_time = Instant::now();
 
-    let dns_error = match my_ip_via_dns().await {
+    if let Some(path) = public_ip_cache_path() {
+        if let Some(ip) = load_cached_public_ip(&path).await {
+            #[cfg(feature = "log")]
+            log::debug!("My IP: {ip} (loaded from cache)");
+            return Ok(ip);
+        }
+    }
+
+    let ip = match my_ip_via_dns().await {
         Ok(ip) => {
             #[cfg(feature = "log")]
             log::debug!(
@@ -201,41 +256,97 @@ async fn resolve_public_ip() -> anyhow::Result<String> {
                 ip,
                 start_time.elapsed()
             );
-            let _ = start_time;
-            return Ok(ip);
+            ip
         }
-        Err(e) => e,
+        Err(dns_error) => {
+            #[cfg(feature = "log")]
+            log::debug!("DNS lookup failed ({:#}), falling back to HTTPS", dns_error);
+
+            match my_ip_via_https().await {
+                Ok(ip) => {
+                    #[cfg(feature = "log")]
+                    log::debug!(
+                        "My IP: {} (resolved via HTTPS in {:?})",
+                        ip,
+                        start_time.elapsed()
+                    );
+                    ip
+                }
+                Err(https_error) => {
+                    return Err(https_error.context(format!(
+                        "could not determine public IP; DNS also failed: {:#}",
+                        dns_error
+                    )));
+                }
+            }
+        }
     };
 
-    #[cfg(feature = "log")]
-    log::debug!("DNS lookup failed ({:#}), falling back to HTTPS", dns_error);
-
-    match my_ip_via_https().await {
-        Ok(ip) => {
-            #[cfg(feature = "log")]
-            log::debug!(
-                "My IP: {} (resolved via HTTPS in {:?})",
-                ip,
-                start_time.elapsed()
-            );
-            let _ = start_time;
-            Ok(ip)
-        }
-        Err(https_error) => Err(https_error.context(format!(
-            "could not determine public IP; DNS also failed: {:#}",
-            dns_error
-        ))),
+    if let Some(path) = public_ip_cache_path() {
+        store_public_ip(&path, &ip).await;
     }
+    let _ = start_time;
+    Ok(ip)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ip_body, MAX_IP_BODY_BYTES};
+    use super::{load_cached_public_ip, parse_ip_body, store_public_ip, MAX_IP_BODY_BYTES};
+    use std::{
+        fs::File,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, SystemTime},
+    };
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_cache_path() -> PathBuf {
+        let unique = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "fluxy_public_ip_test_{}_{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
 
     #[test]
     fn public_ip_body_is_bounded_and_validated() {
         assert_eq!(parse_ip_body(b"203.0.113.7\n").unwrap(), "203.0.113.7");
         assert!(parse_ip_body(&[b'x'; MAX_IP_BODY_BYTES + 1]).is_err());
         assert!(parse_ip_body(b"not-an-ip").is_err());
+    }
+
+    #[tokio::test]
+    async fn public_ip_cache_round_trips_fresh_ip() {
+        let path = temp_cache_path();
+        store_public_ip(&path, "203.0.113.7").await;
+        assert_eq!(
+            load_cached_public_ip(&path).await.as_deref(),
+            Some("203.0.113.7")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn expired_public_ip_cache_is_ignored() {
+        let path = temp_cache_path();
+        store_public_ip(&path, "203.0.113.7").await;
+        let file = File::open(&path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(25 * 60 * 60))
+            .unwrap();
+        drop(file);
+        assert!(load_cached_public_ip(&path).await.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn corrupt_public_ip_cache_is_ignored() {
+        let path = temp_cache_path();
+        tokio::fs::write(&path, "not-an-ip").await.unwrap();
+        assert!(load_cached_public_ip(&path).await.is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }
