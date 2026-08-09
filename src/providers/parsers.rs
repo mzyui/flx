@@ -444,15 +444,30 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
         let i_anon = header_index(&header, &["anonymity"]);
 
         for row in table.select(&ROW_SELECTOR) {
-            let cells: Vec<String> = row
-                .select(&CELL_SELECTOR)
-                .map(normalized_text)
-                .map(Cow::into_owned)
-                .collect();
-            if cells.len() < 2 {
-                continue;
+            let mut ip_cell: Option<Cow<'_, str>> = None;
+            let mut port_cell: Option<Cow<'_, str>> = None;
+            let mut type_cell: Option<Cow<'_, str>> = None;
+            let mut https_cell: Option<Cow<'_, str>> = None;
+            let mut anon_cell: Option<Cow<'_, str>> = None;
+
+            // Normalize only the columns we actually need, instead of
+            // materializing a Vec<String> for every cell of every row.
+            for (index, cell) in row.select(&CELL_SELECTOR).enumerate() {
+                if index == i_ip {
+                    ip_cell = Some(normalized_text(cell));
+                } else if index == i_port {
+                    port_cell = Some(normalized_text(cell));
+                } else if Some(index) == i_type {
+                    type_cell = Some(normalized_text(cell));
+                } else if Some(index) == i_https {
+                    https_cell = Some(normalized_text(cell));
+                } else if Some(index) == i_anon {
+                    anon_cell = Some(normalized_text(cell));
+                }
             }
-            let (Some(ip_cell), Some(port_cell)) = (cells.get(i_ip), cells.get(i_port)) else {
+
+            let (Some(ip_cell), Some(port_cell)) = (ip_cell.as_deref(), port_cell.as_deref())
+            else {
                 continue;
             };
             let (Ok(ip), Ok(port)) = (
@@ -463,19 +478,16 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
             };
 
             // Prefer an explicit protocol column, then the yes/no "Https" column.
-            let mut protocol = i_type
-                .and_then(|i| cells.get(i))
-                .and_then(|cell| protocol_from_str(cell));
+            let mut protocol = type_cell.as_deref().and_then(protocol_from_str);
             if protocol.is_none() {
-                if let Some(cell) = i_https.and_then(|i| cells.get(i)) {
+                if let Some(cell) = https_cell.as_deref() {
                     if cell.trim().eq_ignore_ascii_case("yes") {
                         protocol = Some(Protocol::Https(Anonymity::Unknown));
                     }
                 }
             }
             // Carry the anonymity level through for HTTP rows.
-            if let (Some(Protocol::Http(_)), Some(cell)) =
-                (protocol.as_ref(), i_anon.and_then(|i| cells.get(i)))
+            if let (Some(Protocol::Http(_)), Some(cell)) = (protocol.as_ref(), anon_cell.as_deref())
             {
                 protocol = Some(Protocol::Http(anonymity_from_str(cell)));
             }
