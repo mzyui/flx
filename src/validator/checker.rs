@@ -466,6 +466,11 @@ pub async fn support_http(
                 Err(_e) => {
                     #[cfg(feature = "log")]
                     log::trace!("{}: local judge unreachable: {:#}", proxy, _e);
+                    // A judge that cannot be reached once is likely still down;
+                    // cool it down so the round-robin (and every other proxy)
+                    // stops wasting an attempt and a TCP connect on it. Mirrors
+                    // the tunnel path (re-audit N2).
+                    pool.report_failure(&target);
                     continue;
                 }
             };
