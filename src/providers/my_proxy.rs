@@ -4,7 +4,6 @@ use async_trait::async_trait;
 
 use super::models::{valid_sources, ScrapeMode, Source};
 use super::ProxyProvider;
-use crate::proxy::models::{Anonymity, Protocol};
 
 /// The my-proxy.com free list, which embeds `ip:port#CC` pairs in page text.
 pub struct MyProxyProvider;
@@ -16,9 +15,8 @@ impl ProxyProvider for MyProxyProvider {
     }
 
     fn sources(&self) -> Vec<Source> {
-        valid_sources(vec![Source::typed(
+        valid_sources(vec![Source::http(
             "https://www.my-proxy.com/free-proxy-list.html",
-            Protocol::Http(Anonymity::Unknown),
         )
         .map(|source| {
             source

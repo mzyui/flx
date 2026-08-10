@@ -4,12 +4,12 @@ use async_trait::async_trait;
 
 use super::models::{valid_sources, ScrapeMode, Source};
 use super::ProxyProvider;
-use crate::proxy::models::{Anonymity, Protocol};
 
 /// The freeproxy.world paginated HTML table.
 pub struct FreeProxyWorldProvider;
 
-/// Pages requested per run, matching the reference implementation.
+/// Pages requested per run, ported from the `mzyui/proxy-list` engine
+/// (engine/src/providers/freeproxy-world.js).
 const MAX_PAGES: u32 = 15;
 
 #[async_trait]
@@ -26,7 +26,7 @@ impl ProxyProvider for FreeProxyWorldProvider {
                         "https://freeproxy.world/?type=&anonymity=&country=&speed=&port=&page={}",
                         page
                     );
-                    Source::typed(&url, Protocol::Http(Anonymity::Unknown)).map(|source| {
+                    Source::http(&url).map(|source| {
                         source
                             .with_mode(ScrapeMode::HtmlTable)
                             .with_timeout(Duration::from_secs(15))

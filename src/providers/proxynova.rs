@@ -4,7 +4,6 @@ use async_trait::async_trait;
 
 use super::models::{valid_sources, ScrapeMode, Source};
 use super::ProxyProvider;
-use crate::proxy::models::{Anonymity, Protocol};
 
 /// The api.proxynova.com JSON list.
 ///
@@ -19,14 +18,11 @@ impl ProxyProvider for ProxyNovaProvider {
     }
 
     fn sources(&self) -> Vec<Source> {
-        valid_sources(vec![Source::typed(
-            "https://api.proxynova.com/proxylist",
-            Protocol::Http(Anonymity::Unknown),
-        )
-        .map(|source| {
-            source
-                .with_mode(ScrapeMode::ProxyNovaJson)
-                .with_timeout(Duration::from_secs(15))
-        })])
+        valid_sources(vec![Source::http("https://api.proxynova.com/proxylist")
+            .map(|source| {
+                source
+                    .with_mode(ScrapeMode::ProxyNovaJson)
+                    .with_timeout(Duration::from_secs(15))
+            })])
     }
 }

@@ -15,7 +15,7 @@ use proxy::models::{Anonymity, Protocol, Proxy};
 use std::{
     fs::File,
     io::{BufReader, Lines},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 use std::{io::BufRead, net::Ipv4Addr, path::PathBuf};
 pub use validator::ProxyValidator;
@@ -38,12 +38,27 @@ pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
 
 /// Source of proxies to be validated.
 ///
-/// Wraps either a plaintext file of `ip:port` lines or an asynchronous
-/// [`ProxyFetcher`] stream, yielding one [`Proxy`] at a time.
+/// Wraps a plaintext file of `ip:port` lines, yielding one [`Proxy`] at a
+/// time. For provider-fetched proxies use [`ProxySource::from_fetcher`], which
+/// returns an asynchronous [`ProxyFetcher`] stream directly instead of a
+/// `ProxySource`.
 pub struct ProxySource {
     lines: Lines<BufReader<File>>,
     default_proxy_types: Arc<[Protocol]>,
 }
+
+/// Default protocol set inherited by proxies read from a file.
+///
+/// Built once and shared via `Arc::clone` instead of allocating a fresh
+/// `Vec<Protocol>` + `Arc` per `ProxySource` (audit A.11).
+static FILE_DEFAULT_PROTOCOLS: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| {
+    Arc::from([
+        Protocol::Http(Anonymity::Unknown),
+        Protocol::Https(Anonymity::Unknown),
+        Protocol::Socks4,
+        Protocol::Socks5,
+    ])
+});
 
 impl ProxySource {
     /// Starts a [`ProxyFetcher`] fed by every configured provider.
@@ -70,15 +85,7 @@ impl ProxySource {
         let buffered_reader = BufReader::new(file);
         let lines = buffered_reader.lines();
 
-        let default_proxy_types: Arc<[Protocol]> = Arc::from(
-            vec![
-                Protocol::Http(Anonymity::Unknown),
-                Protocol::Https(Anonymity::Unknown),
-                Protocol::Socks4,
-                Protocol::Socks5,
-            ]
-            .into_boxed_slice(),
-        );
+        let default_proxy_types = Arc::clone(&FILE_DEFAULT_PROTOCOLS);
 
         Ok(Self {
             lines,

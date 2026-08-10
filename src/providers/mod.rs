@@ -46,14 +46,15 @@ use models::ScrapeMode;
 
 /// Builds one instance of every provider fluxy knows about.
 ///
-/// Mirrors the registry in `mzyui/proxy-list` (engine/src/providers/index.js).
-/// `proxyscan` is intentionally absent: its download endpoint returns HTTP 404
-/// for every protocol and it is disabled upstream too.
+/// Mirrors the provider registry of the reference `mzyui/proxy-list` engine
+/// (engine/src/providers/index.js). `proxyscan` is intentionally absent from
+/// that registry: its download endpoint has historically returned HTTP 404 for
+/// every protocol and it is disabled upstream as well.
 ///
 /// Ordering matters: website providers come first because they publish fresh,
 /// self-maintained lists, while [`GithubRepoProvider`] is deliberately last —
-/// the GitHub mirrors are aggregated copies of those same sites and serve only
-/// as a fallback when the primary sources are unreachable or empty.
+/// its lists aggregate copies of other sources and serve as a fallback when
+/// the primary providers are unreachable or empty.
 pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
     vec![
         // Primary: live websites / APIs.

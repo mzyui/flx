@@ -16,12 +16,18 @@ use crate::{error::ProtocolParseError, geolookup::models::GeoData};
 /// Online running statistics for response-time tracking.
 ///
 /// Stores count, total, min and max so the average can be computed at any
-/// point without keeping every individual sample in memory.
+/// point without keeping every individual sample in memory. All durations are
+/// measured in seconds; a freshly defaulted record has `count` of 0 and `min`,
+/// `max`, and `total` of `0.0`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeStats {
+    /// Number of timing samples recorded so far.
     pub count: u32,
+    /// Sum of all recorded durations, in seconds.
     pub total: f64,
+    /// Minimum recorded duration, in seconds (`0.0` before the first sample).
     pub min: f64,
+    /// Maximum recorded duration, in seconds (`0.0` before the first sample).
     pub max: f64,
 }
 
@@ -51,13 +57,20 @@ impl RuntimeStats {
 // ── Anonymity ─────────────────────────────────────────────────────────
 
 /// Represents the level of anonymity of a proxy.
+///
+/// The level is derived from a heuristic scan of the judge response body (see
+/// `validator::checker::classify_anonymity`): it reflects which leaks were
+/// *detected* on the last check, not an absolute guarantee.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub enum Anonymity {
-    /// Elite anonymity: No IP address or headers are leaked.
+    /// Elite anonymity: no known IP or leaking header indicators were detected
+    /// in the judge response.
     Elite,
-    /// Transparent anonymity: Original IP address is visible.
+    /// Transparent anonymity: the original IP address was visible in the judge
+    /// response.
     Transparent,
-    /// Anonymous anonymity: Some headers may be leaked, but IP is hidden.
+    /// Anonymous anonymity: the IP is hidden, but headers that typically leak
+    /// client or proxy metadata were detected.
     Anonymous,
     /// Anonymity is unknown.
     Unknown,
@@ -140,7 +153,8 @@ pub struct ProxyType {
     /// Indicates if the proxy has been checked
     #[serde(skip)]
     pub checked: bool,
-    /// Time when this proxy type was checked
+    /// Unix timestamp in seconds when this proxy type was checked, falling
+    /// back to `0.0` when the system clock precedes the Unix epoch.
     pub checked_on: f64,
 }
 
@@ -189,7 +203,8 @@ pub struct Proxy {
     pub port: u16,
     /// Geographical data associated with the proxy.
     pub geo: Arc<GeoData>,
-    /// Running response-time statistics (replaces unbounded Vec<f64>).
+    /// Running response-time statistics (replaces an unbounded list of
+    /// per-sample durations).
     #[serde(
         rename = "average_response_time",
         serialize_with = "serialize_runtimes"
@@ -289,17 +304,12 @@ impl Display for Proxy {
             write!(f, "<Proxy --")?;
         }
 
-        write!(
-            f,
-            " {:.2}s [{}] {}:{}>",
-            self.avg_response_time(),
-            self.proxy_type
-                .as_ref()
-                .map(|v| format!("{}", v.protocol))
-                .unwrap_or("--".into()),
-            self.ip,
-            self.port
-        )
+        write!(f, " {:.2}s [", self.avg_response_time())?;
+        match &self.proxy_type {
+            Some(proxy_type) => write!(f, "{}", proxy_type.protocol)?,
+            None => write!(f, "--")?,
+        }
+        write!(f, "] {}:{}>", self.ip, self.port)
     }
 }
 

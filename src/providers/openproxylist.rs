@@ -4,12 +4,12 @@ use async_trait::async_trait;
 
 use super::models::{valid_sources, Source};
 use super::ProxyProvider;
-use crate::proxy::models::{Anonymity, Protocol};
+use crate::proxy::models::Protocol;
 
 /// A provider for the api.openproxylist.xyz plaintext lists.
 pub struct OpenProxyListProvider;
 
-/// Per-request timeout, matching the reference implementation.
+/// Per-request timeout, ported from the `mzyui/proxy-list` engine.
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[async_trait]
@@ -20,11 +20,7 @@ impl ProxyProvider for OpenProxyListProvider {
 
     fn sources(&self) -> Vec<Source> {
         valid_sources(vec![
-            Source::typed(
-                "https://api.openproxylist.xyz/http.txt",
-                Protocol::Http(Anonymity::Unknown),
-            )
-            .map(|s| s.with_timeout(TIMEOUT)),
+            Source::http("https://api.openproxylist.xyz/http.txt").map(|s| s.with_timeout(TIMEOUT)),
             Source::typed("https://api.openproxylist.xyz/socks4.txt", Protocol::Socks4)
                 .map(|s| s.with_timeout(TIMEOUT)),
             Source::typed("https://api.openproxylist.xyz/socks5.txt", Protocol::Socks5)

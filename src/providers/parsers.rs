@@ -370,9 +370,7 @@ struct HeaderColumns {
 ///
 /// Lowercases and trims every header cell exactly once, then indexes the cells
 /// by their normalized text in a `HashMap` so all five columns resolve against
-/// a single map. The previous `header_index` re-lowered and re-scanned the
-/// whole header per column (5 × cells × names, with a `String` allocation per
-/// cell per call).
+/// a single map.
 fn header_columns(header: &[String]) -> HeaderColumns {
     let lower: Vec<String> = header
         .iter()

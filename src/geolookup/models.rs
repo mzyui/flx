@@ -7,6 +7,9 @@ use serde::Serialize;
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct GeoData {
     /// Two-letter ISO 3166 country code (e.g. `ID`).
+    ///
+    /// Falls back to the two-letter continent code (e.g. `EU`, `AS`) when the
+    /// database reports no country for the address (see `extract_country_data`).
     pub iso_code: Option<String>,
     /// English country name.
     pub name: Option<String>,

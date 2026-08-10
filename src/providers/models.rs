@@ -1,4 +1,8 @@
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{
+    str::FromStr,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use anyhow::Context;
 use hyper::Uri;
@@ -49,33 +53,43 @@ pub struct Source {
     pub mode: ScrapeMode,
 }
 
+/// Default protocol set assigned to sources that advertise none.
+///
+/// Built once and shared via `Arc::clone` instead of allocating a fresh
+/// `Vec<Protocol>` + `Arc` per source (audit A.11).
+static COMMON_SOURCE_PROTOCOLS: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| {
+    Arc::from([
+        Protocol::Http(Anonymity::Unknown),
+        Protocol::Https(Anonymity::Unknown),
+        Protocol::Socks4,
+        Protocol::Socks5,
+        Protocol::Connect(25),
+        Protocol::Connect(80),
+        Protocol::Connect(443),
+    ])
+});
+
 impl Source {
     /// Creates a source from a URL and the protocol types it advertises.
     ///
     /// When `types` is empty, the source reflects that no specific protocol is
     /// known and the full common set (`HTTP`, `HTTPS`, `SOCKS4`, `SOCKS5`,
-    /// `CONNECT:25`, `CONNECT:80`) is used, subject to verification.
+    /// `CONNECT:25`, `CONNECT:80`, `CONNECT:443`) is used, subject to
+    /// verification.
     ///
     /// # Errors
     ///
     /// Returns an error if `url` is not a valid URI.
     pub fn new(url: &str, types: Vec<Protocol>) -> anyhow::Result<Self> {
-        let types = if types.is_empty() {
-            vec![
-                Protocol::Http(Anonymity::Unknown),
-                Protocol::Https(Anonymity::Unknown),
-                Protocol::Socks4,
-                Protocol::Socks5,
-                Protocol::Connect(25),
-                Protocol::Connect(80),
-            ]
+        let default_types = if types.is_empty() {
+            Arc::clone(&COMMON_SOURCE_PROTOCOLS)
         } else {
-            types
+            Arc::from(types)
         };
 
         Ok(Self {
             url: Uri::from_str(url).with_context(|| format!("invalid provider url: {}", url))?,
-            default_types: Arc::from(types.into_boxed_slice()),
+            default_types,
             timeout: Duration::from_secs(3),
             mode: ScrapeMode::Plaintext,
         })
@@ -126,6 +140,7 @@ impl Source {
                 Protocol::Https(Anonymity::Unknown),
                 Protocol::Connect(80),
                 Protocol::Connect(25),
+                Protocol::Connect(443),
             ],
         )
     }

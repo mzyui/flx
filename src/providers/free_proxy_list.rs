@@ -34,7 +34,11 @@ impl ProxyProvider for FreeProxyListProvider {
             sites
                 .into_iter()
                 .map(|(url, protocol)| {
-                    Source::typed(url, protocol).map(|source| {
+                    let source = match protocol {
+                        Protocol::Http(_) | Protocol::Https(_) => Source::http(url),
+                        _ => Source::typed(url, protocol),
+                    };
+                    source.map(|source| {
                         source
                             .with_mode(ScrapeMode::HtmlTable)
                             .with_timeout(Duration::from_secs(15))

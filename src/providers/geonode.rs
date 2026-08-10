@@ -11,7 +11,8 @@ use super::ProxyProvider;
 /// and a single entry may advertise several. No API key is required.
 pub struct GeonodeProvider;
 
-/// Number of pages requested, matching the reference implementation.
+/// Number of pages requested, ported from the `mzyui/proxy-list` engine
+/// (engine/src/providers/geonode.js).
 const PAGES: u32 = 3;
 /// Entries per page.
 const LIMIT: u32 = 500;

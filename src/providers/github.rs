@@ -8,8 +8,9 @@ use crate::proxy::models::{Anonymity, Protocol};
 
 /// A provider for fetching proxy lists from GitHub repositories.
 ///
-/// This is by far the highest-yield provider: in the reference Node
-/// implementation it contributes roughly 97% of all unique proxies.
+/// Historically the highest-yield provider in the reference `mzyui/proxy-list`
+/// engine, contributing roughly 97% of unique proxies there. That figure is not
+/// computed here and depends on external source availability and timing.
 pub struct GithubRepoProvider;
 
 /// `(path after raw.githubusercontent.com, protocol)` for every tracked list.
@@ -146,13 +147,14 @@ impl ProxyProvider for GithubRepoProvider {
             SOURCES
                 .iter()
                 .map(|(path, protocol)| {
-                    Source::typed(
-                        &format!("https://raw.githubusercontent.com/{}", path),
-                        protocol.clone(),
-                    )
+                    let url = format!("https://raw.githubusercontent.com/{}", path);
+                    let source = match protocol {
+                        Protocol::Http(_) | Protocol::Https(_) => Source::http(&url),
+                        _ => Source::typed(&url, protocol.clone()),
+                    };
                     // Some of these lists are multi-megabyte; the 3s default
                     // truncates them mid-download.
-                    .map(|source| source.with_timeout(Duration::from_secs(20)))
+                    source.map(|source| source.with_timeout(Duration::from_secs(20)))
                 })
                 .collect(),
         )
