@@ -183,9 +183,14 @@ where
     let mut source = std::pin::pin!(source.enumerate());
 
     // One stdout lock for the whole run instead of `print!` re-acquiring the
-    // global lock (`std::io::_print`) for every proxy (re-audit N5).
+    // global lock (`std::io::_print`) for every proxy.
     let mut stdout = std::io::stdout().lock();
     use std::io::Write as _;
+
+    // Reusable per-item buffer: each proxy's bytes are assembled here (no
+    // per-item `String` allocation) and written in a single call, so stdout
+    // issues one syscall per proxy.
+    let mut buf: Vec<u8> = Vec::new();
 
     // When `cancel` resolves (Ctrl+C in the real binary), the run finalizes a
     // valid JSON document instead of leaving an unterminated array behind.
@@ -204,46 +209,46 @@ where
             item = source.next() => {
                 let Some((index, proxy)) = item else { break };
                 let should_end = options.limit > 0 && index + 1 >= options.limit;
-                let output = match options.format.as_str() {
+                buf.clear();
+                match options.format.as_str() {
                     "text" => {
-                        let mut text = proxy.as_text().to_owned();
-                        text.push('\n');
-                        text
+                        buf.extend_from_slice(proxy.as_text().as_bytes());
+                        buf.push(b'\n');
                     }
                     "json" => {
-                        let mut json_output = String::new();
                         if index == 0 {
-                            json_output.push_str("[\n  ");
+                            buf.extend_from_slice(b"[\n  ");
                         } else {
-                            json_output.push_str(",\n  ");
+                            buf.extend_from_slice(b",\n  ");
                         }
-                        json_output.push_str(&proxy.as_json());
-                        json_output
+                        let body_start = buf.len();
+                        if serde_json::to_writer(&mut buf, &proxy).is_err() {
+                            // `as_json()` falls back to an empty string when
+                            // serialization fails; mirror that by undoing the
+                            // partial write.
+                            buf.truncate(body_start);
+                        }
                     }
                     "pretty-json" => {
-                        let mut json_output = String::new();
                         if index == 0 {
-                            json_output.push_str("[\n");
+                            buf.extend_from_slice(b"[\n");
                         } else {
-                            json_output.push_str(",\n");
+                            buf.extend_from_slice(b",\n");
                         }
                         let pretty = proxy.as_pretty_json();
-                        let lines: Vec<&str> = pretty.lines().collect();
-                        let last = lines.len().saturating_sub(1);
-                        for (i, line) in lines.iter().enumerate() {
-                            json_output.push_str("  ");
-                            json_output.push_str(line);
-                            if i < last {
-                                json_output.push('\n');
+                        for (i, line) in pretty.lines().enumerate() {
+                            if i > 0 {
+                                buf.push(b'\n');
                             }
+                            buf.extend_from_slice(b"  ");
+                            buf.extend_from_slice(line.as_bytes());
                         }
-                        json_output
                     }
-                    _ => format!("{}\n", proxy),
+                    _ => writeln!(&mut buf, "{}", proxy).expect("writing to a Vec cannot fail"),
                 };
 
                 if let Some(ref mut file) = output_file {
-                    if let Err(error) = file.write_all(output.as_bytes()).await {
+                    if let Err(error) = file.write_all(&buf).await {
                         write_error = Some(
                             anyhow::Error::new(error)
                                 .context("failed to write proxy to output file"),
@@ -252,9 +257,9 @@ where
                     }
                 } else {
                     // `print!` panics on a broken pipe; keep that behaviour by
-                    // panicking here too (re-audit N5).
+                    // panicking here too.
                     stdout
-                        .write_all(output.as_bytes())
+                        .write_all(&buf)
                         .expect("failed to write proxy to stdout");
                 }
 
