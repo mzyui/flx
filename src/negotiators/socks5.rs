@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{borrow::Cow, net::IpAddr};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -13,6 +13,48 @@ use crate::proxy::models::RuntimeStats;
 
 /// Negotiator for SOCKS5 proxies.
 pub struct Socks5Negotiator;
+
+impl Socks5Negotiator {
+    /// Builds the SOCKS5 CONNECT request into a stack buffer. The domain
+    /// branch enforces a 255-byte hostname (RFC 1928), so the packet can never
+    /// exceed the buffer.
+    fn build_connect_request<'a>(
+        buf: &'a mut [u8],
+        host: &str,
+        port: u16,
+    ) -> anyhow::Result<Cow<'a, [u8]>> {
+        let mut len = 0usize;
+        buf[len..len + 3].copy_from_slice(&[5u8, 1u8, 0u8]); // VER, CMD, RSV
+        len += 3;
+        match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => {
+                buf[len] = 1; // ATYP IPv4
+                len += 1;
+                buf[len..len + 4].copy_from_slice(&ip.octets());
+                len += 4;
+            }
+            Ok(IpAddr::V6(ip)) => {
+                buf[len] = 4; // ATYP IPv6
+                len += 1;
+                buf[len..len + 16].copy_from_slice(&ip.octets());
+                len += 16;
+            }
+            Err(_) => {
+                let length =
+                    u8::try_from(host.len()).context("SOCKS5 target hostname exceeds 255 bytes")?;
+                buf[len] = 3; // ATYP domain
+                len += 1;
+                buf[len] = length;
+                len += 1;
+                buf[len..len + host.len()].copy_from_slice(host.as_bytes());
+                len += host.len();
+            }
+        }
+        buf[len..len + 2].copy_from_slice(&port.to_be_bytes());
+        len += 2;
+        Ok(Cow::Borrowed(&buf[..len]))
+    }
+}
 
 #[async_trait]
 impl NegotiatorTrait for Socks5Negotiator {
@@ -56,25 +98,9 @@ impl NegotiatorTrait for Socks5Negotiator {
             .context("SOCKS5 target URI has no port")?;
 
         // CONNECT request: VER=5, CMD=1, RSV=0, ATYP, DST.ADDR, DST.PORT (BE).
-        let mut connection_packet = Vec::with_capacity(22 + host.len());
-        connection_packet.extend_from_slice(&[5u8, 1u8, 0u8]);
-        match host.parse::<IpAddr>() {
-            Ok(IpAddr::V4(ip)) => {
-                connection_packet.push(1);
-                connection_packet.extend_from_slice(&ip.octets());
-            }
-            Ok(IpAddr::V6(ip)) => {
-                connection_packet.push(4);
-                connection_packet.extend_from_slice(&ip.octets());
-            }
-            Err(_) => {
-                let length =
-                    u8::try_from(host.len()).context("SOCKS5 target hostname exceeds 255 bytes")?;
-                connection_packet.extend_from_slice(&[3, length]);
-                connection_packet.extend_from_slice(host.as_bytes());
-            }
-        }
-        connection_packet.extend_from_slice(&port.to_be_bytes());
+        // Built into a stack buffer; RFC 1928 bounds the domain to 255 bytes.
+        let mut packet_buf = [0u8; 512];
+        let connection_packet = Self::build_connect_request(&mut packet_buf, host, port)?;
 
         let start_time = Instant::now();
         stream.write_all(&connection_packet).await?;
@@ -103,8 +129,11 @@ impl NegotiatorTrait for Socks5Negotiator {
             }
             address_type => anyhow::bail!("InvalidData: invalid response ATYP: {address_type}"),
         };
-        let mut tail = vec![0u8; address_length + 2];
-        stream.read_exact(&mut tail).await?;
+        // Discard the variable-length bound address and trailing port (the
+        // domain ATYP caps the length at 255, so 257 bytes always fit).
+        let mut tail_buf = [0u8; 258];
+        let tail_len = address_length + 2;
+        stream.read_exact(&mut tail_buf[..tail_len]).await?;
 
         Ok(())
     }
