@@ -589,7 +589,7 @@ mod tests {
     async fn assert_end_to_end_validation(protocol: Protocol) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server_protocol = protocol.clone();
+        let server_protocol = protocol;
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             serve_successful_protocol(stream, server_protocol)
