@@ -12,6 +12,7 @@ use fluxy::{
 };
 use futures_util::{Stream, StreamExt};
 use std::future::Future;
+use std::sync::Arc;
 use tokio::{io::AsyncWriteExt, runtime};
 
 mod argument;
@@ -333,7 +334,7 @@ fn fetcher_config(options: &Cli) -> fluxy::fetcher::Config {
     fluxy::fetcher::Config {
         concurrency_limit: options.fetch_concurrency as usize,
         enable_geo_lookup: options.with_geo || !options.countries.is_empty(),
-        countries: options.countries.clone(),
+        countries: Arc::from(options.countries.as_slice()),
         cache_ttl: (options.cache_ttl > 0)
             .then(|| std::time::Duration::from_secs(options.cache_ttl * 60)),
         refresh_cache: options.refresh_cache,
@@ -446,7 +447,7 @@ mod tests {
         let combined = Cli::parse_from(["fluxy", "--with-geo", "--countries", "ID"]);
         let config = fetcher_config(&combined);
         assert!(config.enable_geo_lookup);
-        assert_eq!(config.countries, vec!["ID"]);
+        assert_eq!(config.countries.as_ref(), ["ID".to_owned()]);
     }
 
     #[test]

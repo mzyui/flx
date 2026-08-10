@@ -814,7 +814,7 @@ mod tests {
         // Regression for F-34: requesting a country filter while GeoIP lookup
         // is disabled must fail fast instead of silently dropping every proxy.
         let config = Config {
-            countries: vec!["ID".to_owned()],
+            countries: Arc::from(vec!["ID".to_owned()]),
             enable_geo_lookup: false,
             ..Config::default()
         };
@@ -832,7 +832,7 @@ mod tests {
         // different, acceptable error. We only assert the F-34 guard does not
         // trip when the combination is valid.
         let config = Config {
-            countries: vec!["ID".to_owned()],
+            countries: Arc::from(vec!["ID".to_owned()]),
             enable_geo_lookup: true,
             ..Config::default()
         };

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 /// Configuration for the proxy fetching pipeline.
 pub struct Config {
@@ -12,7 +12,7 @@ pub struct Config {
     /// The lookup is off by default because it adds per-proxy I/O.
     pub enable_geo_lookup: bool,
     /// ISO country codes to filter accepted proxies by; empty means no filter.
-    pub countries: Vec<String>,
+    pub countries: Arc<[String]>,
     /// Skip the fallback (GitHub mirror) providers when the primary providers
     /// already yielded at least this many proxies.
     ///
@@ -42,7 +42,7 @@ impl Default for Config {
             enforce_unique_ip: true,
             concurrency_limit: 10,
             enable_geo_lookup: false,
-            countries: Vec::new(),
+            countries: Arc::from(Vec::new()),
             fallback_threshold: None,
             cache_ttl: None,
             refresh_cache: false,
@@ -53,6 +53,7 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use std::sync::Arc;
 
     #[test]
     fn geo_lookup_is_disabled_by_default() {
@@ -62,12 +63,12 @@ mod tests {
     #[test]
     fn country_filters_are_normalized_and_deduplicated() {
         let config = Config {
-            countries: vec![
+            countries: Arc::from(vec![
                 "id".to_owned(),
                 "ID".to_owned(),
                 " us ".to_owned(),
                 String::new(),
-            ],
+            ]),
             ..Config::default()
         };
 
