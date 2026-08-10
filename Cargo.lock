@@ -412,6 +412,7 @@ dependencies = [
  "libc",
  "log",
  "maxminddb",
+ "memchr",
  "native-tls",
  "regex",
  "scraper",
