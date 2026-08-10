@@ -61,7 +61,7 @@ impl RuntimeStats {
 /// The level is derived from a heuristic scan of the judge response body (see
 /// `validator::checker::classify_anonymity`): it reflects which leaks were
 /// *detected* on the last check, not an absolute guarantee.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Anonymity {
     /// Elite anonymity: no known IP or leaking header indicators were detected
     /// in the judge response.
@@ -79,7 +79,7 @@ pub enum Anonymity {
 // ── Protocol ─────────────────────────────────────────────────────────
 
 /// Represents different protocols that a proxy can support.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Protocol {
     Http(Anonymity),
     Https(Anonymity),
