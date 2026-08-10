@@ -728,9 +728,8 @@ mod tests {
 
     /// Spawns a plain-HTTP judge that echoes the `X-Fluxy-Token` header.
     ///
-    /// The header match is case-insensitive, so this works with the buggy
-    /// token extraction used by `spawn_self_signed_judge` (F-32) and is safe to
-    /// rely on for the streaming-preflight tests.
+    /// The header match is case-insensitive, mirroring `spawn_self_signed_judge`
+    /// (F-32), and is safe to rely on for the streaming-preflight tests.
     async fn spawn_plain_echo_judge() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -806,9 +805,11 @@ mod tests {
                     }
                     for line in received.split(|&b| b == b'\n') {
                         let line = String::from_utf8_lossy(line).to_string();
-                        if let Some(rest) = line.strip_prefix("X-Fluxy-Token:") {
-                            token = rest.trim().to_owned();
-                            break;
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
+                                token = value.trim().to_owned();
+                                break;
+                            }
                         }
                     }
                     let body = if echo_token {
