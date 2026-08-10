@@ -1,3 +1,5 @@
+use std::{borrow::Cow, io::Write as _};
+
 use async_trait::async_trait;
 use hyper::Uri;
 use tokio::{
@@ -13,11 +15,48 @@ use crate::proxy::models::RuntimeStats;
 pub struct HttpsNegotiator;
 
 impl HttpsNegotiator {
-    /// Builds the HTTP `CONNECT` request sent to the proxy.
-    fn generate_connect_request(&self, authority: &str) -> String {
-        format!(
+    /// Writes `host:port` (bracketed for IPv6) into a stack buffer, falling
+    /// back to an owned `String` only for overlong hosts.
+    fn write_authority<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, str> {
+        let mut writer = std::io::Cursor::new(buf);
+        let result = if host.contains(':') {
+            writer.write_fmt(format_args!("[{host}]:{port}"))
+        } else {
+            writer.write_fmt(format_args!("{host}:{port}"))
+        };
+        match result {
+            Ok(()) => {
+                let len = writer.position() as usize;
+                Cow::Borrowed(
+                    std::str::from_utf8(&writer.into_inner()[..len]).expect("authority is ASCII"),
+                )
+            }
+            Err(_) => Cow::Owned(if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            }),
+        }
+    }
+
+    /// Writes the HTTP `CONNECT` request line into a stack buffer, falling back
+    /// to an owned `String` only for pathologically overlong authorities.
+    fn write_connect_request<'a>(buf: &'a mut [u8], authority: &str) -> Cow<'a, str> {
+        let mut writer = std::io::Cursor::new(buf);
+        match writer.write_fmt(format_args!(
             "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
-        )
+        )) {
+            Ok(()) => {
+                let len = writer.position() as usize;
+                Cow::Borrowed(
+                    std::str::from_utf8(&writer.into_inner()[..len])
+                        .expect("CONNECT request is ASCII"),
+                )
+            }
+            Err(_) => Cow::Owned(format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
+            )),
+        }
     }
 }
 
@@ -33,12 +72,10 @@ impl NegotiatorTrait for HttpsNegotiator {
         // Configure the connect authority from the target URI.
         if let Some(host) = uri.host() {
             let port = uri.port_u16().unwrap_or(443);
-            let authority = if host.contains(':') {
-                format!("[{host}]:{port}")
-            } else {
-                format!("{host}:{port}")
-            };
-            let connect_request = self.generate_connect_request(&authority);
+            let mut authority_buf = [0u8; 256];
+            let authority = Self::write_authority(&mut authority_buf, host, port);
+            let mut request_buf = [0u8; 1024];
+            let connect_request = Self::write_connect_request(&mut request_buf, &authority);
 
             // CONNECT only makes sense when tunnelling to an HTTPS target.
             if !uri.scheme().is_some_and(|s| s.as_str() == "https") {
@@ -47,7 +84,7 @@ impl NegotiatorTrait for HttpsNegotiator {
 
             self.log_trace(
                 proxy_host,
-                format!("Sending a connection request to {}", host),
+                format_args!("Sending a connection request to {}", host),
             );
             let start_time = time::Instant::now();
             stream.write_all(connect_request.as_bytes()).await?;
