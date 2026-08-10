@@ -395,8 +395,8 @@ mod tests {
         // omitted it.
         let mut proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 40), 8080);
         proxy.geo = Arc::new(crate::geolookup::models::GeoData {
-            iso_code: Some("ID".to_owned()),
-            name: Some("Indonesia".to_owned()),
+            iso_code: Some("ID".into()),
+            name: Some("Indonesia".into()),
             region_iso_code: None,
             region_name: None,
             city_name: None,

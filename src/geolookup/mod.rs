@@ -392,14 +392,14 @@ impl GeoLookup {
     /// reported) resolved for the address.
     fn extract_country_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(country) = &lookup.country {
-            geodata.iso_code = country.iso_code.map(ToString::to_string);
+            geodata.iso_code = country.iso_code.map(Box::from);
             if let Some(country_names) = &country.names {
-                geodata.name = country_names.get("en").map(ToString::to_string);
+                geodata.name = country_names.get("en").map(|name| Box::from(*name));
             }
         } else if let Some(continent) = &lookup.continent {
-            geodata.iso_code = continent.code.map(ToString::to_string);
+            geodata.iso_code = continent.code.map(Box::from);
             if let Some(continent_names) = &continent.names {
-                geodata.name = continent_names.get("en").map(ToString::to_string);
+                geodata.name = continent_names.get("en").map(|name| Box::from(*name));
             }
         }
     }
@@ -408,9 +408,9 @@ impl GeoLookup {
     fn extract_region_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(subdivisions) = &lookup.subdivisions {
             if let Some(division) = subdivisions.first() {
-                geodata.region_iso_code = division.iso_code.map(ToString::to_string);
+                geodata.region_iso_code = division.iso_code.map(Box::from);
                 if let Some(division_names) = &division.names {
-                    geodata.region_name = division_names.get("en").map(ToString::to_string);
+                    geodata.region_name = division_names.get("en").map(|name| Box::from(*name));
                 }
             }
         }
@@ -420,7 +420,7 @@ impl GeoLookup {
     fn extract_city_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(city) = &lookup.city {
             if let Some(city_names) = &city.names {
-                geodata.city_name = city_names.get("en").map(ToString::to_string);
+                geodata.city_name = city_names.get("en").map(|name| Box::from(*name));
             }
         }
     }

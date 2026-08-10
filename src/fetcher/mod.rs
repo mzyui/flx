@@ -568,7 +568,7 @@ where
                 .geo
                 .iso_code
                 .as_ref()
-                .map(|code| countries.contains(code))
+                .map(|code| countries.contains(code.as_ref()))
                 .unwrap_or(false)
         {
             return None;
@@ -786,7 +786,7 @@ mod tests {
             proxy,
             |_| {
                 Some(GeoData {
-                    iso_code: Some("ID".to_owned()),
+                    iso_code: Some("ID".into()),
                     ..GeoData::default()
                 })
             },
