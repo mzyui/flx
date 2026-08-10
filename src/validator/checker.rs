@@ -353,7 +353,9 @@ impl JudgePool {
                 .elapsed()
                 .saturating_add(JUDGE_FAILURE_COOLDOWN)
                 .as_millis() as u64;
-            inner.cooldown_until_ms[index].0.store(until, Ordering::Relaxed);
+            inner.cooldown_until_ms[index]
+                .0
+                .store(until, Ordering::Relaxed);
         }
     }
 
@@ -382,7 +384,9 @@ impl JudgePool {
     pub(crate) fn append(&self, target: Arc<ValidationTarget>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.judges.push(target);
-        inner.cooldown_until_ms.push(PaddedCooldown(AtomicU64::new(0)));
+        inner
+            .cooldown_until_ms
+            .push(PaddedCooldown(AtomicU64::new(0)));
     }
 
     /// Builds a pool from already-constructed targets (used by tests and the
