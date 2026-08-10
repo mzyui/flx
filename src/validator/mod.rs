@@ -267,31 +267,54 @@ impl ProxyValidator {
         };
 
         let manager = tokio::spawn(async move {
-            let jobs =
-                proxy_source.flat_map(move |proxy| {
-                    let jobs: Vec<(Protocol, Protocol)> = proxy
-                        .expected_types
+            // Expand each proxy's advertised types against the requested set
+            // lazily and allocation-free: no `Vec` is built per proxy,
+            // `Protocol` is `Copy` so values are passed by copy instead of
+            // `clone()`, and both the advertised and requested lists are
+            // deduplicated so a duplicated entry can never yield a duplicate
+            // probe job.
+            let jobs = proxy_source.flat_map(move |proxy| {
+                let proxy = Arc::new(proxy);
+                let advertised = Arc::clone(&proxy.expected_types);
+                if advertised.iter().any(|advertised| {
+                    expected
                         .iter()
-                        .flat_map(|advertised| {
-                            expected
-                                .iter()
-                                .filter(move |requested| {
-                                    advertised_matches_request(advertised, requested)
-                                })
-                                .map(move |requested| (advertised.clone(), requested.clone()))
-                        })
-                        .collect();
-
-                    if !jobs.is_empty() {
-                        manager_total.fetch_add(1, Ordering::Relaxed);
-                    }
-
-                    let proxy = Arc::new(proxy);
-
-                    futures_util::stream::iter(jobs.into_iter().map(
-                        move |(protocol, requested)| (Arc::clone(&proxy), protocol, requested),
-                    ))
-                });
+                        .any(|requested| advertised_matches_request(advertised, requested))
+                }) {
+                    manager_total.fetch_add(1, Ordering::Relaxed);
+                }
+                let state = (proxy, advertised, Arc::clone(&expected), 0usize, 0usize);
+                futures_util::stream::unfold(
+                    state,
+                    |(proxy, advertised, requested, mut adv_idx, mut req_idx)| async move {
+                        loop {
+                            if adv_idx >= advertised.len() {
+                                return None;
+                            }
+                            let adv = &advertised[adv_idx];
+                            if advertised[..adv_idx].iter().any(|seen| seen == adv) {
+                                adv_idx += 1;
+                                req_idx = 0;
+                                continue;
+                            }
+                            while req_idx < requested.len() {
+                                let req = &requested[req_idx];
+                                let requested_is_new =
+                                    !requested[..req_idx].iter().any(|seen| seen == req);
+                                req_idx += 1;
+                                if requested_is_new && advertised_matches_request(adv, req) {
+                                    return Some((
+                                        (Arc::clone(&proxy), *adv, *req),
+                                        (proxy, advertised, requested, adv_idx, req_idx),
+                                    ));
+                                }
+                            }
+                            adv_idx += 1;
+                            req_idx = 0;
+                        }
+                    },
+                )
+            });
 
             jobs.for_each_concurrent(concurrency_limit, move |(proxy, protocol, requested)| {
                 let sender = sender.clone();
