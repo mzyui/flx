@@ -25,6 +25,10 @@ Edition 2021, no rust-toolchain pin, no clap or CI job that runs tests.
 - `Proxy.geo` is serialized into JSON output (F-35 regression test in `src/proxy/models.rs`).
 - `proxyscan` provider is intentionally absent (`src/providers/`): its download endpoint returns 404.
 
+## Conventions
+
+- When patching code in `src/`, never add audit references (item numbers like "B.17", "re-audit", "F-xx") to documentation or code comments. Keep code comments about the code itself; audit/effort notes belong only in `docs/*` (and even there, only when the user asks for them).
+
 ## Gotchas
 
 - The working tree has uncommitted WIP (`git status`: Cargo.toml, examples/provider_check.rs, src/cli/main.rs, src/validator/{checker,mod}.rs). Don't commit unless asked.
