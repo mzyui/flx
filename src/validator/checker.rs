@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
     },
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
@@ -29,28 +29,26 @@ use crate::{
 };
 
 /// Header tokens whose appearance in a judge's echoed environment is taken as
-/// evidence that a proxy forwards client- or proxy-internal metadata.
-static ANON_INTEREST: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    [
-        "X-REAL-IP",
-        "X-FORWARDED-FOR",
-        "X-PROXY-ID",
-        "VIA",
-        "FORWARDED-FOR",
-        "X-FORWARDED",
-        "HTTP-FORWARDED",
-        "CLIENT-IP",
-        "FORWARDED-FOR-IP",
-        "FORWARDED_FOR",
-        "X_FORWARDED FORWARDED",
-        "CLIENT_IP",
-        "PROXY-CONNECTION",
-        "X-PROXY-CONNECTION",
-        "X-IMFORWARDS",
-    ]
-    .into_iter()
-    .collect()
-});
+/// evidence that a proxy forwards client- or proxy-internal metadata. Kept as
+/// a small sorted slice (not a `HashSet`) because classification only iterates
+/// it: a fixed-size contiguous array is cheaper than hashing 15 members.
+static ANON_INTEREST: &[&str] = &[
+    "CLIENT-IP",
+    "CLIENT_IP",
+    "FORWARDED-FOR",
+    "FORWARDED-FOR-IP",
+    "FORWARDED_FOR",
+    "HTTP-FORWARDED",
+    "PROXY-CONNECTION",
+    "VIA",
+    "X-FORWARDED",
+    "X-FORWARDED-FOR",
+    "X-IMFORWARDS",
+    "X-PROXY-CONNECTION",
+    "X-PROXY-ID",
+    "X-REAL-IP",
+    "X_FORWARDED FORWARDED",
+];
 
 const MAX_JUDGE_BODY_BYTES: usize = 512 * 1024;
 const JUDGE_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
@@ -71,7 +69,7 @@ pub(crate) async fn read_bounded_body(
     limit: usize,
 ) -> anyhow::Result<Bytes> {
     use http_body_util::BodyExt;
-    let mut collected: Vec<u8> = Vec::with_capacity(1024);
+    let mut collected: Vec<u8> = Vec::with_capacity(8192);
     while let Some(chunk) = body.frame().await {
         let chunk = chunk
             .map_err(|e| anyhow::anyhow!("judge body stream error: {e}"))?
@@ -93,7 +91,7 @@ pub(crate) async fn read_bounded_body(
 pub(crate) fn classify_anonymity(body: &str, my_ip: &str) -> Anonymity {
     if body.contains(my_ip) {
         Anonymity::Transparent
-    } else if ANON_INTEREST.iter().any(|&v| body.contains(v)) {
+    } else if ANON_INTEREST.iter().any(|token| body.contains(token)) {
         Anonymity::Anonymous
     } else {
         Anonymity::Elite
@@ -209,8 +207,14 @@ pub struct JudgePool {
 /// The append-only judge list plus per-judge cooldown timestamps.
 struct PoolInner {
     judges: Vec<Arc<ValidationTarget>>,
-    cooldown_until_ms: Vec<AtomicU64>,
+    cooldown_until_ms: Vec<PaddedCooldown>,
 }
+
+/// A cooldown timestamp padded to its own cache line so judges probed by
+/// different workers never bounce one shared line when one of them is written
+/// during a failure while the others are being read.
+#[repr(align(64))]
+struct PaddedCooldown(AtomicU64);
 
 impl JudgePool {
     /// Builds a pool from the candidate `urls`, preflighting each one.
@@ -310,7 +314,7 @@ impl JudgePool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for offset in 0..inner.judges.len() {
             let index = (start + offset) % inner.judges.len();
-            if inner.cooldown_until_ms[index].load(Ordering::Relaxed) <= now_ms {
+            if inner.cooldown_until_ms[index].0.load(Ordering::Relaxed) <= now_ms {
                 return Arc::clone(&inner.judges[index]);
             }
         }
@@ -327,7 +331,7 @@ impl JudgePool {
         let mut candidates = Vec::with_capacity(inner.judges.len());
         for offset in 0..inner.judges.len() {
             let index = (start + offset) % inner.judges.len();
-            if inner.cooldown_until_ms[index].load(Ordering::Relaxed) <= now_ms {
+            if inner.cooldown_until_ms[index].0.load(Ordering::Relaxed) <= now_ms {
                 candidates.push(Arc::clone(&inner.judges[index]));
             }
         }
@@ -349,7 +353,7 @@ impl JudgePool {
                 .elapsed()
                 .saturating_add(JUDGE_FAILURE_COOLDOWN)
                 .as_millis() as u64;
-            inner.cooldown_until_ms[index].store(until, Ordering::Relaxed);
+            inner.cooldown_until_ms[index].0.store(until, Ordering::Relaxed);
         }
     }
 
@@ -378,13 +382,15 @@ impl JudgePool {
     pub(crate) fn append(&self, target: Arc<ValidationTarget>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.judges.push(target);
-        inner.cooldown_until_ms.push(AtomicU64::new(0));
+        inner.cooldown_until_ms.push(PaddedCooldown(AtomicU64::new(0)));
     }
 
     /// Builds a pool from already-constructed targets (used by tests and the
     /// validator's placeholder pools for unrequested protocol classes).
     pub(crate) fn from_targets(targets: Vec<Arc<ValidationTarget>>) -> Self {
-        let cooldown_until_ms = (0..targets.len()).map(|_| AtomicU64::new(0)).collect();
+        let cooldown_until_ms = (0..targets.len())
+            .map(|_| PaddedCooldown(AtomicU64::new(0)))
+            .collect();
         Self {
             inner: Mutex::new(PoolInner {
                 judges: targets,
@@ -396,31 +402,38 @@ impl JudgePool {
     }
 }
 
-/// Serializes a judge response into a plain-text representation for marker and
-/// anonymity matching: upper-cased headers followed by the bounded body.
+/// Serializes a judge response for marker and anonymity matching: upper-cased
+/// headers followed by the bounded raw body.
+///
+/// Header names are upper-cased byte-by-byte into a reusable `Vec<u8>` and the
+/// body is appended directly, so no intermediate `String` is allocated per
+/// header or per response body (a lossy decode only happens later, when
+/// anonymity classification actually needs text).
 async fn to_raw_response(
     response: Response<Incoming>,
     deadline: time::Instant,
-    _driver: Option<crate::proxy::client::ConnectionDriver>,
-) -> anyhow::Result<String> {
-    let mut content = String::with_capacity(1024);
+) -> anyhow::Result<Vec<u8>> {
+    let mut content: Vec<u8> = Vec::with_capacity(2048);
     for (k, v) in response.headers() {
-        content.push_str(&k.as_str().to_uppercase());
-        content.push_str(": ");
-        content.push_str(
+        for &b in k.as_str().as_bytes() {
+            content.push(b.to_ascii_uppercase());
+        }
+        content.extend_from_slice(b": ");
+        content.extend_from_slice(
             v.to_str()
-                .with_context(|| format!("response header `{}` is not valid utf-8", k))?,
+                .with_context(|| format!("response header `{}` is not valid utf-8", k))?
+                .as_bytes(),
         );
-        content.push('\n');
+        content.push(b'\n');
     }
-    content.push_str("\n\n");
+    content.extend_from_slice(b"\n\n");
     let bytes = time::timeout_at(
         deadline,
         read_bounded_body(response.into_body(), MAX_JUDGE_BODY_BYTES),
     )
     .await
     .context("judge response body timed out")??;
-    content.push_str(&String::from_utf8_lossy(&bytes));
+    content.extend_from_slice(&bytes);
     Ok(content)
 }
 
@@ -491,7 +504,7 @@ pub async fn support_http(
                 continue;
             }
 
-            let body = match to_raw_response(response.inner, deadline, response.driver).await {
+            let body = match to_raw_response(response.inner, deadline).await {
                 Ok(body) => body,
                 Err(_e) => {
                     #[cfg(feature = "log")]
@@ -500,7 +513,7 @@ pub async fn support_http(
                 }
             };
 
-            if !body.contains(&target.response_marker) {
+            if memchr::memmem::find(&body, target.response_marker.as_bytes()).is_none() {
                 #[cfg(feature = "log")]
                 log::trace!("{}: response did not originate from the local judge", proxy);
                 pool.report_failure(&target);
@@ -514,6 +527,7 @@ pub async fn support_http(
                 .await
                 .context("public-IP lookup timed out during HTTP validation")?
                 .context("cannot determine anonymity level without knowing our own public IP")?;
+            let body = String::from_utf8_lossy(&body);
             let anonymity = classify_anonymity(&body, &my_ip);
 
             return Ok(Some(ProxyRuntimes {
