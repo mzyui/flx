@@ -150,7 +150,7 @@ impl ProxyProvider for GithubRepoProvider {
                     let url = format!("https://raw.githubusercontent.com/{}", path);
                     let source = match protocol {
                         Protocol::Http(_) | Protocol::Https(_) => Source::http(&url),
-                        _ => Source::typed(&url, protocol.clone()),
+                        _ => Source::typed(&url, *protocol),
                     };
                     // Some of these lists are multi-megabyte; the 3s default
                     // truncates them mid-download.
