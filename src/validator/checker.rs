@@ -2,12 +2,13 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
     },
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use aho_corasick::AhoCorasick;
 use tokio::{task::JoinSet, time};
 
 use anyhow::Context;
@@ -22,7 +23,7 @@ use hyper::{
 use crate::{
     negotiators::{HttpNegotiator, HttpsNegotiator},
     proxy::{
-        client::{ProxyClient, ProxyRuntimes},
+        client::{tls_connector, ProxyClient, ProxyRuntimes},
         models::{Anonymity, Protocol, Proxy, RuntimeStats},
     },
     resolver::my_ip,
@@ -49,6 +50,13 @@ static ANON_INTEREST: &[&str] = &[
     "X-REAL-IP",
     "X_FORWARDED FORWARDED",
 ];
+
+/// Single-pass matcher over every anonymity-leak token, built once.
+///
+/// Aho-Corasick scans a judge body once for all 15 tokens instead of running a
+/// separate substring search per token.
+static ANON_MATCHER: LazyLock<AhoCorasick> =
+    LazyLock::new(|| AhoCorasick::new(ANON_INTEREST).expect("static anonymity tokens are valid"));
 
 const MAX_JUDGE_BODY_BYTES: usize = 512 * 1024;
 const JUDGE_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
@@ -91,7 +99,7 @@ pub(crate) async fn read_bounded_body(
 pub(crate) fn classify_anonymity(body: &str, my_ip: &str) -> Anonymity {
     if body.contains(my_ip) {
         Anonymity::Transparent
-    } else if ANON_INTEREST.iter().any(|token| body.contains(token)) {
+    } else if ANON_MATCHER.find(body.as_bytes()).is_some() {
         Anonymity::Anonymous
     } else {
         Anonymity::Elite
@@ -149,13 +157,9 @@ impl ValidationTarget {
             rt::TokioExecutor,
         };
 
-        let tls = native_tls::TlsConnector::builder()
-            .danger_accept_invalid_certs(insecure)
-            .build()
-            .context("failed to build online judge TLS connector")?;
         let mut http = HttpConnector::new();
         http.enforce_http(false);
-        let connector = HttpsConnector::from((http, tokio_native_tls::TlsConnector::from(tls)));
+        let connector = HttpsConnector::from((http, tls_connector(insecure)));
         let client = Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(connector);
         let request = Request::get(&self.url)
             .header("X-Fluxy-Token", &self.request_token)
@@ -179,10 +183,7 @@ impl ValidationTarget {
         if body.len() > MAX_JUDGE_BODY_BYTES {
             anyhow::bail!("online judge preflight body exceeds limit");
         }
-        if !body
-            .windows(self.response_marker.len())
-            .any(|window| window.eq_ignore_ascii_case(self.response_marker.as_bytes()))
-        {
+        if memchr::memmem::find(&body, self.response_marker.as_bytes()).is_none() {
             anyhow::bail!("online judge did not echo X-Fluxy-Token");
         }
         Ok(())
@@ -546,11 +547,28 @@ pub async fn support_http(
 
 #[cfg(test)]
 mod tests {
-    use super::{end_to_end_runtime, JudgePool, ValidationTarget};
+    use super::{classify_anonymity, end_to_end_runtime, JudgePool, ValidationTarget};
+    use crate::proxy::models::Anonymity;
     use std::time::{Duration, Instant};
     use std::vec::Vec;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn anonymity_classification_uses_single_pass_token_matching() {
+        let ip = "203.0.113.7";
+        let body = "HTTP/1.1 200 OK\nX-CLIENT-IP: 10.0.0.1\n...";
+
+        assert_eq!(
+            classify_anonymity(&format!("REMOTE_ADDR = {ip}\n..."), ip),
+            Anonymity::Transparent
+        );
+        assert_eq!(classify_anonymity(body, ip), Anonymity::Anonymous);
+        assert_eq!(
+            classify_anonymity("no leak tokens here", ip),
+            Anonymity::Elite
+        );
+    }
 
     #[test]
     fn http_latency_is_one_end_to_end_sample() {

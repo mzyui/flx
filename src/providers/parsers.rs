@@ -6,7 +6,7 @@
 //!
 //! Ported from the Node implementation in `mzyui/proxy-list` (engine/src/providers).
 
-use std::{borrow::Cow, collections::HashMap, net::Ipv4Addr, sync::LazyLock};
+use std::{borrow::Cow, cell::Cell, collections::HashMap, net::Ipv4Addr, sync::LazyLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use regex::Regex;
@@ -26,6 +26,7 @@ const VISITOR_STOPPED: &str = "fluxy parser visitor stopped";
 
 struct JsonDataSeed<'a, T, F> {
     visit: &'a mut F,
+    stopped: &'a Cell<bool>,
     marker: std::marker::PhantomData<T>,
 }
 
@@ -42,6 +43,7 @@ where
     {
         deserializer.deserialize_map(JsonRootVisitor {
             visit: self.visit,
+            stopped: self.stopped,
             marker: std::marker::PhantomData,
         })
     }
@@ -49,6 +51,7 @@ where
 
 struct JsonRootVisitor<'a, T, F> {
     visit: &'a mut F,
+    stopped: &'a Cell<bool>,
     marker: std::marker::PhantomData<T>,
 }
 
@@ -71,6 +74,7 @@ where
             if key == "data" {
                 map.next_value_seed(JsonRowsSeed {
                     visit: self.visit,
+                    stopped: self.stopped,
                     marker: std::marker::PhantomData,
                 })?;
             } else {
@@ -83,6 +87,7 @@ where
 
 struct JsonRowsSeed<'a, T, F> {
     visit: &'a mut F,
+    stopped: &'a Cell<bool>,
     marker: std::marker::PhantomData<T>,
 }
 
@@ -99,6 +104,7 @@ where
     {
         deserializer.deserialize_seq(JsonRowsVisitor {
             visit: self.visit,
+            stopped: self.stopped,
             marker: std::marker::PhantomData,
         })
     }
@@ -106,6 +112,7 @@ where
 
 struct JsonRowsVisitor<'a, T, F> {
     visit: &'a mut F,
+    stopped: &'a Cell<bool>,
     marker: std::marker::PhantomData<T>,
 }
 
@@ -126,6 +133,7 @@ where
     {
         while let Some(row) = rows.next_element::<T>()? {
             if !(self.visit)(row) {
+                self.stopped.set(true);
                 return Err(A::Error::custom(VISITOR_STOPPED));
             }
         }
@@ -140,15 +148,20 @@ fn visit_json_data<T>(body: &str, mut visit: impl FnMut(T) -> bool) -> anyhow::R
 where
     T: DeserializeOwned,
 {
+    let stopped = Cell::new(false);
     let mut deserializer = serde_json::Deserializer::from_str(body);
     let result = JsonDataSeed::<T, _> {
         visit: &mut visit,
+        stopped: &stopped,
         marker: std::marker::PhantomData,
     }
     .deserialize(&mut deserializer);
     match result {
         Ok(()) => Ok(()),
-        Err(error) if error.to_string().contains(VISITOR_STOPPED) => Ok(()),
+        // The visitor aborted the walk on purpose (early stop); every other
+        // error is a genuine parse problem. Detecting the stop via the flag
+        // avoids formatting the error message just to compare strings.
+        Err(_error) if stopped.get() => Ok(()),
         Err(error) => Err(error.into()),
     }
 }

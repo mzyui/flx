@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     fmt::{Debug, Display},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -64,7 +64,7 @@ pub(crate) fn tls_connector(insecure: bool) -> tokio_native_tls::TlsConnector {
 /// `linger` if the peer never does.
 pub(crate) fn spawn_connection_driver<F, E>(
     conn: F,
-    host: Cow<'static, str>,
+    host: Arc<str>,
     linger: Duration,
 ) -> ConnectionDriver
 where
@@ -129,6 +129,13 @@ impl<T> ProxyRuntimes<T> {
 #[async_trait]
 pub trait ProxyClient {
     fn host(&self) -> Cow<'_, str>;
+
+    /// Owned host string for `'static` consumers such as the background
+    /// connection driver. The default materializes a new allocation; proxy
+    /// types with a precomputed endpoint string override it to clone instead.
+    fn host_arc(&self) -> Arc<str> {
+        Arc::from(self.host().as_ref())
+    }
 
     /// Establishes a TCP connection to the proxy server.
     ///
@@ -262,7 +269,7 @@ pub trait ProxyClient {
                 .await
                 .context("HTTP/1 handshake over TLS failed")?;
             runtimes.record(start_time.elapsed().as_secs_f64());
-            let driver = spawn_connection_driver(conn, host.into_owned().into(), CONNECTION_LINGER);
+            let driver = spawn_connection_driver(conn, self.host_arc(), CONNECTION_LINGER);
 
             self.log_trace(format!("Sending request: {:?}", req));
             let start_time = time::Instant::now();
@@ -283,7 +290,7 @@ pub trait ProxyClient {
         let io = TokioIo::new(stream);
         let (mut sender, conn) = handshake(io).await.context("HTTP/1 handshake failed")?;
         runtimes.record(start_time.elapsed().as_secs_f64());
-        let driver = spawn_connection_driver(conn, host.into_owned().into(), CONNECTION_LINGER);
+        let driver = spawn_connection_driver(conn, self.host_arc(), CONNECTION_LINGER);
 
         self.log_trace(format!("Sending request: {:?}", req));
         let start_time = time::Instant::now();
@@ -326,5 +333,11 @@ impl ProxyClient for Proxy {
         // `text` is a precomputed `ip:port` Arc<str> (see Proxy::new), so the
         // borrowed form avoids a `String` allocation on every call.
         Cow::Borrowed(self.as_text())
+    }
+
+    fn host_arc(&self) -> Arc<str> {
+        // Clone the precomputed endpoint instead of copying its bytes: the
+        // background connection driver gets an `Arc` without re-allocating.
+        Arc::clone(&self.text)
     }
 }

@@ -3,6 +3,7 @@ use std::{
     collections::HashSet,
     io::Write as _,
     net::{IpAddr, Ipv4Addr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -23,12 +24,25 @@ use crate::resolver::my_ip;
 const MAX_PROXY_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_JUDGE_RESPONSE_BYTES: usize = 576 * 1024;
 
-/// Renders `host:port`, bracketing IPv6 hosts.
-fn authority_for(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
+/// Renders `host:port` (bracketing IPv6 hosts) into `buf`, borrowing the stack
+/// buffer on success so the common case is allocation-free.
+///
+/// Pathologically overlong hosts fall back to an owned `String`.
+fn authority_for<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, str> {
+    let args = if host.contains(':') {
+        format_args!("[{host}]:{port}")
     } else {
-        format!("{host}:{port}")
+        format_args!("{host}:{port}")
+    };
+    let mut writer = std::io::Cursor::new(buf);
+    match writer.write_fmt(args) {
+        Ok(()) => {
+            let len = writer.position() as usize;
+            Cow::Borrowed(
+                std::str::from_utf8(&writer.into_inner()[..len]).expect("authority is ASCII"),
+            )
+        }
+        Err(_) => Cow::Owned(args.to_string()),
     }
 }
 
@@ -105,7 +119,7 @@ impl JudgeTarget {
             .path_and_query()
             .map(|value| value.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
-        let authority = authority_for(&host, port);
+        let authority = authority_for(&mut [0u8; 64], &host, port).into_owned();
 
         Ok(Self {
             scheme: uri.scheme_str().unwrap_or("http").to_owned(),
@@ -229,11 +243,12 @@ async fn probe_once(
     let mut stream = BufReader::new(proxy.connect_timeout(remaining).await?.inner);
 
     // CONNECT tunnels target the requested port rather than the judge's own,
-    // so only that variant pays for an owned authority string; every other
+    // so only that variant pays for a rendered authority string; every other
     // protocol reuses the one cached on the `JudgeTarget` (B.28).
+    let mut authority_buf = [0u8; 64];
     let authority = match protocol {
-        Protocol::Connect(port) => Cow::Owned(authority_for(&target.host, *port)),
-        _ => Cow::Borrowed(&target.authority),
+        Protocol::Connect(port) => authority_for(&mut authority_buf, &target.host, *port),
+        _ => Cow::Borrowed(target.authority.as_str()),
     };
     let authority = authority.as_ref();
 
@@ -400,11 +415,8 @@ async fn verify_tls_judge(
     let (mut sender, connection) = handshake(TokioIo::new(tls_stream))
         .await
         .context("HTTP handshake with TLS judge failed")?;
-    let _driver = spawn_connection_driver(
-        connection,
-        std::borrow::Cow::Owned(authority.to_owned()),
-        Duration::from_secs(30),
-    );
+    let _driver =
+        spawn_connection_driver(connection, Arc::from(authority), Duration::from_secs(30));
     let request = hyper::Request::get(&target.path_and_query)
         .header(hyper::header::HOST, authority)
         .header(hyper::header::CONNECTION, "close")
