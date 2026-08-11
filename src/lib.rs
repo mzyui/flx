@@ -102,7 +102,17 @@ impl Iterator for ProxySource {
     ///
     /// Returns `None` once no parseable `ip:port` line remains.
     fn next(&mut self) -> Option<Self::Item> {
-        for line in self.lines.by_ref().flatten() {
+        for line in self.lines.by_ref() {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    #[cfg(feature = "log")]
+                    log::warn!("failed to read a line from the proxy file: {error}");
+                    #[cfg(not(feature = "log"))]
+                    let _ = error;
+                    continue;
+                }
+            };
             let mut parts = line.split(':');
             if let Some(Ok(ip_address)) = parts.next().map(|part| part.parse::<Ipv4Addr>()) {
                 if let Some(Ok(port_number)) = parts.next().map(|part| part.parse::<u16>()) {
