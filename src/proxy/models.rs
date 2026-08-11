@@ -287,12 +287,24 @@ impl Proxy {
 
     /// Serializes the proxy as compact JSON.
     pub fn as_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        serde_json::to_string(self).unwrap_or_else(|error| {
+            #[cfg(feature = "log")]
+            log::error!("failed to serialize proxy to JSON: {error}");
+            #[cfg(not(feature = "log"))]
+            let _ = error;
+            String::new()
+        })
     }
 
     /// Serializes the proxy as pretty-printed JSON.
     pub fn as_pretty_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
+        serde_json::to_string_pretty(self).unwrap_or_else(|error| {
+            #[cfg(feature = "log")]
+            log::error!("failed to serialize proxy to pretty JSON: {error}");
+            #[cfg(not(feature = "log"))]
+            let _ = error;
+            String::new()
+        })
     }
 }
 
