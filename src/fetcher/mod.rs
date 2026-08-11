@@ -8,7 +8,7 @@ use std::{
     net::Ipv4Addr,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     task::{Context as TaskContext, Poll},
@@ -149,6 +149,9 @@ pub struct ProxyFetcher {
     /// Signals the fetcher coordinator and provider tasks to stop producing
     /// when the consumer has collected enough proxies (threshold met).
     stop_tx: watch::Sender<bool>,
+    /// Guards the stop signal so the `watch` send happens exactly once even
+    /// when several accepted proxies cross the threshold at the same time.
+    stop_signaled: AtomicBool,
 }
 
 impl ProxyFetcher {
@@ -348,6 +351,7 @@ impl ProxyFetcher {
             drain_notify,
             prefetched: None,
             stop_tx,
+            stop_signaled: AtomicBool::new(false),
         })
     }
 }
@@ -530,10 +534,15 @@ impl ProxyFetcher {
         );
         if result.is_some() {
             if let Some(threshold) = self.config.fallback_threshold {
-                // Signal the stop once; re-sending the same value on every
-                // accepted proxy just bumps the watch version pointlessly
-                // (re-audit N3).
-                if self.accepted.load(Ordering::Relaxed) >= threshold && !*self.stop_tx.borrow() {
+                // Signal the stop atomically: `compare_exchange` ensures
+                // only the first caller crossing the threshold sends, so the
+                // watch version is bumped exactly once per run.
+                if self.accepted.load(Ordering::Relaxed) >= threshold
+                    && self
+                        .stop_signaled
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
                     let _ = self.stop_tx.send(true);
                 }
             }
