@@ -13,11 +13,13 @@ mod user_agent;
 use fetcher::{Config, ProxyFetcher};
 use proxy::models::{Anonymity, Protocol, Proxy};
 use std::{
+    borrow::Cow,
     fs::File,
-    io::{BufReader, Lines},
+    io::{BufRead, BufReader, Cursor, Lines, Write as _},
+    net::Ipv4Addr,
+    path::PathBuf,
     sync::{Arc, LazyLock},
 };
-use std::{io::BufRead, net::Ipv4Addr, path::PathBuf};
 pub use validator::ProxyValidator;
 
 /// Initializes the logging system with the requested verbosity.
@@ -59,6 +61,25 @@ static FILE_DEFAULT_PROTOCOLS: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| {
         Protocol::Socks5,
     ])
 });
+
+/// Writes `args` into `buf` using `Cursor`, returning a borrowed view of the
+/// written region when possible and an owned `String` only for overlong output.
+///
+/// The return value is always ASCII (the callers only format ASCII content), so
+/// a panic on invalid UTF-8 is a bug.
+pub(crate) fn write_to_buffer<'a>(
+    buf: &'a mut [u8],
+    args: std::fmt::Arguments<'_>,
+) -> Cow<'a, str> {
+    let mut writer = Cursor::new(buf);
+    match writer.write_fmt(args) {
+        Ok(()) => {
+            let len = writer.position() as usize;
+            Cow::Borrowed(std::str::from_utf8(&writer.into_inner()[..len]).expect("ASCII"))
+        }
+        Err(_) => Cow::Owned(args.to_string()),
+    }
+}
 
 impl ProxySource {
     /// Starts a [`ProxyFetcher`] fed by every configured provider.

@@ -25,7 +25,7 @@ static CURSOR: AtomicUsize = AtomicUsize::new(0);
 ///
 /// Callers may reuse the returned string concurrently; the rotation cursor is
 /// shared and advanced atomically.
-pub fn random_user_agent() -> &'static str {
+pub fn next_user_agent() -> &'static str {
     let index = CURSOR.fetch_add(1, Ordering::Relaxed) % USER_AGENTS.len();
     USER_AGENTS[index]
 }

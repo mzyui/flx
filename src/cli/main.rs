@@ -7,11 +7,12 @@ use clap::{
 #[cfg(feature = "log")]
 use fluxy::initialize_logging;
 use fluxy::{
-    proxy::models::{Anonymity, Protocol, Proxy},
+    proxy::models::{Protocol, Proxy},
     ProxySource, ProxyValidator,
 };
 use futures_util::{Stream, StreamExt};
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::{io::AsyncWriteExt, runtime};
 
@@ -114,47 +115,12 @@ fn report_invalid_type_value(value: &str) {
 fn convert_protocols(types: &[String]) -> Vec<Protocol> {
     types
         .iter()
-        .filter_map(|type_str| {
-            let mut parts = type_str.split(':');
-            if let Some(protocol) = parts.next() {
-                match protocol {
-                    "HTTP" => {
-                        if let Some(anonymity) = parts.next() {
-                            match anonymity {
-                                "Transparent" => {
-                                    return Some(Protocol::Http(Anonymity::Transparent))
-                                }
-                                "Anonymous" => return Some(Protocol::Http(Anonymity::Anonymous)),
-                                "Elite" => return Some(Protocol::Http(Anonymity::Elite)),
-                                _ => {}
-                            }
-                        }
-                        return Some(Protocol::Http(Anonymity::Unknown));
-                    }
-                    "HTTPS" => {
-                        if let Some(anonymity) = parts.next() {
-                            match anonymity {
-                                "Transparent" => {
-                                    return Some(Protocol::Https(Anonymity::Transparent))
-                                }
-                                "Anonymous" => return Some(Protocol::Https(Anonymity::Anonymous)),
-                                "Elite" => return Some(Protocol::Https(Anonymity::Elite)),
-                                _ => {}
-                            }
-                        }
-                        return Some(Protocol::Https(Anonymity::Unknown));
-                    }
-                    "SOCKS4" => return Some(Protocol::Socks4),
-                    "SOCKS5" => return Some(Protocol::Socks5),
-                    "CONNECT" => {
-                        if let Some(Ok(port)) = parts.next().map(|p| p.parse::<u16>()) {
-                            return Some(Protocol::Connect(port));
-                        }
-                    }
-                    _ => report_invalid_type_value(type_str),
-                }
+        .filter_map(|type_str| match Protocol::from_str(type_str.as_str()) {
+            Ok(protocol) => Some(protocol),
+            Err(_) => {
+                report_invalid_type_value(type_str);
+                None
             }
-            None
         })
         .collect()
 }
@@ -431,6 +397,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxy::proxy::models::Anonymity;
     use futures_util::stream;
 
     #[test]

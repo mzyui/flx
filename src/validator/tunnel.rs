@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     collections::HashSet,
-    io::Write as _,
     net::{IpAddr, Ipv4Addr},
     sync::Arc,
     time::Duration,
@@ -34,32 +33,13 @@ fn authority_for<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, str> {
     } else {
         format_args!("{host}:{port}")
     };
-    let mut writer = std::io::Cursor::new(buf);
-    match writer.write_fmt(args) {
-        Ok(()) => {
-            let len = writer.position() as usize;
-            Cow::Borrowed(
-                std::str::from_utf8(&writer.into_inner()[..len]).expect("authority is ASCII"),
-            )
-        }
-        Err(_) => Cow::Owned(args.to_string()),
-    }
+    crate::write_to_buffer(buf, args)
 }
 
 /// Renders a small handshake request line into a stack buffer when it fits,
-/// falling back to an owned `String` for pathologically overlong inputs. The
-/// common case is allocation-free (re-audit B.29/B.30).
+/// falling back to an owned `String` for pathologically overlong inputs.
 fn write_request<'a>(buf: &'a mut [u8], args: std::fmt::Arguments<'_>) -> Cow<'a, str> {
-    let mut writer = std::io::Cursor::new(buf);
-    match writer.write_fmt(args) {
-        Ok(()) => {
-            let len = writer.position() as usize;
-            Cow::Borrowed(
-                std::str::from_utf8(&writer.into_inner()[..len]).expect("request is ASCII"),
-            )
-        }
-        Err(_) => Cow::Owned(args.to_string()),
-    }
+    crate::write_to_buffer(buf, args)
 }
 
 #[derive(Debug, Clone)]

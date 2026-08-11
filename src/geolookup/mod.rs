@@ -261,7 +261,7 @@ pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
         .uri(GEOLITE_ENDPOINT_URL)
         .header(
             hyper::header::USER_AGENT,
-            crate::user_agent::random_user_agent(),
+            crate::user_agent::next_user_agent(),
         )
         .body(Empty::<Bytes>::new())
         .context("failed to build GeoLite2 download request")?;

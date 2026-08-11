@@ -366,7 +366,7 @@ impl ProxyFetcher {
 /// with the subsequent channel-drain signal (`Notify` from the consumer),
 /// it proves the primary counter (`produced`) is stable before fallback
 /// runs — no primary result can be lost or double counted.
-#[allow(dead_code)]
+#[cfg(test)]
 async fn finish_phase(mut handles: JoinSet<()>, timeout: Duration) -> bool {
     let drain = async { while handles.join_next().await.is_some() {} };
     if time::timeout(timeout, drain).await.is_ok() {

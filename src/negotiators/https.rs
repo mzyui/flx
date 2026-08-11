@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io::Write as _};
+use std::borrow::Cow;
 
 use async_trait::async_trait;
 use hyper::Uri;
@@ -18,45 +18,23 @@ impl HttpsNegotiator {
     /// Writes `host:port` (bracketed for IPv6) into a stack buffer, falling
     /// back to an owned `String` only for overlong hosts.
     fn write_authority<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, str> {
-        let mut writer = std::io::Cursor::new(buf);
-        let result = if host.contains(':') {
-            writer.write_fmt(format_args!("[{host}]:{port}"))
+        let args = if host.contains(':') {
+            format_args!("[{host}]:{port}")
         } else {
-            writer.write_fmt(format_args!("{host}:{port}"))
+            format_args!("{host}:{port}")
         };
-        match result {
-            Ok(()) => {
-                let len = writer.position() as usize;
-                Cow::Borrowed(
-                    std::str::from_utf8(&writer.into_inner()[..len]).expect("authority is ASCII"),
-                )
-            }
-            Err(_) => Cow::Owned(if host.contains(':') {
-                format!("[{host}]:{port}")
-            } else {
-                format!("{host}:{port}")
-            }),
-        }
+        crate::write_to_buffer(buf, args)
     }
 
     /// Writes the HTTP `CONNECT` request line into a stack buffer, falling back
     /// to an owned `String` only for pathologically overlong authorities.
     fn write_connect_request<'a>(buf: &'a mut [u8], authority: &str) -> Cow<'a, str> {
-        let mut writer = std::io::Cursor::new(buf);
-        match writer.write_fmt(format_args!(
-            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
-        )) {
-            Ok(()) => {
-                let len = writer.position() as usize;
-                Cow::Borrowed(
-                    std::str::from_utf8(&writer.into_inner()[..len])
-                        .expect("CONNECT request is ASCII"),
-                )
-            }
-            Err(_) => Cow::Owned(format!(
+        crate::write_to_buffer(
+            buf,
+            format_args!(
                 "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
-            )),
-        }
+            ),
+        )
     }
 }
 

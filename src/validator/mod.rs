@@ -77,34 +77,37 @@ struct WorkParams {
     insecure: bool,
 }
 
+/// Shared match structure for protocol pairs. The closure `on_http_https`
+/// supplies the anonymity-matching rule that differs between the two callers
+/// (advertised vs. result).
+fn protocol_matches<F>(a: &Protocol, b: &Protocol, on_http_https: F) -> bool
+where
+    F: FnOnce(&Anonymity, &Anonymity) -> bool,
+{
+    match (a, b) {
+        (Protocol::Http(left), Protocol::Http(right))
+        | (Protocol::Https(left), Protocol::Https(right)) => on_http_https(left, right),
+        (Protocol::Connect(left), Protocol::Connect(right)) => left == right,
+        _ => a == b,
+    }
+}
+
 /// Whether a protocol advertised by a source is eligible for a specific user
 /// request. Unknown anonymity is unspecified metadata; CONNECT ports are
 /// capabilities and must match exactly.
 fn advertised_matches_request(advertised: &Protocol, requested: &Protocol) -> bool {
-    match (advertised, requested) {
-        (Protocol::Http(left), Protocol::Http(right))
-        | (Protocol::Https(left), Protocol::Https(right)) => {
-            matches!(left, Anonymity::Unknown)
-                || matches!(right, Anonymity::Unknown)
-                || left == right
-        }
-        (Protocol::Connect(left), Protocol::Connect(right)) => left == right,
-        _ => advertised == requested,
-    }
+    protocol_matches(advertised, requested, |left, right| {
+        matches!(left, Anonymity::Unknown) || matches!(right, Anonymity::Unknown) || left == right
+    })
 }
 
 /// Whether the protocol proven by the judge satisfies the user's request.
 /// Unknown requests accept any measured anonymity; concrete predicates and
 /// CONNECT ports must match exactly.
 fn result_satisfies_request(result: &Protocol, requested: &Protocol) -> bool {
-    match (result, requested) {
-        (Protocol::Http(actual), Protocol::Http(required))
-        | (Protocol::Https(actual), Protocol::Https(required)) => {
-            matches!(required, Anonymity::Unknown) || actual == required
-        }
-        (Protocol::Connect(actual), Protocol::Connect(required)) => actual == required,
-        _ => result == requested,
-    }
+    protocol_matches(result, requested, |actual, required| {
+        matches!(required, Anonymity::Unknown) || actual == required
+    })
 }
 
 async fn do_work(

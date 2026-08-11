@@ -1,6 +1,5 @@
 use std::{
     fmt::Display,
-    io::{Cursor, Write},
     net::Ipv4Addr,
     str::FromStr,
     sync::{Arc, LazyLock},
@@ -232,10 +231,7 @@ impl Proxy {
     /// Builds a proxy, precomputing its `ip:port` text representation.
     pub fn new(ip: Ipv4Addr, port: u16) -> Self {
         let mut buf = [0u8; 32];
-        let mut writer = Cursor::new(&mut buf[..]);
-        write!(writer, "{}:{}", ip, port)
-            .expect("`ip:port` always fits in the 32-byte stack buffer");
-        let len = writer.position() as usize;
+        let text = crate::write_to_buffer(&mut buf, format_args!("{ip}:{port}"));
         Self {
             ip,
             port,
@@ -243,7 +239,7 @@ impl Proxy {
             runtimes: RuntimeStats::default(),
             expected_types: Arc::from([]),
             proxy_type: None,
-            text: Arc::from(std::str::from_utf8(&buf[..len]).expect("`ip:port` is always ASCII")),
+            text: Arc::from(text.as_ref()),
         }
     }
 

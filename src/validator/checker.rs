@@ -457,7 +457,7 @@ pub async fn support_http(
     pool: &JudgePool,
     insecure: bool,
 ) -> anyhow::Result<Option<ProxyRuntimes<Protocol>>> {
-    let useragent = crate::user_agent::random_user_agent();
+    let useragent = crate::user_agent::next_user_agent();
 
     for _ in 0..max_attempts {
         for target in pool.candidates() {

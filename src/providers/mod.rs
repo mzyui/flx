@@ -113,7 +113,7 @@ pub trait ProxyProvider {
             url::Url::parse(url).with_context(|| format!("invalid provider URL `{url}`"))?;
         urls.push_back((initial_url, None));
 
-        let user_agent = crate::user_agent::random_user_agent();
+        let user_agent = crate::user_agent::next_user_agent();
         let mut content = String::new();
         let mut pending = [0u8; 3];
         let mut pending_len = 0usize;
