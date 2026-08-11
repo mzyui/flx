@@ -88,7 +88,6 @@ impl NegotiatorTrait for HttpsNegotiator {
             );
             let start_time = time::Instant::now();
             stream.write_all(connect_request.as_bytes()).await?;
-            runtimes.record(start_time.elapsed().as_secs_f64());
 
             let mut reader = tokio::io::BufReader::new(&mut *stream);
             let mut buf = Vec::with_capacity(16 * 1024);
