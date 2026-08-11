@@ -341,7 +341,7 @@ fn fetcher_config(options: &Cli) -> fluxy::fetcher::Config {
         enable_geo_lookup: options.with_geo || !options.countries.is_empty(),
         countries: Arc::from(options.countries.as_slice()),
         cache_ttl: (options.cache_ttl > 0)
-            .then(|| std::time::Duration::from_secs(options.cache_ttl * 60)),
+            .then(|| std::time::Duration::from_secs(options.cache_ttl.saturating_mul(60))),
         refresh_cache: options.refresh_cache,
         ..Default::default()
     }
@@ -480,6 +480,15 @@ mod tests {
 
         let default = Cli::parse_from(["fluxy"]);
         assert!(!fetcher_config(&default).refresh_cache);
+    }
+
+    #[test]
+    fn cache_ttl_max_value_does_not_overflow() {
+        let huge = Cli::parse_from(["fluxy", "--cache-ttl", "18446744073709551615"]);
+        assert_eq!(
+            fetcher_config(&huge).cache_ttl,
+            Some(std::time::Duration::from_secs(u64::MAX))
+        );
     }
 
     #[test]
