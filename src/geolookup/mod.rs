@@ -299,8 +299,6 @@ pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
         timer: time::Instant::now(),
         max: max_size,
     });
-    #[cfg(feature = "progress_bar")]
-    status.progress.fetch_add(0, Ordering::Relaxed);
 
     let chunks = futures_util::stream::unfold(response, |mut response| async move {
         loop {
