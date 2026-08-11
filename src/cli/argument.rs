@@ -1,6 +1,6 @@
 use clap::builder::styling::AnsiColor;
 use clap::builder::{PossibleValue, Styles, TypedValueParser};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 fn get_styles() -> Styles {
     Styles::styled()
@@ -93,14 +93,89 @@ impl TypedValueParser for TypesValueParser {
     }
 }
 
-/// Command-line interface definition for the proxy application.
-#[derive(Parser, Debug, Clone)]
+/// Fluxy is a proxy scraper and validator.
+///
+/// The pipeline is split into three commands: `fetch` scrapes the built-in
+/// providers, `find` validates proxies against online judges, and `geo-update`
+/// ensures the GeoLite2 database is present. A subcommand is required; running
+/// `fluxy` with no subcommand prints the help text and exits with a usage error.
+#[derive(Parser, Debug)]
 #[command(
     name = "fluxy",
     after_help = "Suggestions and bug reports are greatly appreciated:\nhttps://github.com/zevtyardt/fluxy/issues",
     styles=get_styles()
 )]
 pub struct Cli {
+    /// Subcommand to run.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    /// Log level for application output.
+    #[arg(
+        long = "log",
+        default_value = "off",
+        value_parser([
+            PossibleValue::new("debug"),
+            PossibleValue::new("info"),
+            PossibleValue::new("warn"),
+            PossibleValue::new("error"),
+            PossibleValue::new("trace"),
+            PossibleValue::new("off"),
+        ])
+    )]
+    pub log_level: String,
+
+    /// Generate a shell completion script and exit.
+    #[arg(long, value_enum, value_name = "SHELL")]
+    pub generate_completions: Option<clap_complete::Shell>,
+
+    /// Generate a man page and exit.
+    #[arg(long, default_value_t = false)]
+    pub generate_man_page: bool,
+}
+
+/// The pipeline commands available in the CLI.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Scrape proxies from the built-in providers and print them.
+    Fetch(FetchArgs),
+    /// Validate proxies from a file or the built-in providers against online
+    /// judges, printing the survivors.
+    Find(FindArgs),
+    /// Download (if missing) and verify the GeoLite2 database used for GeoIP
+    /// lookups, then exit.
+    GeoUpdate,
+}
+
+/// Options shared by every command that render proxies.
+#[derive(Args, Debug, Clone, Default)]
+pub struct OutputOptions {
+    /// Output format for the results.
+    #[arg(
+        short,
+        long,
+        default_value = "default",
+        value_parser([
+            PossibleValue::new("default"),
+            PossibleValue::new("text"),
+            PossibleValue::new("json"),
+            PossibleValue::new("pretty-json"),
+        ])
+    )]
+    pub format: String,
+
+    /// Maximum number of proxies to retrieve.
+    #[arg(short, long, default_value = "0")]
+    pub limit: usize,
+
+    /// File path to save the retrieved proxies. If not provided, output will go to the console.
+    #[arg(short, long)]
+    pub output_file: Option<std::path::PathBuf>,
+}
+
+/// Options controlling how proxies are scraped from the built-in providers.
+#[derive(Args, Debug, Clone, Default)]
+pub struct FetcherArgs {
     /// List of ISO country codes to filter proxies by location.
     #[arg(short, long, num_args(1..))]
     pub countries: Vec<String>,
@@ -110,15 +185,6 @@ pub struct Cli {
     /// on first use; pair with --countries to also filter.
     #[arg(long)]
     pub with_geo: bool,
-
-    /// Maximum number of concurrent proxy checks.
-    #[arg(
-        short,
-        long,
-        default_value_t = fluxy::validator::DEFAULT_CONCURRENCY_LIMIT as u64,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    pub max_connections: u64,
 
     /// Maximum number of proxy sources fetched concurrently.
     ///
@@ -161,48 +227,20 @@ pub struct Cli {
     /// Performs no network I/O.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+}
 
-    /// Timeout duration in seconds before giving up.
-    #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..))]
-    pub timeout: u64,
+/// `fluxy fetch`: scrape proxies from the built-in providers and print them.
+#[derive(Args, Debug, Default)]
+pub struct FetchArgs {
+    #[command(flatten)]
+    pub fetcher: FetcherArgs,
+    #[command(flatten)]
+    pub output: OutputOptions,
+}
 
-    /// Log level for application output.
-    #[arg(
-        long = "log",
-        default_value = "off",
-        value_parser([
-            PossibleValue::new("debug"),
-            PossibleValue::new("info"),
-            PossibleValue::new("warn"),
-            PossibleValue::new("error"),
-            PossibleValue::new("trace"),
-            PossibleValue::new("off"),
-        ])
-    )]
-    pub log_level: String,
-
-    /// Output format for the results.
-    #[arg(
-        short,
-        long,
-        default_value = "default",
-        value_parser([
-            PossibleValue::new("default"),
-            PossibleValue::new("text"),
-            PossibleValue::new("json"),
-            PossibleValue::new("pretty-json"),
-        ])
-    )]
-    pub format: String,
-
-    /// Maximum number of proxies to retrieve.
-    #[arg(short, long, default_value = "0")]
-    pub limit: usize,
-
-    /// File path to save the retrieved proxies. If not provided, output will go to the console.
-    #[arg(short, long)]
-    pub output_file: Option<std::path::PathBuf>,
-
+/// Options controlling proxy validation against online judges.
+#[derive(Args, Debug, Default)]
+pub struct ValidatorArgs {
     /// Proxy types (protocols) to validate. [possible values: HTTP{:Transparent,
     /// :Anonymous,:Elite}, HTTPS{:Transparent,:Anonymous,:Elite}, SOCKS4, SOCKS5,
     /// CONNECT:<port>]
@@ -211,23 +249,31 @@ pub struct Cli {
         long = "types",
         help_heading = "Validate",
         num_args(1..),
+        required = true,
         value_parser = TypesValueParser,
     )]
     pub types: Vec<String>,
 
-    /// File path containing proxies. Overrides providers if specified.
-    #[arg(long, help_heading = "Validate", requires("types"))]
-    pub file: Option<std::path::PathBuf>,
+    /// Maximum number of concurrent proxy checks.
+    #[arg(
+        short,
+        long,
+        default_value_t = fluxy::validator::DEFAULT_CONCURRENCY_LIMIT as u64,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub max_connections: u64,
 
     /// Maximum number of attempts to validate a proxy.
     #[arg(
         long,
         default_value = "1",
-        value_parser = parse_positive_usize,
-        help_heading = "Validate",
-        requires("types")
+        value_parser = parse_positive_usize
     )]
     pub max_attempts: usize,
+
+    /// Timeout duration in seconds before giving up.
+    #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..))]
+    pub timeout: u64,
 
     /// Online judges used to validate plain HTTP proxy forwarding.
     ///
@@ -237,9 +283,7 @@ pub struct Cli {
     #[arg(
         long,
         default_value = "http://azenv.net/,http://wfuchs.de/azenv.php,http://proxyjudge.us/,http://shinh.org/env.cgi",
-        value_delimiter = ',',
-        help_heading = "Validate",
-        requires = "types"
+        value_delimiter = ','
     )]
     pub http_judge_urls: Vec<String>,
 
@@ -250,9 +294,7 @@ pub struct Cli {
     #[arg(
         long,
         default_value = "https://aranguren.org/azenv.php,https://wfuchs.de/azenv.php",
-        value_delimiter = ',',
-        help_heading = "Validate",
-        requires = "types"
+        value_delimiter = ','
     )]
     pub https_judge_urls: Vec<String>,
 
@@ -263,12 +305,21 @@ pub struct Cli {
     /// judge path forge validation responses.
     #[arg(long, default_value_t = false)]
     pub insecure: bool,
+}
 
-    /// Generate a shell completion script and exit.
-    #[arg(long, value_enum, value_name = "SHELL")]
-    pub generate_completions: Option<clap_complete::Shell>,
+/// `fluxy find`: validate proxies from a file or the built-in providers.
+#[derive(Args, Debug, Default)]
+pub struct FindArgs {
+    #[command(flatten)]
+    pub fetcher: FetcherArgs,
 
-    /// Generate a man page and exit.
-    #[arg(long, default_value_t = false)]
-    pub generate_man_page: bool,
+    /// File path containing proxies. Overrides providers if specified.
+    #[arg(long)]
+    pub file: Option<std::path::PathBuf>,
+
+    #[command(flatten)]
+    pub validator: ValidatorArgs,
+
+    #[command(flatten)]
+    pub output: OutputOptions,
 }

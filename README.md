@@ -12,12 +12,17 @@
 > GeoIP lookup is opt-in. Fluxy downloads the MaxMind database on first use.
 > `--countries` enables lookup **and** filters by ISO country code;
 > `--with-geo` enables the lookup only, annotating every proxy with its country
-> in the output without filtering.
+> in the output without filtering. Both are `fetch`/`find` flags.
+
+The CLI is split into subcommands: `fluxy fetch` scrapes the built-in
+providers, `fluxy find` checks proxies against online judges, and a
+`fluxy geo-update` subcommand pre-downloads the GeoLite2 database. Running
+`fluxy` with no subcommand prints the help text.
 
 Here's the debug output showing the proxy validator process:
 
 ```sh
-fluxy -t HTTP -l 3 --with-geo --log debug -f json
+fluxy find -t HTTP -l 3 --with-geo --log debug -f json
 fluxy::fetcher: DEBUG Proxy gathering started (40 primary sources, 31 fallback sources)
 fluxy::validator: DEBUG Proxy validator started (500 workers)
 fluxy::validator: INFO using 1 healthy HTTP judge(s)
@@ -48,14 +53,15 @@ The built-in defaults work without a local judge binary or shared secret:
 
 ```sh
 cargo run --release --bin fluxy -- \
-  -t HTTP HTTPS SOCKS4 SOCKS5 \
+  find -t HTTP HTTPS SOCKS4 SOCKS5 \
   --timeout 5
 ```
 
 Custom pools can be supplied with comma-separated `--http-judge-urls` and
-`--https-judge-urls`. HTTPS certificate validation is enabled by default. Use
-`--insecure` only for an explicitly trusted self-signed judge; HTTP judges do not
-provide transport authentication and should be treated accordingly.
+`--https-judge-urls` on `fluxy find`. HTTPS certificate validation is
+enabled by default. Use `--insecure` only for an explicitly trusted self-signed
+judge; HTTP judges do not provide transport authentication and should be treated
+accordingly.
 
 ## Provider source cache
 
@@ -67,6 +73,9 @@ so repeat runs skip most of the network startup cost.
   (default `15`; `0` disables the cache entirely).
 - `--refresh-cache` — ignore the cache and fetch every source again; the freshly
   fetched bodies still repopulate the cache.
+
+Both flags are available on `fluxy fetch` (and on `fluxy find` when its
+proxies come from the built-in providers).
 
 The public IP used for anonymity classification is cached to disk for 24 hours
 the same way, so DNS/HTTPS discovery runs at most once per day.
