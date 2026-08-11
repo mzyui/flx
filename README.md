@@ -70,3 +70,43 @@ so repeat runs skip most of the network startup cost.
 
 The public IP used for anonymity classification is cached to disk for 24 hours
 the same way, so DNS/HTTPS discovery runs at most once per day.
+
+## Using as a library
+
+Fluxy is also a library. Add it to `Cargo.toml`:
+
+```toml
+[dependencies]
+fluxy = { git = "https://github.com/zevtyardt/fluxy" }
+```
+
+The [`Fluxy`] builder facade covers the common workflows: scrape the built-in
+providers, optionally validate, and collect the survivors.
+
+```rust,no_run
+use fluxy::{Anonymity, Fluxy, Protocol};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Fetch from the built-in providers and validate them as elite HTTP proxies.
+    let proxies = Fluxy::fetch()
+        .types([Protocol::Http(Anonymity::Elite)])
+        .limit(20)
+        .collect()
+        .await?;
+
+    // Or validate an existing `ip:port` file.
+    let file_proxies = Fluxy::from_file("proxies.txt")?
+        .types([Protocol::Socks5])
+        .collect()
+        .await?;
+    Ok(())
+}
+```
+
+When `types` is empty the pipeline skips validation and yields every fetched
+proxy unchanged. Large pools can be processed incrementally with
+`Fluxy::stream()`, which returns a `Stream<Item = Proxy>` instead of buffering
+everything into a `Vec`. The lower-level pieces (`ProxyFetcher`,
+`ProxyValidator`, `ProxySource`) are public too, along with the `prelude`
+module for glob imports. Run `cargo doc --open` for the full API reference.

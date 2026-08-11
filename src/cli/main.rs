@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn https_judge_urls_flag_parses_without_duplicate_attr() {
-        // Regression for F-36: the `#[arg]` for `--https-judge-urls` was
+        // The `#[arg]` for `--https-judge-urls` was
         // declared twice; ensure the flag still accepts a custom value and
         // lands in the right field.
         let cli = Cli::parse_from([

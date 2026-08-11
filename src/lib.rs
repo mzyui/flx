@@ -1,7 +1,41 @@
+//! Fluxy is a proxy scraper and validator.
+//!
+//! The crate is both a library and a CLI (`bin/fluxy`). As a library it offers
+//! two layers:
+//!
+//! * the [`Fluxy`] builder facade — fetch from the built-in providers and
+//!   optionally validate with a few method calls;
+//! * the lower-level pieces the facade composes: [`ProxyFetcher`] (an async
+//!   stream of scraped candidates), [`ProxyValidator`] (an async stream of
+//!   validated proxies), and the [`Proxy`] model.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use fluxy::{Anonymity, Fluxy, Protocol};
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     let proxies = Fluxy::fetch()
+//!         .types([Protocol::Http(Anonymity::Elite)])
+//!         .limit(20)
+//!         .collect()
+//!         .await?;
+//!
+//!     for proxy in &proxies {
+//!         println!("{}", proxy.as_text());
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! See the [`Fluxy`] docs for the file-backed variant and for streaming.
+
 pub mod error;
 pub mod fetcher;
 pub mod geolookup;
 
+mod api;
 pub mod negotiators;
 pub mod providers;
 pub mod proxy;
@@ -10,8 +44,6 @@ pub mod validator;
 mod resolver;
 mod user_agent;
 
-use fetcher::{Config, ProxyFetcher};
-use proxy::models::{Anonymity, Protocol, Proxy};
 use std::{
     borrow::Cow,
     fs::File,
@@ -20,7 +52,35 @@ use std::{
     path::PathBuf,
     sync::{Arc, LazyLock},
 };
-pub use validator::ProxyValidator;
+
+// ── Root re-exports ───────────────────────────────────────────────────
+//
+// The most commonly used types are re-exported at the crate root so consumers
+// can write `fluxy::Proxy` instead of `fluxy::proxy::models::Proxy`.
+
+pub use api::Fluxy;
+pub use error::{ProtocolParseError, ProxyParseError};
+pub use fetcher::{Config as FetcherConfig, ProxyFetcher};
+pub use geolookup::models::GeoData;
+pub use geolookup::GeoLookup;
+pub use providers::all_providers;
+pub use providers::models::{ProviderTier, ScrapeMode, Source};
+pub use providers::ProxyProvider;
+pub use proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
+pub use validator::{Config as ValidatorConfig, ProxyValidator, ValidationStatus};
+
+/// Common items, re-exported for convenient glob imports.
+///
+/// ```no_run
+/// use fluxy::prelude::*;
+/// ```
+pub mod prelude {
+    pub use crate::{
+        all_providers, Anonymity, FetcherConfig, Fluxy, GeoData, GeoLookup, Protocol, Proxy,
+        ProxyFetcher, ProxyParseError, ProxySource, ProxyType, ProxyValidator, RuntimeStats,
+        ScrapeMode, Source, ValidatorConfig,
+    };
+}
 
 /// Initializes the logging system with the requested verbosity.
 ///
@@ -88,7 +148,7 @@ impl ProxySource {
     ///
     /// Returns an error when provider fetching cannot be started
     /// (e.g. invalid configuration or a failed GeoIP setup).
-    pub async fn from_fetcher(config: Config) -> anyhow::Result<ProxyFetcher> {
+    pub async fn from_fetcher(config: FetcherConfig) -> anyhow::Result<ProxyFetcher> {
         ProxyFetcher::gather(config).await
     }
 

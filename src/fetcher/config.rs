@@ -36,15 +36,28 @@ impl Config {
     }
 }
 
+/// Default number of provider sources fetched concurrently.
+///
+/// Shared with the CLI (`--fetch-concurrency`) so the library facade and the
+/// binary behave identically out of the box.
+pub const DEFAULT_CONCURRENCY_LIMIT: usize = 25;
+
+/// Default freshness window (minutes) for the local source-body cache.
+///
+/// Shared with the CLI (`--cache-ttl`). `0` disables the cache.
+pub const DEFAULT_CACHE_TTL_MINUTES: u64 = 15;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             enforce_unique_ip: true,
-            concurrency_limit: 10,
+            concurrency_limit: DEFAULT_CONCURRENCY_LIMIT,
             enable_geo_lookup: false,
             countries: Arc::from(Vec::new()),
             fallback_threshold: None,
-            cache_ttl: None,
+            cache_ttl: Some(Duration::from_secs(
+                DEFAULT_CACHE_TTL_MINUTES.saturating_mul(60),
+            )),
             refresh_cache: false,
         }
     }

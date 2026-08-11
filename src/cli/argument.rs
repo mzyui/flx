@@ -111,14 +111,23 @@ pub struct Cli {
     pub with_geo: bool,
 
     /// Maximum number of concurrent proxy checks.
-    #[arg(short, long, default_value = "500", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(
+        short,
+        long,
+        default_value_t = fluxy::validator::DEFAULT_CONCURRENCY_LIMIT as u64,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub max_connections: u64,
 
     /// Maximum number of proxy sources fetched concurrently.
     ///
     /// Separate from `--max-connections`: fetching touches a few dozen source
     /// URLs, while validation touches thousands of proxies.
-    #[arg(long, default_value = "25", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(
+        long,
+        default_value_t = fluxy::fetcher::DEFAULT_CONCURRENCY_LIMIT as u64,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub fetch_concurrency: u64,
 
     /// Freshness in minutes for the local provider-source cache.
@@ -126,7 +135,11 @@ pub struct Cli {
     /// Fetched source bodies are stored under the platform data dir and reused
     /// within this window, so repeat runs skip most of the network startup cost.
     /// `0` disables the cache entirely.
-    #[arg(long, default_value = "15", value_parser = clap::value_parser!(u64))]
+    #[arg(
+        long,
+        default_value_t = fluxy::fetcher::DEFAULT_CACHE_TTL_MINUTES,
+        value_parser = clap::value_parser!(u64)
+    )]
     pub cache_ttl: u64,
 
     /// Ignore the local provider-source cache and fetch every source again.

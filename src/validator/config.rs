@@ -46,10 +46,16 @@ pub struct Config {
     pub insecure: bool,
 }
 
+/// Default number of proxies validated concurrently.
+///
+/// Shared with the CLI (`--max-connections`) so the library facade and the
+/// binary behave identically out of the box.
+pub const DEFAULT_CONCURRENCY_LIMIT: usize = 500;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            concurrency_limit: 50,
+            concurrency_limit: DEFAULT_CONCURRENCY_LIMIT,
             request_timeout: 3,
             types: Vec::new(),
             max_attempts: 1,

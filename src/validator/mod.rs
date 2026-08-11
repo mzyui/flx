@@ -19,7 +19,7 @@ use futures_util::{Stream, StreamExt};
 use tokio::time::Instant;
 use tokio::{sync::mpsc, task::JoinHandle};
 
-pub use config::Config;
+pub use config::{Config, DEFAULT_CONCURRENCY_LIMIT};
 pub use tunnel::ValidationStatus;
 
 use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType};

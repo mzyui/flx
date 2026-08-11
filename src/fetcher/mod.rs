@@ -16,7 +16,7 @@ use std::{
 };
 
 use anyhow::Context;
-pub use config::Config;
+pub use config::{Config, DEFAULT_CACHE_TTL_MINUTES, DEFAULT_CONCURRENCY_LIMIT};
 use futures_util::Stream;
 use hashbrown::HashSet;
 use http_body_util::Empty;
