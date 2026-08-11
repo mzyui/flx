@@ -6,8 +6,6 @@
 //! and re-runs the cheap CPU-side scrape on the stored body.
 
 use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
     path::PathBuf,
     time::{Duration, SystemTime},
 };
@@ -89,10 +87,17 @@ impl Cache {
 }
 
 /// Stable per-URL cache file name (16 hex digits of the URL's hash).
+///
+/// Uses hand-rolled FNV-1a 64-bit instead of `DefaultHasher`: the latter's
+/// internal algorithm is not guaranteed stable across Rust releases, so cache
+/// file names would silently change whenever the compiler is upgraded.
 fn cache_file_name(url: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in url.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]
@@ -178,6 +183,18 @@ mod tests {
         assert_ne!(
             cache_file_name("http://example.com/list"),
             cache_file_name("http://example.com/other")
+        );
+    }
+
+    #[test]
+    fn cache_file_name_is_deterministic_fnv1a() {
+        assert_eq!(
+            cache_file_name("http://example.com/list"),
+            "ffb9dd630c1e02bd"
+        );
+        assert_eq!(
+            cache_file_name("http://example.com/other"),
+            "e2eae3c2756ad9b1"
         );
     }
 }
