@@ -231,7 +231,17 @@ pub(crate) fn data_dir() -> anyhow::Result<PathBuf> {
     } else {
         #[cfg(feature = "log")]
         log::warn!("Failed to get local data directory, using current directory instead");
-        current_dir().context("failed to determine current working directory")
+        let mut dir = current_dir().context("failed to determine current working directory")?;
+        dir.push(env!("CARGO_PKG_NAME"));
+        if !dir.is_dir() {
+            fs::create_dir_all(&dir).with_context(|| {
+                format!(
+                    "failed to create data directory {} under the current working directory (no platform data directory available); choose a writable working directory or set XDG_DATA_HOME",
+                    dir.display()
+                )
+            })?;
+        }
+        Ok(dir)
     }
 }
 
