@@ -6,17 +6,54 @@
 //! and re-runs the cheap CPU-side scrape on the stored body.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
+
+/// Age beyond which a leftover `.tmp-*` scratch file is considered orphaned.
+///
+/// `store` writes to a process-unique `.tmp-{pid}` file and renames it into
+/// place; a process killed between the write and the rename leaves the scratch
+/// file behind forever. A live writer's scratch file is seconds old, so only
+/// files older than this are safe to delete at startup.
+const ORPHANED_TMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Local cache of provider response bodies, keyed by source URL.
 pub struct Cache {
     dir: PathBuf,
     ttl: Duration,
     refresh: bool,
+}
+
+/// Removes `.tmp-*` scratch files that are older than [`ORPHANED_TMP_MAX_AGE`].
+///
+/// Best-effort: unreadable or locked entries are skipped so a concurrent
+/// writer's fresh scratch file is never touched.
+fn clean_orphaned_tmp(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().contains(".tmp-") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(SystemTime::now());
+        let Ok(age) = SystemTime::now().duration_since(modified) else {
+            continue;
+        };
+        if age > ORPHANED_TMP_MAX_AGE {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 impl Cache {
@@ -32,6 +69,7 @@ impl Cache {
         dir.push("cache");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create cache directory {}", dir.display()))?;
+        clean_orphaned_tmp(&dir);
         Ok(Self::new_at(dir, ttl, refresh))
     }
 
@@ -196,5 +234,37 @@ mod tests {
             cache_file_name("http://example.com/other"),
             "e2eae3c2756ad9b1"
         );
+    }
+
+    #[test]
+    fn clean_orphaned_tmp_removes_only_stale_scratch_files() {
+        use super::{clean_orphaned_tmp, ORPHANED_TMP_MAX_AGE};
+        use std::time::SystemTime;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxy_cache_tmp_test_{}_{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stale_tmp = dir.join(".abcdef.tmp-99999");
+        std::fs::write(&stale_tmp, "partial").unwrap();
+        let file = std::fs::File::open(&stale_tmp).unwrap();
+        file.set_modified(SystemTime::now() - ORPHANED_TMP_MAX_AGE - Duration::from_secs(1))
+            .unwrap();
+        drop(file);
+
+        let fresh_tmp = dir.join(".012345.tmp-1");
+        std::fs::write(&fresh_tmp, "in-progress").unwrap();
+        let real = dir.join("0123456789abcdef");
+        std::fs::write(&real, "cached body").unwrap();
+
+        clean_orphaned_tmp(&dir);
+
+        assert!(!stale_tmp.exists(), "stale scratch file must be removed");
+        assert!(fresh_tmp.exists(), "live scratch file must be kept");
+        assert!(real.exists(), "real cache entry must be kept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
