@@ -207,6 +207,11 @@ impl Fluxy {
     }
 
     /// Stop after at most `limit` proxies. `0` (the default) means unlimited.
+    ///
+    /// The limit bounds the *output* of the pipeline, matching the CLI's
+    /// `-l/--limit`: when validation is enabled the pipeline keeps validating
+    /// candidates until `limit` proxies pass, instead of capping the number of
+    /// candidates before the check.
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
@@ -235,18 +240,20 @@ impl Fluxy {
             SourceKind::File(source) => Box::pin(stream::iter(source)) as BoxStream,
         };
 
-        let source = if limit > 0 {
-            Box::pin(source.take(limit)) as BoxStream
-        } else {
+        let output = if validator_config.types.is_empty() {
             source
+        } else {
+            Box::pin(ProxyValidator::validate(source, validator_config).await?) as BoxStream
         };
 
-        if validator_config.types.is_empty() {
-            return Ok(source);
-        }
-
-        let validator = ProxyValidator::validate(source, validator_config).await?;
-        Ok(Box::pin(validator) as BoxStream)
+        // Cap the final output. Dropping the stream when the limit is reached
+        // propagates the early stop down the chain (validator → fetcher), so
+        // production shuts down promptly, exactly like the CLI.
+        Ok(if limit > 0 {
+            Box::pin(output.take(limit)) as BoxStream
+        } else {
+            output
+        })
     }
 
     /// Runs the configured pipeline and collects the validated proxies.
@@ -354,6 +361,31 @@ mod tests {
         std::fs::write(&path, "192.0.2.1:8080\n192.0.2.2:3128\ngarbage\n").unwrap();
 
         let proxies = Fluxy::from_file(&path).unwrap().collect().await.unwrap();
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].as_text(), "192.0.2.1:8080");
+        assert_eq!(proxies[1].as_text(), "192.0.2.2:3128");
+    }
+
+    #[tokio::test]
+    async fn from_file_limit_truncates_the_output() {
+        let path = std::env::temp_dir().join(format!(
+            "fluxy_lib_test_limit_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "192.0.2.1:8080\n192.0.2.2:3128\n192.0.2.3:80\n").unwrap();
+
+        let proxies = Fluxy::from_file(&path)
+            .unwrap()
+            .limit(2)
+            .collect()
+            .await
+            .unwrap();
 
         let _ = std::fs::remove_file(&path);
         assert_eq!(proxies.len(), 2);

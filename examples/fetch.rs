@@ -6,10 +6,38 @@
 
 use fluxy::Fluxy;
 
+/// Reads `--name value` or `--name=value` from the argument list.
+fn flag(args: &[String], name: &str) -> Option<String> {
+    let long = format!("--{name}");
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix(&format!("{long}=")) {
+            return Some(value.to_owned());
+        }
+        if arg == &long {
+            return iter.next().cloned();
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let limit = std::env::args()
-        .find_map(|arg| arg.strip_prefix("--limit=").map(str::to_owned))
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+
+    if let Some(level) = flag(&args, "log") {
+        let level = match level.as_str() {
+            "debug" => log::LevelFilter::Debug,
+            "info" => log::LevelFilter::Info,
+            "warn" => log::LevelFilter::Warn,
+            "error" => log::LevelFilter::Error,
+            "trace" => log::LevelFilter::Trace,
+            _ => log::LevelFilter::Off,
+        };
+        fluxy::initialize_logging(level)?;
+    }
+
+    let limit = flag(&args, "limit")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10);
 
