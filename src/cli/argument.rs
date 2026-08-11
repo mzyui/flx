@@ -148,6 +148,19 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub refresh_cache: bool,
 
+    /// Disable deduplication of identical endpoints across sources.
+    ///
+    /// Off by default (duplicates are filtered). Useful when auditing how many
+    /// times a source re-emits the same `ip:port`.
+    #[arg(long, default_value_t = false)]
+    pub no_dedup: bool,
+
+    /// List the providers and sources that would be fetched, then exit.
+    ///
+    /// Performs no network I/O.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
     /// Timeout duration in seconds before giving up.
     #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout: u64,

@@ -309,12 +309,32 @@ fn fetcher_config(options: &Cli) -> fluxy::fetcher::Config {
         cache_ttl: (options.cache_ttl > 0)
             .then(|| std::time::Duration::from_secs(options.cache_ttl.saturating_mul(60))),
         refresh_cache: options.refresh_cache,
+        enforce_unique_ip: !options.no_dedup,
         ..Default::default()
+    }
+}
+
+/// Prints every provider and its sources to stderr for `--dry-run`.
+fn list_sources() {
+    for provider in fluxy::all_providers() {
+        let tier = match provider.tier() {
+            fluxy::ProviderTier::Primary => "primary",
+            fluxy::ProviderTier::Fallback => "fallback",
+        };
+        eprintln!("{} ({tier}):", provider.name());
+        for source in provider.sources() {
+            eprintln!("  {}", source.url);
+        }
     }
 }
 
 fn run_application() -> anyhow::Result<RunOutcome> {
     let options = Cli::parse();
+
+    if options.dry_run {
+        list_sources();
+        return Ok(RunOutcome::Finished);
+    }
 
     #[cfg(feature = "log")]
     {
@@ -447,6 +467,21 @@ mod tests {
 
         let default = Cli::parse_from(["fluxy"]);
         assert!(!fetcher_config(&default).refresh_cache);
+    }
+
+    #[test]
+    fn no_dedup_flag_disables_uniqueness() {
+        let disabled = Cli::parse_from(["fluxy", "--no-dedup"]);
+        assert!(!fetcher_config(&disabled).enforce_unique_ip);
+
+        let default = Cli::parse_from(["fluxy"]);
+        assert!(fetcher_config(&default).enforce_unique_ip);
+    }
+
+    #[test]
+    fn dry_run_flag_is_accepted() {
+        assert!(Cli::parse_from(["fluxy", "--dry-run"]).dry_run);
+        assert!(!Cli::parse_from(["fluxy"]).dry_run);
     }
 
     #[test]
