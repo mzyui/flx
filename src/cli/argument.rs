@@ -96,6 +96,7 @@ impl TypedValueParser for TypesValueParser {
 /// Command-line interface definition for the proxy application.
 #[derive(Parser, Debug, Clone)]
 #[command(
+    name = "fluxy",
     after_help = "Suggestions and bug reports are greatly appreciated:\nhttps://github.com/zevtyardt/fluxy/issues",
     styles=get_styles()
 )]
@@ -262,4 +263,12 @@ pub struct Cli {
     /// judge path forge validation responses.
     #[arg(long, default_value_t = false)]
     pub insecure: bool,
+
+    /// Generate a shell completion script and exit.
+    #[arg(long, value_enum, value_name = "SHELL")]
+    pub generate_completions: Option<clap_complete::Shell>,
+
+    /// Generate a man page and exit.
+    #[arg(long, default_value_t = false)]
+    pub generate_man_page: bool,
 }

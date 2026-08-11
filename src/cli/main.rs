@@ -336,6 +336,16 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         return Ok(RunOutcome::Finished);
     }
 
+    if let Some(shell) = options.generate_completions {
+        clap_complete::generate(shell, &mut Cli::command(), "fluxy", &mut std::io::stdout());
+        return Ok(RunOutcome::Finished);
+    }
+
+    if options.generate_man_page {
+        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+        return Ok(RunOutcome::Finished);
+    }
+
     #[cfg(feature = "log")]
     {
         let log_level = match options.log_level.as_str() {
@@ -482,6 +492,36 @@ mod tests {
     fn dry_run_flag_is_accepted() {
         assert!(Cli::parse_from(["fluxy", "--dry-run"]).dry_run);
         assert!(!Cli::parse_from(["fluxy"]).dry_run);
+    }
+
+    #[test]
+    fn generate_completions_flag_is_accepted() {
+        let cli = Cli::parse_from(["fluxy", "--generate-completions", "bash"]);
+        assert_eq!(cli.generate_completions, Some(clap_complete::Shell::Bash));
+        assert!(Cli::parse_from(["fluxy", "--generate-man-page"]).generate_man_page);
+    }
+
+    #[test]
+    fn generate_completions_produces_script() {
+        let mut out = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut Cli::command(),
+            "fluxy",
+            &mut out,
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("fluxy"));
+    }
+
+    #[test]
+    fn generate_man_page_produces_text() {
+        let mut out = Vec::new();
+        clap_mangen::Man::new(Cli::command())
+            .render(&mut out)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("fluxy"));
     }
 
     #[test]
