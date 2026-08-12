@@ -1,4 +1,4 @@
-mod checker;
+pub mod checker;
 pub mod config;
 mod tunnel;
 

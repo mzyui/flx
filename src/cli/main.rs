@@ -151,6 +151,7 @@ where
     };
 
     let json = matches!(options.format.as_str(), "json" | "pretty-json");
+    let _csv = options.format.as_str() == "csv";
     let mut found_proxy = false;
     let mut cancelled = false;
     let mut source = std::pin::pin!(source.enumerate());
@@ -172,6 +173,24 @@ where
     // Collects the write error, if any, so the document can still be closed
     // before the error is reported to the caller.
     let mut write_error: Option<anyhow::Error> = None;
+
+    // Emit the CSV header once before the stream starts so the output is
+    // always valid even when the stream is empty.
+    if _csv {
+        buf.extend_from_slice(b"ip,port,type,response_time,country\n");
+        if let Some(ref mut file) = output_file {
+            if let Err(error) = file.write_all(&buf).await {
+                write_error = Some(
+                    anyhow::Error::new(error).context("failed to write CSV header to output file"),
+                );
+            }
+        } else {
+            stdout
+                .write_all(&buf)
+                .expect("failed to write CSV header to stdout");
+        }
+        buf.clear();
+    }
 
     loop {
         tokio::select! {
@@ -216,6 +235,14 @@ where
                             buf.extend_from_slice(b"  ");
                             buf.extend_from_slice(line.as_bytes());
                         }
+                    }
+                    "json-lines" => {
+                        if serde_json::to_writer(&mut buf, &proxy).is_ok() {
+                            buf.push(b'\n');
+                        }
+                    }
+                    "csv" => {
+                        write_csv_row(&mut buf, &proxy);
                     }
                     _ => writeln!(&mut buf, "{}", proxy).expect("writing to a Vec cannot fail"),
                 };
@@ -491,6 +518,60 @@ fn validator_config(options: &ValidatorArgs, protocols: Vec<Protocol>) -> fluxy:
     }
 }
 
+/// Writes a single CSV row for `proxy` into `buf`.
+///
+/// Fields are comma-separated; any field containing a comma, double-quote, or
+/// newline is wrapped in double-quotes and inner quotes are escaped by doubling.
+fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
+    let ip = proxy.ip.to_string();
+    let port = proxy.port.to_string();
+    let proxy_type = proxy
+        .proxy_type
+        .as_ref()
+        .map(|pt| pt.protocol.to_string())
+        .unwrap_or_default();
+    let response_time = format!("{:.2}", proxy.avg_response_time());
+    let country = proxy.geo.iso_code.as_deref().unwrap_or("");
+
+    for (i, field) in [
+        ip.as_str(),
+        port.as_str(),
+        proxy_type.as_str(),
+        response_time.as_str(),
+        country,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if i > 0 {
+            buf.push(b',');
+        }
+        csv_quote(buf, field);
+    }
+    buf.push(b'\n');
+}
+
+/// Writes `field` into `buf`, quoting if it contains a comma, double-quote, or
+/// newline.
+fn csv_quote(buf: &mut Vec<u8>, field: &str) {
+    if field.contains([',', '"', '\n', '\r']) {
+        buf.push(b'"');
+        for ch in field.chars() {
+            if ch == '"' {
+                buf.extend_from_slice(b"\"\"");
+            } else {
+                // CSV fields are ASCII-safe; non-ASCII is written as-is.
+                let mut b = [0u8; 4];
+                let encoded = ch.encode_utf8(&mut b);
+                buf.extend_from_slice(encoded.as_bytes());
+            }
+        }
+        buf.push(b'"');
+    } else {
+        buf.extend_from_slice(field.as_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +809,44 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Parses a `json-lines`-format string produced by `process_result` into a
+    /// `Vec<serde_json::Value>`.
+    fn parse_json_lines(content: &str) -> Vec<serde_json::Value> {
+        content
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn run_json_lines(proxies: &[Proxy], limit: usize) -> String {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("json-lines", limit);
+        rt.block_on(async {
+            let s = stream::iter(proxies.iter().cloned());
+            process_result(s, options, std::future::pending::<()>())
+                .await
+                .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        content
+    }
+
+    fn run_csv(proxies: &[Proxy], limit: usize) -> String {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("csv", limit);
+        rt.block_on(async {
+            let s = stream::iter(proxies.iter().cloned());
+            process_result(s, options, std::future::pending::<()>())
+                .await
+                .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        content
+    }
+
     fn run_json(proxies: &[Proxy], limit: usize) -> String {
         let rt = runtime::Builder::new_current_thread().build().unwrap();
         let (options, path) = output_options("json", limit);
@@ -802,5 +921,111 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed.len(), 2);
         assert!(!out.contains(",]"));
+    }
+
+    #[test]
+    fn quiet_flag_is_accepted() {
+        let cli = Cli::parse_from(["fluxy", "--quiet"]);
+        assert!(cli.quiet);
+        assert!(!Cli::parse_from(["fluxy"]).quiet);
+    }
+
+    #[test]
+    fn no_color_flag_is_accepted() {
+        let cli = Cli::parse_from(["fluxy", "--no-color"]);
+        assert!(cli.no_color);
+        assert!(!Cli::parse_from(["fluxy"]).no_color);
+    }
+
+    #[test]
+    fn quiet_with_json_format_is_valid() {
+        let cli = Cli::parse_from(["fluxy", "--quiet", "fetch", "--format", "json"]);
+        assert!(cli.quiet);
+        match cli.command {
+            Some(Command::Fetch(fetch)) => assert_eq!(fetch.output.format, "json"),
+            _ => panic!("expected fetch subcommand"),
+        }
+    }
+
+    #[test]
+    fn json_lines_empty_yields_nothing() {
+        let out = run_json_lines(&[], 0);
+        assert_eq!(out, "", "empty source must produce empty output");
+    }
+
+    #[test]
+    fn json_lines_one_proxy_produces_one_line() {
+        let out = run_json_lines(&[sample_proxy(1)], 0);
+        let parsed = parse_json_lines(&out);
+        assert_eq!(parsed.len(), 1);
+        // No array brackets, no trailing comma
+        assert!(!out.contains('['));
+        assert!(!out.contains(']'));
+    }
+
+    #[test]
+    fn json_lines_multiple_proxies_produce_one_per_line() {
+        let proxies = [sample_proxy(1), sample_proxy(2), sample_proxy(3)];
+        let out = run_json_lines(&proxies, 0);
+        let parsed = parse_json_lines(&out);
+        assert_eq!(parsed.len(), 3);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(serde_json::from_str::<serde_json::Value>(line).is_ok());
+        }
+    }
+
+    #[test]
+    fn json_lines_limit_truncates() {
+        let proxies = [sample_proxy(1), sample_proxy(2), sample_proxy(3)];
+        let out = run_json_lines(&proxies, 2);
+        let parsed = parse_json_lines(&out);
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn csv_empty_yields_header_only() {
+        let out = run_csv(&[], 0);
+        assert_eq!(out, "ip,port,type,response_time,country\n");
+    }
+
+    #[test]
+    fn csv_one_proxy_produces_header_and_one_row() {
+        let out = run_csv(&[sample_proxy(1)], 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "ip,port,type,response_time,country");
+        assert!(lines[1].starts_with("192.168.0.1,8081,"));
+    }
+
+    #[test]
+    fn csv_multiple_proxies_produce_one_row_each() {
+        let proxies = [sample_proxy(1), sample_proxy(2), sample_proxy(3)];
+        let out = run_csv(&proxies, 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "header + 3 rows");
+        assert_eq!(lines[0], "ip,port,type,response_time,country");
+        assert!(lines[1].contains("192.168.0.1"));
+        assert!(lines[2].contains("192.168.0.2"));
+        assert!(lines[3].contains("192.168.0.3"));
+    }
+
+    #[test]
+    fn csv_limit_truncates_rows() {
+        let proxies = [sample_proxy(1), sample_proxy(2), sample_proxy(3)];
+        let out = run_csv(&proxies, 2);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows");
+    }
+
+    #[test]
+    fn no_color_with_json_format_is_valid() {
+        let cli = Cli::parse_from(["fluxy", "--no-color", "fetch", "--format", "json"]);
+        assert!(cli.no_color);
+        match cli.command {
+            Some(Command::Fetch(fetch)) => assert_eq!(fetch.output.format, "json"),
+            _ => panic!("expected fetch subcommand"),
+        }
     }
 }

@@ -132,6 +132,14 @@ pub struct Cli {
     /// Generate a man page and exit.
     #[arg(long, default_value_t = false)]
     pub generate_man_page: bool,
+
+    /// Suppress all non-essential output.
+    #[arg(long, default_value_t = false)]
+    pub quiet: bool,
+
+    /// Disable colored output.
+    #[arg(long, default_value_t = false)]
+    pub no_color: bool,
 }
 
 /// The pipeline commands available in the CLI.
@@ -159,7 +167,9 @@ pub struct OutputOptions {
             PossibleValue::new("default"),
             PossibleValue::new("text"),
             PossibleValue::new("json"),
+            PossibleValue::new("json-lines"),
             PossibleValue::new("pretty-json"),
+            PossibleValue::new("csv"),
         ])
     )]
     pub format: String,

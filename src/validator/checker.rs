@@ -96,7 +96,7 @@ pub(crate) async fn read_bounded_body(
 /// `my_ip` is this host's public IP; if it appears in the echoed environment the
 /// proxy is `Transparent`. Presence of any header that typically leaks client or
 /// proxy metadata marks it `Anonymous`, otherwise `Elite`.
-pub(crate) fn classify_anonymity(body: &str, my_ip: &str) -> Anonymity {
+pub fn classify_anonymity(body: &str, my_ip: &str) -> Anonymity {
     if body.contains(my_ip) {
         Anonymity::Transparent
     } else if ANON_MATCHER.find(body.as_bytes()).is_some() {
@@ -269,7 +269,7 @@ impl JudgePool {
         // Wait until the first judge has passed (appended) or every candidate
         // has finished. Failures that land first are still reported.
         loop {
-            if pool.len() > 0 {
+            if !pool.is_empty() {
                 break;
             }
             match tasks.join_next().await {
@@ -281,7 +281,7 @@ impl JudgePool {
                 None => break,
             }
         }
-        if pool.len() == 0 {
+        if pool.is_empty() {
             anyhow::bail!(
                 "no online judge passed preflight; all {} candidate URL(s) failed",
                 urls.len()
@@ -367,6 +367,11 @@ impl JudgePool {
             .unwrap_or_else(|e| e.into_inner())
             .judges
             .len()
+    }
+
+    /// Returns `true` when the pool contains no healthy judges.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Creates an empty pool that preflight tasks append to as they pass.

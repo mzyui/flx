@@ -226,7 +226,7 @@ fn anonymity_from_str(raw: &str) -> Anonymity {
 /// Handles the `1.2.3.4:8080`, `1.2.3.4:8080 US`, and `1.2.3.4:8080#US`
 /// variants, as well as colon-delimited trailers such as
 /// `1.2.3.4:8080:Argentina` used by hideip.me.
-fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
+pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
     let text = text.trim();
     let head = text
         .split([' ', '\t', '#', ',', '|'])

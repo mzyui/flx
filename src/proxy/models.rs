@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Serialize, Serializer};
 
-use crate::{error::ProtocolParseError, geolookup::models::GeoData};
+use crate::{error::ProtocolParseError, error::ProxyParseError, geolookup::models::GeoData};
 
 // ── RuntimeStats ──────────────────────────────────────────────────────
 
@@ -321,6 +321,45 @@ impl Display for Proxy {
     }
 }
 
+impl FromStr for Proxy {
+    type Err = ProxyParseError;
+
+    /// Parses a proxy from text such as `"1.2.3.4:8080"`,
+    /// `"http://1.2.3.4:8080"` or `"socks5://1.2.3.4:1080"`.
+    ///
+    /// When a scheme prefix is present it is mapped to a single-element
+    /// `expected_types` list via [`crate::providers::parsers::protocol_from_str`];
+    /// plain `ip:port` lines leave `expected_types` empty.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+
+        // Detect a scheme prefix so the protocol can be extracted, then strip
+        // it so the parse_pair helper sees a clean `ip:port` head.
+        let (scheme, rest) = if let Some(rest) = s.strip_prefix("http://") {
+            (Some("http"), rest)
+        } else if let Some(rest) = s.strip_prefix("https://") {
+            (Some("https"), rest)
+        } else if let Some(rest) = s.strip_prefix("socks4://") {
+            (Some("socks4"), rest)
+        } else if let Some(rest) = s.strip_prefix("socks5://") {
+            (Some("socks5"), rest)
+        } else {
+            (None, s)
+        };
+
+        let (ip, port) = crate::providers::parsers::parse_pair(rest)
+            .ok_or_else(|| ProxyParseError::MissingSeparator(s.to_string()))?;
+
+        let expected_types: Arc<[Protocol]> =
+            match scheme.and_then(crate::providers::parsers::protocol_from_str) {
+                Some(protocol) => Arc::from([protocol]),
+                None => Arc::from([]),
+            };
+
+        Ok(Proxy::with_expected_types(ip, port, expected_types))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Anonymity, Protocol, Proxy};
@@ -415,5 +454,60 @@ mod tests {
 
         assert_eq!(value["geo"]["iso_code"], "ID");
         assert_eq!(value["geo"]["name"], "Indonesia");
+    }
+
+    #[test]
+    fn from_str_parses_bare_ip_port() {
+        let proxy: Proxy = "1.2.3.4:8080".parse().unwrap();
+        assert_eq!(proxy.ip, Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(proxy.port, 8080);
+        assert!(proxy.expected_types.is_empty());
+    }
+
+    #[test]
+    fn from_str_parses_http_prefix() {
+        let proxy: Proxy = "http://1.2.3.4:8080".parse().unwrap();
+        assert_eq!(proxy.ip, Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(proxy.port, 8080);
+        assert_eq!(
+            proxy.expected_types.as_ref(),
+            &[Protocol::Http(Anonymity::Unknown)]
+        );
+    }
+
+    #[test]
+    fn from_str_parses_https_prefix() {
+        let proxy: Proxy = "https://5.6.7.8:3128".parse().unwrap();
+        assert_eq!(
+            proxy.expected_types.as_ref(),
+            &[Protocol::Https(Anonymity::Unknown)]
+        );
+    }
+
+    #[test]
+    fn from_str_parses_socks5_prefix() {
+        let proxy: Proxy = "socks5://10.0.0.1:1080".parse().unwrap();
+        assert_eq!(proxy.expected_types.as_ref(), &[Protocol::Socks5]);
+    }
+
+    #[test]
+    fn from_str_parses_socks4_prefix() {
+        let proxy: Proxy = "socks4://10.0.0.2:1080".parse().unwrap();
+        assert_eq!(proxy.expected_types.as_ref(), &[Protocol::Socks4]);
+    }
+
+    #[test]
+    fn from_str_fails_on_garbage() {
+        assert!("garbage".parse::<Proxy>().is_err());
+    }
+
+    #[test]
+    fn from_str_fails_on_missing_port() {
+        assert!("1.2.3.4".parse::<Proxy>().is_err());
+    }
+
+    #[test]
+    fn from_str_fails_on_invalid_ip() {
+        assert!("999.999.999.999:8080".parse::<Proxy>().is_err());
     }
 }
