@@ -21,7 +21,9 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     }
 }
 
-/// Protocol values accepted by `--types`, without the dynamic `CONNECT:<port>`.
+/// Protocol values accepted by the positional `TYPES` argument, without the
+/// dynamic `CONNECT:<port>`. A token may combine several values with `+` to
+/// require all of them (`HTTP+HTTPS`).
 const VALID_TYPE_NAMES: &[&str] = &[
     "HTTP",
     "HTTP:Transparent",
@@ -35,19 +37,22 @@ const VALID_TYPE_NAMES: &[&str] = &[
     "SOCKS5",
 ];
 
-/// Validates a single `--types` value against the fixed protocol names plus
-/// the dynamic `CONNECT:<port>` form.
+/// Validates a single `TYPES` token: every `+`-separated component must match
+/// the fixed protocol names plus the dynamic `CONNECT:<port>` form.
 fn is_valid_type_value(value: &str) -> bool {
-    VALID_TYPE_NAMES.contains(&value)
-        || value
-            .strip_prefix("CONNECT:")
-            .is_some_and(|port| port.parse::<u16>().is_ok())
+    value.split('+').all(|part| {
+        VALID_TYPE_NAMES.contains(&part)
+            || part
+                .strip_prefix("CONNECT:")
+                .is_some_and(|port| port.parse::<u16>().is_ok())
+    })
 }
 
-/// `value_parser` for `--types`.
+/// `value_parser` for the positional `TYPES` argument.
 ///
 /// A static `[PossibleValue]` list cannot express `CONNECT:<port>` (the port is
-/// dynamic), so validation is a typed parser over the same documented set.
+/// dynamic) nor `+`-separated AND groups, so validation is a typed parser over
+/// the same documented set.
 #[derive(Clone)]
 struct TypesValueParser;
 
@@ -57,7 +62,7 @@ impl TypedValueParser for TypesValueParser {
     fn parse_ref(
         &self,
         cmd: &clap::Command,
-        arg: Option<&clap::Arg>,
+        _arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
         let value = value
@@ -69,10 +74,7 @@ impl TypedValueParser for TypesValueParser {
             let mut error = clap::Error::new(clap::error::ErrorKind::InvalidValue).with_cmd(cmd);
             error.insert(
                 clap::error::ContextKind::InvalidArg,
-                clap::error::ContextValue::String(
-                    arg.map(|arg| format!("--{}", arg.get_id()))
-                        .unwrap_or_else(|| "--types".to_owned()),
-                ),
+                clap::error::ContextValue::String("TYPES".to_owned()),
             );
             error.insert(
                 clap::error::ContextKind::InvalidValue,
@@ -85,6 +87,7 @@ impl TypedValueParser for TypesValueParser {
                         .iter()
                         .map(|name| name.to_string())
                         .chain(std::iter::once("CONNECT:<port>".to_string()))
+                        .chain(std::iter::once("HTTP+HTTPS".to_string()))
                         .collect(),
                 ),
             );
@@ -202,6 +205,7 @@ pub struct FetcherArgs {
     /// URLs, while validation touches thousands of proxies.
     #[arg(
         long,
+        help_heading = "Advanced",
         default_value_t = fluxy::fetcher::DEFAULT_CONCURRENCY_LIMIT as u64,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -214,6 +218,7 @@ pub struct FetcherArgs {
     /// `0` disables the cache entirely.
     #[arg(
         long,
+        help_heading = "Advanced",
         default_value_t = fluxy::fetcher::DEFAULT_CACHE_TTL_MINUTES,
         value_parser = clap::value_parser!(u64)
     )]
@@ -222,14 +227,14 @@ pub struct FetcherArgs {
     /// Ignore the local provider-source cache and fetch every source again.
     ///
     /// The freshly fetched bodies still repopulate the cache.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, help_heading = "Advanced", default_value_t = false)]
     pub refresh_cache: bool,
 
     /// Disable deduplication of identical endpoints across sources.
     ///
     /// Off by default (duplicates are filtered). Useful when auditing how many
     /// times a source re-emits the same `ip:port`.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, help_heading = "Advanced", default_value_t = false)]
     pub no_dedup: bool,
 
     /// List the providers and sources that would be fetched, then exit.
@@ -251,23 +256,20 @@ pub struct FetchArgs {
 /// Options controlling proxy validation against online judges.
 #[derive(Args, Debug, Default)]
 pub struct ValidatorArgs {
-    /// Proxy types (protocols) to validate. [possible values: HTTP{:Transparent,
-    /// :Anonymous,:Elite}, HTTPS{:Transparent,:Anonymous,:Elite}, SOCKS4, SOCKS5,
-    /// CONNECT:<port>]
-    #[arg(
-        short = 't',
-        long = "types",
-        help_heading = "Validate",
-        num_args(1..),
-        required = true,
-        value_parser = TypesValueParser,
-    )]
+    /// Proxy types (protocols) to validate. Combine several with `+` to
+    /// require all of them (e.g. `HTTP+HTTPS`); separate entries with spaces
+    /// to accept any (OR). Omitted types default to `HTTP`.
+    ///
+    /// [possible values: HTTP{:Transparent,:Anonymous,:Elite},
+    /// HTTPS{:Transparent,:Anonymous,:Elite}, SOCKS4, SOCKS5, CONNECT:<port>]
+    #[arg(num_args(1..), value_parser = TypesValueParser)]
     pub types: Vec<String>,
 
     /// Maximum number of concurrent proxy checks.
     #[arg(
         short,
         long,
+        help_heading = "Advanced",
         default_value_t = fluxy::validator::DEFAULT_CONCURRENCY_LIMIT as u64,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
@@ -276,13 +278,19 @@ pub struct ValidatorArgs {
     /// Maximum number of attempts to validate a proxy.
     #[arg(
         long,
+        help_heading = "Advanced",
         default_value = "1",
         value_parser = parse_positive_usize
     )]
     pub max_attempts: usize,
 
     /// Timeout duration in seconds before giving up.
-    #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(
+        long,
+        help_heading = "Advanced",
+        default_value = "3",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub timeout: u64,
 
     /// Online judges used to validate plain HTTP proxy forwarding.
@@ -292,6 +300,7 @@ pub struct ValidatorArgs {
     /// used round-robin. If all fail, the run aborts with a message.
     #[arg(
         long,
+        help_heading = "Advanced",
         default_value = "http://azenv.net/,http://wfuchs.de/azenv.php,http://proxyjudge.us/,http://shinh.org/env.cgi",
         value_delimiter = ','
     )]
@@ -303,6 +312,7 @@ pub struct ValidatorArgs {
     /// connection to port 443.
     #[arg(
         long,
+        help_heading = "Advanced",
         default_value = "https://aranguren.org/azenv.php,https://wfuchs.de/azenv.php",
         value_delimiter = ','
     )]
@@ -313,7 +323,7 @@ pub struct ValidatorArgs {
     /// Off by default. Enable only for self-hosted judges that use self-signed
     /// certificates; leaving it on for public HTTPS judges lets a MITM on the
     /// judge path forge validation responses.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, help_heading = "Advanced", default_value_t = false)]
     pub insecure: bool,
 }
 

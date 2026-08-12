@@ -114,6 +114,19 @@ impl Fluxy {
         self
     }
 
+    /// AND groups of protocols to validate. Every protocol inside a group must
+    /// pass for a proxy to be kept; a passing proxy is emitted once, listing
+    /// every passing protocol. Groups combine with OR across [`Fluxy::types`]
+    /// and each other.
+    ///
+    /// Unlike singleton types, group members are verified for every candidate
+    /// rather than trusting the source's label. When both `types` and `groups`
+    /// are empty the pipeline skips validation.
+    pub fn groups(mut self, groups: impl Into<Vec<Vec<Protocol>>>) -> Self {
+        self.validator_config.groups = groups.into();
+        self
+    }
+
     /// Maximum number of proxies validated concurrently.
     ///
     /// Mirrors the CLI's `--max-connections`.
@@ -240,7 +253,7 @@ impl Fluxy {
             SourceKind::File(source) => Box::pin(stream::iter(source)) as BoxStream,
         };
 
-        let output = if validator_config.types.is_empty() {
+        let output = if validator_config.types.is_empty() && validator_config.groups.is_empty() {
             source
         } else {
             Box::pin(ProxyValidator::validate(source, validator_config).await?) as BoxStream
@@ -284,6 +297,22 @@ mod tests {
             fluxy.validator_config.types,
             vec![Protocol::Http(Anonymity::Elite)]
         );
+    }
+
+    #[test]
+    fn groups_land_in_validator_config() {
+        let fluxy = Fluxy::fetch().groups(vec![vec![
+            Protocol::Http(Anonymity::Unknown),
+            Protocol::Https(Anonymity::Unknown),
+        ]]);
+        assert_eq!(
+            fluxy.validator_config.groups,
+            vec![vec![
+                Protocol::Http(Anonymity::Unknown),
+                Protocol::Https(Anonymity::Unknown)
+            ]]
+        );
+        assert!(fluxy.validator_config.types.is_empty());
     }
 
     #[test]

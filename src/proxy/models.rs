@@ -191,6 +191,20 @@ where
     serializer.serialize_f64(runtimes.avg())
 }
 
+/// Serializes the validated types under the `type` key: `null` when unset, a
+/// single object when exactly one protocol passed, and an array for AND-group
+/// matches (e.g. `HTTP+HTTPS`).
+fn serialize_types<S>(types: &[ProxyType], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match types {
+        [] => serializer.serialize_none(),
+        [single] => single.serialize(serializer),
+        many => many.serialize(serializer),
+    }
+}
+
 // ── Proxy ─────────────────────────────────────────────────────────────
 
 /// An `ip:port` proxy endpoint enriched with geo data and validation results.
@@ -211,8 +225,8 @@ pub struct Proxy {
     pub runtimes: RuntimeStats,
     #[serde(skip)]
     pub expected_types: Arc<[Protocol]>,
-    #[serde(rename = "type")]
-    pub proxy_type: Option<ProxyType>,
+    #[serde(rename = "type", serialize_with = "serialize_types")]
+    pub proxy_types: Vec<ProxyType>,
     /// Precomputed `ip:port` text, cached to avoid re-formatting on every hot-path call.
     #[serde(skip)]
     pub(crate) text: Arc<str>,
@@ -238,7 +252,7 @@ impl Proxy {
             geo: Arc::clone(&DEFAULT_GEO),
             runtimes: RuntimeStats::default(),
             expected_types: Arc::from([]),
-            proxy_type: None,
+            proxy_types: Vec::new(),
             text: Arc::from(text.as_ref()),
         }
     }
@@ -258,7 +272,7 @@ impl Proxy {
             geo: Arc::clone(&self.geo),
             runtimes: self.runtimes,
             expected_types: Arc::from([]),
-            proxy_type: None,
+            proxy_types: Vec::new(),
             text: Arc::clone(&self.text),
         }
     }
@@ -313,9 +327,16 @@ impl Display for Proxy {
         }
 
         write!(f, " {:.2}s [", self.avg_response_time())?;
-        match &self.proxy_type {
-            Some(proxy_type) => write!(f, "{}", proxy_type.protocol)?,
-            None => write!(f, "--")?,
+        match self.proxy_types.as_slice() {
+            [] => write!(f, "--")?,
+            proxy_types => {
+                for (i, proxy_type) in proxy_types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", proxy_type.protocol)?;
+                }
+            }
         }
         write!(f, "] {}:{}>", self.ip, self.port)
     }
@@ -362,7 +383,7 @@ impl FromStr for Proxy {
 
 #[cfg(test)]
 mod tests {
-    use super::{Anonymity, Protocol, Proxy};
+    use super::{Anonymity, Protocol, Proxy, ProxyType};
     use std::{net::Ipv4Addr, sync::Arc};
 
     #[test]
@@ -408,6 +429,36 @@ mod tests {
 
         assert!(std::sync::Arc::ptr_eq(&proxy.expected_types, &expected));
         assert!(std::sync::Arc::ptr_eq(&proxy.text, &probe.text));
+    }
+
+    #[test]
+    fn multi_type_proxy_renders_combined_display_and_json() {
+        let mut proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 40), 10006);
+        proxy.proxy_types.push(ProxyType::checked(Protocol::Socks4));
+        proxy.proxy_types.push(ProxyType::checked(Protocol::Socks5));
+
+        let rendered = proxy.to_string();
+        assert!(rendered.contains("[SOCKS4, SOCKS5]"), "got: {rendered}");
+
+        let value: serde_json::Value = serde_json::from_str(&proxy.as_json()).unwrap();
+        let types = value["type"]
+            .as_array()
+            .expect("multi-type serializes as array");
+        assert_eq!(types.len(), 2);
+        assert_eq!(types[0]["protocol"], "Socks4");
+        assert_eq!(types[1]["protocol"], "Socks5");
+    }
+
+    #[test]
+    fn single_type_proxy_keeps_object_json_shape() {
+        let mut proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 41), 8080);
+        proxy
+            .proxy_types
+            .push(ProxyType::checked(Protocol::Http(Anonymity::Transparent)));
+
+        let value: serde_json::Value = serde_json::from_str(&proxy.as_json()).unwrap();
+        assert!(value["type"].is_object());
+        assert_eq!(value["type"]["protocol"]["Http"], "Transparent");
     }
 
     #[test]

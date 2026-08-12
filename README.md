@@ -22,7 +22,7 @@ providers, `flx find` checks proxies against online judges, and a
 Here's the debug output showing the proxy validator process:
 
 ```sh
-flx find -t HTTP -l 3 --with-geo --log debug -f json
+flx find HTTP -l 3 --with-geo --log debug -f json
 fluxy::fetcher: DEBUG Proxy gathering started (40 primary sources, 31 fallback sources)
 fluxy::validator: DEBUG Proxy validator started (500 workers)
 fluxy::validator: INFO using 1 healthy HTTP judge(s)
@@ -53,9 +53,29 @@ The built-in defaults work without a local judge binary or shared secret:
 
 ```sh
 cargo run --release --bin flx -- \
-  find -t HTTP HTTPS SOCKS4 SOCKS5 \
+  find HTTP HTTPS SOCKS4 SOCKS5 \
   --timeout 5
 ```
+
+### Choosing what to validate
+
+`find` takes the protocols as positional arguments (no `-t`): the default is
+`HTTP`, `flx find HTTP HTTPS` accepts a proxy that supports *either*, and `+`
+combines protocols into an *all* requirement:
+
+```sh
+flx find HTTP+HTTPS        # must support both HTTP and HTTPS
+flx find HTTP+HTTPS SOCKS5 # (HTTP and HTTPS) or SOCKS5
+```
+
+Every protocol inside an AND group is verified against each candidate rather
+than trusting the source label, and a proxy that passes the whole group appears
+once, listing every passing protocol (`<Proxy ... [SOCKS4, SOCKS5] ...>`,
+`"type":[{...},{...}]` in JSON). `flx find` with a piped stdout defaults to
+`json-lines` (`flx find HTTP | jq .ip` just works); `-f pretty-json` is still
+there for humans. Rarely-tuned flags (`--http-judge-urls`, `--insecure`,
+`--max-connections`, the fetch cache knobs, …) live under the *Advanced*
+section of `flx find --help`.
 
 Custom pools can be supplied with comma-separated `--http-judge-urls` and
 `--https-judge-urls` on `flx find`. HTTPS certificate validation is
@@ -109,12 +129,22 @@ async fn main() -> anyhow::Result<()> {
         .types([Protocol::Socks5])
         .collect()
         .await?;
+    // Or require a proxy to pass several protocols at once.
+    let both = Fluxy::fetch()
+        .groups(vec![vec![
+            Protocol::Http(Anonymity::Unknown),
+            Protocol::Https(Anonymity::Unknown),
+        ]])
+        .limit(20)
+        .collect()
+        .await?;
     Ok(())
 }
 ```
 
-When `types` is empty the pipeline skips validation and yields every fetched
-proxy unchanged. Large pools can be processed incrementally with
+When both `types` and `groups` are empty the pipeline skips validation and
+yields every fetched proxy unchanged. Large pools can be processed
+incrementally with
 `Fluxy::stream()`, which returns a `Stream<Item = Proxy>` instead of buffering
 everything into a `Vec`. The lower-level pieces (`ProxyFetcher`,
 `ProxyValidator`, `ProxySource`) are public too, along with the `prelude`

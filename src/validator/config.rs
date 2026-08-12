@@ -29,6 +29,10 @@ pub struct Config {
     pub request_timeout: u64,
     /// Protocols to validate and match against. Empty disables the validator.
     pub types: Vec<Protocol>,
+    /// AND groups of protocols. Every protocol inside a group must pass for a
+    /// proxy to be emitted once, listing every passing protocol. Groups combine
+    /// with OR across the singleton `types` list and with each other.
+    pub groups: Vec<Vec<Protocol>>,
     /// Maximum number of attempts per advertised protocol before giving up.
     pub max_attempts: usize,
     /// Online judges used to validate plain HTTP proxy forwarding.
@@ -58,6 +62,7 @@ impl Default for Config {
             concurrency_limit: DEFAULT_CONCURRENCY_LIMIT,
             request_timeout: 3,
             types: Vec::new(),
+            groups: Vec::new(),
             max_attempts: 1,
             http_judge_urls: DEFAULT_HTTP_JUDGE_URLS
                 .iter()
@@ -88,5 +93,10 @@ mod tests {
     #[test]
     fn default_max_attempts_is_positive() {
         assert!(Config::default().max_attempts > 0);
+    }
+
+    #[test]
+    fn default_groups_are_empty() {
+        assert!(Config::default().groups.is_empty());
     }
 }

@@ -3,6 +3,7 @@ pub mod config;
 mod tunnel;
 
 use std::{
+    collections::HashMap,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -22,7 +23,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 pub use config::{Config, DEFAULT_CONCURRENCY_LIMIT};
 pub use tunnel::ValidationStatus;
 
-use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType};
+use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
 
 pub(crate) const VALIDATOR_CHANNEL_MIN: usize = 64;
 pub(crate) const VALIDATOR_CHANNEL_MAX: usize = 4_096;
@@ -62,6 +63,7 @@ pub struct ProxyValidator {
     #[cfg(feature = "log")]
     timer: Instant,
     task_handle: JoinHandle<()>,
+    group_task: JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -75,6 +77,31 @@ struct WorkParams {
     max_attempts: usize,
     request_timeout: u64,
     insecure: bool,
+}
+
+/// Identifies one AND-group validation for one proxy instance.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GroupKey {
+    /// Uniquely identifies the `Arc<Proxy>` instance (each candidate is
+    /// wrapped once, so the address is unique for the lifetime of the jobs).
+    proxy: usize,
+    group_idx: usize,
+}
+
+/// Outcome of one protocol inside an AND group. `None` means the probe failed,
+/// was inconclusive, or errored out; the group drops as soon as any slot is
+/// missing when all of its members have reported.
+struct GroupWorkResult {
+    key: GroupKey,
+    slot: usize,
+    group_len: usize,
+    proxy: Option<Proxy>,
+}
+
+/// Accumulates the per-slot outcomes of one AND group.
+struct GroupState {
+    remaining: usize,
+    results: Vec<Option<Proxy>>,
 }
 
 /// Shared match structure for protocol pairs. The closure `on_http_https`
@@ -110,6 +137,55 @@ fn result_satisfies_request(result: &Protocol, requested: &Protocol) -> bool {
     })
 }
 
+/// Runs a single protocol check against the judge pools and returns the
+/// measured [`ProxyType`] when it passes and satisfies `requested`.
+async fn run_probe(
+    proxy: &mut Proxy,
+    timeout: Duration,
+    max_attempts: usize,
+    insecure: bool,
+    protocol: Protocol,
+    requested: Protocol,
+    targets: &JudgeTargets,
+) -> anyhow::Result<Option<ProxyType>> {
+    if let Protocol::Http(_) = protocol {
+        // The judge request performs its own connect and negotiation; avoid a
+        // redundant TCP preflight for every HTTP proxy.
+        let result = checker::support_http(proxy, timeout, max_attempts, &targets.http, insecure)
+            .await
+            .with_context(|| format!("{}: HTTP check failed", proxy.as_text()))?;
+        if let Some(result) =
+            result.filter(|result| result_satisfies_request(&result.inner, &requested))
+        {
+            result.apply(proxy);
+            Ok(Some(ProxyType::checked(result.inner)))
+        } else {
+            Ok(None)
+        }
+    } else {
+        let result = tunnel::support_tunnel(
+            proxy,
+            timeout,
+            max_attempts,
+            protocol,
+            &targets.tunnel,
+            insecure,
+        )
+        .await
+        .with_context(|| format!("{}: tunnel check failed", proxy.as_text()))?;
+        if let Some(result) =
+            result.filter(|result| result_satisfies_request(&result.inner, &requested))
+        {
+            result.apply(proxy);
+            Ok(Some(ProxyType::checked(result.inner)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Runs a single validation job that emits its proxy directly. Used for the
+/// singleton `Config::types` list (OR semantics, gated by advertised types).
 async fn do_work(
     proxy: Arc<Proxy>,
     sender: mpsc::Sender<Proxy>,
@@ -120,56 +196,136 @@ async fn do_work(
     params: WorkParams,
 ) -> anyhow::Result<()> {
     let mut proxy = proxy.validation_probe();
-    let timeout = Duration::from_secs(params.request_timeout);
-    if let Protocol::Http(_) = protocol {
-        // The judge request performs its own connect and negotiation; avoid a
-        // redundant TCP preflight for every HTTP proxy.
-        let result = checker::support_http(
-            &mut proxy,
-            timeout,
-            params.max_attempts,
-            &targets.http,
-            params.insecure,
-        )
-        .await
-        .with_context(|| format!("{}: HTTP check failed", proxy.as_text()))?;
-        if let Some(result) =
-            result.filter(|result| result_satisfies_request(&result.inner, &requested))
-        {
-            result.apply(&mut proxy);
-            proxy.proxy_type = Some(ProxyType::checked(result.inner));
-        }
-    } else {
-        let result = tunnel::support_tunnel(
-            &mut proxy,
-            timeout,
-            params.max_attempts,
-            protocol,
-            &targets.tunnel,
-            params.insecure,
-        )
-        .await
-        .with_context(|| format!("{}: tunnel check failed", proxy.as_text()))?;
-        if let Some(result) =
-            result.filter(|result| result_satisfies_request(&result.inner, &requested))
-        {
-            result.apply(&mut proxy);
-            proxy.proxy_type = Some(ProxyType::checked(result.inner));
-        }
-    }
-    if let Some(proxy_type) = proxy.proxy_type.as_ref() {
-        #[cfg(feature = "log")]
-        log::trace!(
-            "{}: support protocol: {}",
-            proxy.as_text(),
-            proxy_type.protocol
-        );
-        let _ = proxy_type;
+    if let Some(proxy_type) = run_probe(
+        &mut proxy,
+        Duration::from_secs(params.request_timeout),
+        params.max_attempts,
+        params.insecure,
+        protocol,
+        requested,
+        &targets,
+    )
+    .await?
+    {
+        proxy.proxy_types.push(proxy_type);
         counter.fetch_add(1, Ordering::Relaxed);
-        // A closed receiver simply means the consumer stopped early.
         let _ = sender.send(proxy).await;
     }
     Ok(())
+}
+
+/// One protocol of an AND group, bound to its proxy instance.
+struct GroupMemberJob {
+    proxy: Arc<Proxy>,
+    protocol: Protocol,
+    group_idx: usize,
+    slot: usize,
+    group_len: usize,
+}
+
+/// Runs one protocol of an AND group and reports the outcome to the group
+/// aggregator. Unlike singleton jobs, group members are always probed: the
+/// "supports both" claim is verified, never taken from the source label.
+async fn do_group_work(
+    member: GroupMemberJob,
+    group_tx: mpsc::Sender<GroupWorkResult>,
+    targets: JudgeTargets,
+    params: WorkParams,
+) -> anyhow::Result<()> {
+    let GroupMemberJob {
+        proxy,
+        protocol,
+        group_idx,
+        slot,
+        group_len,
+    } = member;
+    let mut probe = proxy.validation_probe();
+    let result = match run_probe(
+        &mut probe,
+        Duration::from_secs(params.request_timeout),
+        params.max_attempts,
+        params.insecure,
+        protocol,
+        protocol,
+        &targets,
+    )
+    .await
+    {
+        Ok(Some(proxy_type)) => {
+            probe.proxy_types.push(proxy_type);
+            Some(probe)
+        }
+        Ok(None) | Err(_) => None,
+    };
+    let _ = group_tx
+        .send(GroupWorkResult {
+            key: GroupKey {
+                proxy: Arc::as_ptr(&proxy) as usize,
+                group_idx,
+            },
+            slot,
+            group_len,
+            proxy: result,
+        })
+        .await;
+    Ok(())
+}
+
+/// Merges the passing records of a finished AND group into a single proxy
+/// whose `proxy_types` lists every passing protocol (in slot order). Returns
+/// `None` when any member failed to pass.
+fn group_finish(state: GroupState) -> Option<Proxy> {
+    let slots: Vec<Proxy> = if state.results.iter().all(Option::is_some) {
+        state.results.into_iter().flatten().collect()
+    } else {
+        return None;
+    };
+    let mut merged = slots[0].clone();
+    merged.proxy_types = slots
+        .iter()
+        .filter_map(|proxy| proxy.proxy_types.first().cloned())
+        .collect();
+    // Combine the per-protocol latencies into one aggregate: each slot carries
+    // a single aggregated sample (matching `ProxyRuntimes::apply`), so they
+    // merge as one sample per passing protocol.
+    merged.runtimes = RuntimeStats::default();
+    for slot in &slots {
+        let avg = slot.runtimes.avg();
+        if avg > 0.0 {
+            merged.runtimes.record(avg);
+        }
+    }
+    Some(merged)
+}
+
+/// Correlates the per-protocol probes of each proxy+group and only forwards to
+/// the public channel once every slot reported. Any missing/failed slot drops
+/// the whole group. Runs concurrently so multi-type results stream out as they
+/// complete.
+async fn aggregate_groups(
+    mut group_rx: mpsc::Receiver<GroupWorkResult>,
+    aggregate_sender: mpsc::Sender<Proxy>,
+    aggregate_counter: Arc<AtomicUsize>,
+) {
+    let mut states: HashMap<GroupKey, GroupState> = HashMap::new();
+    while let Some(msg) = group_rx.recv().await {
+        let entry = states.entry(msg.key).or_insert_with(|| GroupState {
+            remaining: msg.group_len,
+            results: vec![None; msg.group_len],
+        });
+        entry.results[msg.slot] = msg.proxy;
+        entry.remaining -= 1;
+        if entry.remaining == 0 {
+            let finished = states
+                .remove(&msg.key)
+                .expect("current group state was pushed above");
+            if let Some(proxy) = group_finish(finished) {
+                aggregate_counter.fetch_add(1, Ordering::Relaxed);
+                // A closed receiver simply means the consumer stopped early.
+                let _ = aggregate_sender.send(proxy).await;
+            }
+        }
+    }
 }
 
 impl ProxyValidator {
@@ -186,8 +342,11 @@ impl ProxyValidator {
     where
         S: Stream<Item = Proxy> + Send + 'static,
     {
-        if config.types.is_empty() {
-            anyhow::bail!("config.types cannot be empty; please specify at least one type.");
+        if config.types.is_empty() && config.groups.is_empty() {
+            anyhow::bail!("config.types and config.groups cannot both be empty; please specify at least one type.");
+        }
+        if config.groups.iter().any(|group| group.is_empty()) {
+            anyhow::bail!("config.groups cannot contain an empty group");
         }
         if config.concurrency_limit == 0 {
             anyhow::bail!("config.concurrency_limit must be greater than zero");
@@ -211,6 +370,40 @@ impl ProxyValidator {
         let manager_total = Arc::clone(&total);
         let manager_counter = Arc::clone(&counter);
         let expected: Arc<[Protocol]> = Arc::from(config.types.into_boxed_slice());
+        // Deduplicate protocols inside each AND group so a duplicated member
+        // can never double-probe the same slot or emit a duplicate record.
+        let groups: Arc<Vec<Vec<Protocol>>> = Arc::new(
+            config
+                .groups
+                .into_iter()
+                .map(|mut group| {
+                    let mut seen: Vec<Protocol> = Vec::with_capacity(group.len());
+                    group.retain(|protocol| {
+                        if seen.contains(protocol) {
+                            false
+                        } else {
+                            seen.push(*protocol);
+                            true
+                        }
+                    });
+                    group
+                })
+                .collect(),
+        );
+        // Flatten all groups once, so job expansion only clones the shared
+        // spec (no per-proxy allocation).
+        let group_spec: Arc<Vec<(usize, usize, Protocol)>> = Arc::from(
+            groups
+                .iter()
+                .enumerate()
+                .flat_map(|(group_idx, protocols)| {
+                    protocols
+                        .iter()
+                        .enumerate()
+                        .map(move |(slot, protocol)| (group_idx, slot, *protocol))
+                })
+                .collect::<Vec<_>>(),
+        );
         let max_attempts = config.max_attempts;
         let request_timeout = config.request_timeout;
         let concurrency_limit = config.concurrency_limit;
@@ -218,9 +411,11 @@ impl ProxyValidator {
         let preflight_timeout = Duration::from_secs(config.request_timeout);
         let need_http = expected
             .iter()
+            .chain(groups.iter().flatten())
             .any(|protocol| matches!(protocol, Protocol::Http(_)));
         let need_tunnel = expected
             .iter()
+            .chain(groups.iter().flatten())
             .any(|protocol| !matches!(protocol, Protocol::Http(_)));
 
         let http_preflight = async {
@@ -269,82 +464,195 @@ impl ProxyValidator {
                 .unwrap_or_else(|| Arc::new(checker::JudgePool::from_targets(Vec::new()))),
         };
 
+        let (group_tx, group_rx): (
+            mpsc::Sender<GroupWorkResult>,
+            mpsc::Receiver<GroupWorkResult>,
+        ) = mpsc::channel(validator_channel_capacity(concurrency_limit));
+
+        // AND-group aggregator: correlates the per-protocol probes of each
+        // proxy+group and only forwards to the public channel once every slot
+        // reported. Any missing/failed slot drops the whole group. Runs
+        // concurrently so multi-type results stream out as they complete.
+        let aggregate_sender = sender.clone();
+        let aggregate_counter = Arc::clone(&manager_counter);
+        let group_aggregator = tokio::spawn(aggregate_groups(
+            group_rx,
+            aggregate_sender,
+            aggregate_counter,
+        ));
+
         let manager = tokio::spawn(async move {
-            // Expand each proxy's advertised types against the requested set
-            // lazily and allocation-free: no `Vec` is built per proxy,
-            // `Protocol` is `Copy` so values are passed by copy instead of
-            // `clone()`, and both the advertised and requested lists are
-            // deduplicated so a duplicated entry can never yield a duplicate
-            // probe job.
-            let jobs = proxy_source.flat_map(move |proxy| {
+            enum Job {
+                Singleton {
+                    proxy: Arc<Proxy>,
+                    protocol: Protocol,
+                    requested: Protocol,
+                },
+                GroupMember {
+                    proxy: Arc<Proxy>,
+                    protocol: Protocol,
+                    group_idx: usize,
+                    slot: usize,
+                    group_len: usize,
+                },
+            }
+
+            // Expand each proxy into its singleton jobs (advertised-gated, OR
+            // semantics) plus its AND-group jobs (every member always probed).
+            let jobs = proxy_source.flat_map(move |proxy: Proxy| {
                 let proxy = Arc::new(proxy);
                 let advertised = Arc::clone(&proxy.expected_types);
-                if advertised.iter().any(|advertised| {
+                let has_singleton = advertised.iter().any(|advertised| {
                     expected
                         .iter()
                         .any(|requested| advertised_matches_request(advertised, requested))
-                }) {
+                });
+                if has_singleton {
                     manager_total.fetch_add(1, Ordering::Relaxed);
                 }
-                let state = (proxy, advertised, Arc::clone(&expected), 0usize, 0usize);
-                futures_util::stream::unfold(
-                    state,
-                    |(proxy, advertised, requested, mut adv_idx, mut req_idx)| async move {
-                        loop {
-                            if adv_idx >= advertised.len() {
-                                return None;
-                            }
-                            let adv = &advertised[adv_idx];
-                            if advertised[..adv_idx].iter().any(|seen| seen == adv) {
+                let has_group = !group_spec.is_empty();
+                if has_group {
+                    manager_total.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // Singleton path, allocation-free: no `Vec` is built per proxy,
+                // `Protocol` is `Copy`, and both the advertised and requested
+                // lists are deduplicated so a duplicated entry can never yield
+                // a duplicate probe job.
+                let singleton: futures_util::stream::BoxStream<'static, Job> = if has_singleton {
+                    let state = (
+                        proxy.clone(),
+                        advertised,
+                        Arc::clone(&expected),
+                        0usize,
+                        0usize,
+                    );
+                    Box::pin(futures_util::stream::unfold(
+                        state,
+                        |(proxy, advertised, requested, mut adv_idx, mut req_idx)| async move {
+                            loop {
+                                if adv_idx >= advertised.len() {
+                                    return None;
+                                }
+                                let adv = &advertised[adv_idx];
+                                if advertised[..adv_idx].iter().any(|seen| seen == adv) {
+                                    adv_idx += 1;
+                                    req_idx = 0;
+                                    continue;
+                                }
+                                while req_idx < requested.len() {
+                                    let req = &requested[req_idx];
+                                    let requested_is_new =
+                                        !requested[..req_idx].iter().any(|seen| seen == req);
+                                    req_idx += 1;
+                                    if requested_is_new && advertised_matches_request(adv, req) {
+                                        return Some((
+                                            Job::Singleton {
+                                                proxy: Arc::clone(&proxy),
+                                                protocol: *adv,
+                                                requested: *req,
+                                            },
+                                            (proxy, advertised, requested, adv_idx, req_idx),
+                                        ));
+                                    }
+                                }
                                 adv_idx += 1;
                                 req_idx = 0;
-                                continue;
                             }
-                            while req_idx < requested.len() {
-                                let req = &requested[req_idx];
-                                let requested_is_new =
-                                    !requested[..req_idx].iter().any(|seen| seen == req);
-                                req_idx += 1;
-                                if requested_is_new && advertised_matches_request(adv, req) {
-                                    return Some((
-                                        (Arc::clone(&proxy), *adv, *req),
-                                        (proxy, advertised, requested, adv_idx, req_idx),
-                                    ));
-                                }
+                        },
+                    ))
+                } else {
+                    Box::pin(futures_util::stream::empty())
+                };
+
+                let group: futures_util::stream::BoxStream<'static, Job> = if has_group {
+                    Box::pin(futures_util::stream::unfold(
+                        (0usize, proxy, Arc::clone(&group_spec), Arc::clone(&groups)),
+                        |(mut idx, proxy, spec, groups)| async move {
+                            if idx >= spec.len() {
+                                return None;
                             }
-                            adv_idx += 1;
-                            req_idx = 0;
-                        }
-                    },
-                )
+                            let (group_idx, slot, protocol) = spec[idx];
+                            idx += 1;
+                            let group_len = groups[group_idx].len();
+                            Some((
+                                Job::GroupMember {
+                                    proxy: Arc::clone(&proxy),
+                                    protocol,
+                                    group_idx,
+                                    slot,
+                                    group_len,
+                                },
+                                (idx, proxy, spec, groups),
+                            ))
+                        },
+                    ))
+                } else {
+                    Box::pin(futures_util::stream::empty())
+                };
+
+                singleton.chain(group)
             });
 
-            jobs.for_each_concurrent(concurrency_limit, move |(proxy, protocol, requested)| {
+            let worker_group_tx = group_tx.clone();
+            jobs.for_each_concurrent(concurrency_limit, move |job| {
                 let sender = sender.clone();
                 let counter = Arc::clone(&manager_counter);
                 let targets = targets.clone();
+                let group_tx = worker_group_tx.clone();
+                let params = WorkParams {
+                    max_attempts,
+                    request_timeout,
+                    insecure,
+                };
                 async move {
-                    if let Err(_e) = do_work(
-                        proxy,
-                        sender,
-                        counter,
-                        protocol,
-                        requested,
-                        targets,
-                        WorkParams {
-                            max_attempts,
-                            request_timeout,
-                            insecure,
-                        },
-                    )
-                    .await
-                    {
-                        #[cfg(feature = "log")]
-                        log::debug!("validation task failed: {:#}", _e);
+                    match job {
+                        Job::Singleton {
+                            proxy,
+                            protocol,
+                            requested,
+                        } => {
+                            if let Err(_e) = do_work(
+                                proxy, sender, counter, protocol, requested, targets, params,
+                            )
+                            .await
+                            {
+                                #[cfg(feature = "log")]
+                                log::debug!("validation task failed: {:#}", _e);
+                            }
+                        }
+                        Job::GroupMember {
+                            proxy,
+                            protocol,
+                            group_idx,
+                            slot,
+                            group_len,
+                        } => {
+                            if let Err(_e) = do_group_work(
+                                GroupMemberJob {
+                                    proxy,
+                                    protocol,
+                                    group_idx,
+                                    slot,
+                                    group_len,
+                                },
+                                group_tx,
+                                targets,
+                                params,
+                            )
+                            .await
+                            {
+                                #[cfg(feature = "log")]
+                                log::debug!("group validation task failed: {:#}", _e);
+                            }
+                        }
                     }
                 }
             })
             .await;
+
+            // Close the group channel so the aggregator drains and stops.
+            drop(group_tx);
         });
 
         Ok(Self {
@@ -356,6 +664,7 @@ impl ProxyValidator {
             #[cfg(feature = "log")]
             timer: Instant::now(),
             task_handle: manager,
+            group_task: group_aggregator,
         })
     }
 
@@ -377,6 +686,7 @@ impl Drop for ProxyValidator {
     fn drop(&mut self) {
         self.receiver.close();
         self.task_handle.abort();
+        self.group_task.abort();
         #[cfg(feature = "log")]
         log::info!(
             "Proxy validator completed: {}/{} proxies validated ({:?})",
@@ -390,10 +700,11 @@ impl Drop for ProxyValidator {
 #[cfg(test)]
 mod tests {
     use super::{
-        advertised_matches_request, result_satisfies_request, validator_channel_capacity, Config,
-        ProxyValidator, VALIDATOR_CHANNEL_MAX, VALIDATOR_CHANNEL_MIN,
+        advertised_matches_request, group_finish, result_satisfies_request,
+        validator_channel_capacity, Config, GroupState, ProxyValidator, VALIDATOR_CHANNEL_MAX,
+        VALIDATOR_CHANNEL_MIN,
     };
-    use crate::proxy::models::{Anonymity, Protocol};
+    use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType};
 
     #[test]
     fn unknown_advertised_anonymity_can_be_measured_for_specific_request() {
@@ -443,6 +754,48 @@ mod tests {
             validator_channel_capacity(usize::MAX),
             VALIDATOR_CHANNEL_MAX
         );
+    }
+
+    #[test]
+    fn group_finish_merges_passing_types_into_one_record() {
+        let mut socks4 = Proxy::new("1.1.1.1".parse().unwrap(), 10006);
+        socks4.runtimes.record(0.5);
+        socks4
+            .proxy_types
+            .push(ProxyType::checked(Protocol::Socks4));
+        let mut socks5 = Proxy::new("1.1.1.1".parse().unwrap(), 10006);
+        socks5.runtimes.record(0.3);
+        socks5
+            .proxy_types
+            .push(ProxyType::checked(Protocol::Socks5));
+
+        let finished = group_finish(GroupState {
+            remaining: 0,
+            results: vec![Some(socks4), Some(socks5)],
+        })
+        .expect("group passed");
+
+        assert_eq!(finished.ip.to_string(), "1.1.1.1");
+        assert_eq!(finished.proxy_types.len(), 2);
+        assert_eq!(finished.proxy_types[0].protocol, Protocol::Socks4);
+        assert_eq!(finished.proxy_types[1].protocol, Protocol::Socks5);
+        assert!(finished.to_string().contains("[SOCKS4, SOCKS5]"));
+        // Per-protocol latencies merge into one non-zero average.
+        let average = finished.avg_response_time();
+        assert!(
+            (average - 0.4).abs() < f64::EPSILON,
+            "average was {average}"
+        );
+    }
+
+    #[test]
+    fn group_finish_drops_group_when_any_slot_failed() {
+        let passed = Proxy::new("1.1.1.1".parse().unwrap(), 10006);
+        let finished = group_finish(GroupState {
+            remaining: 0,
+            results: vec![Some(passed), None],
+        });
+        assert!(finished.is_none());
     }
 
     #[tokio::test]

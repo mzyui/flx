@@ -7,11 +7,12 @@ use clap::{
 #[cfg(feature = "log")]
 use fluxy::initialize_logging;
 use fluxy::{
-    proxy::models::{Protocol, Proxy},
+    proxy::models::{Anonymity, Protocol, Proxy},
     ProxySource, ProxyValidator,
 };
 use futures_util::{Stream, StreamExt};
 use std::future::Future;
+use std::io::IsTerminal as _;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::{io::AsyncWriteExt, runtime};
@@ -106,7 +107,7 @@ fn report_invalid_type_value(value: &str) {
     let mut error = clap::Error::new(ErrorKind::ValueValidation).with_cmd(&Cli::command());
     error.insert(
         ContextKind::InvalidArg,
-        ContextValue::String("--types".to_owned()),
+        ContextValue::String("TYPES".to_owned()),
     );
     error.insert(
         ContextKind::InvalidValue,
@@ -115,6 +116,7 @@ fn report_invalid_type_value(value: &str) {
     let _ = error.print();
 }
 
+#[cfg(test)]
 fn convert_protocols(types: &[String]) -> Vec<Protocol> {
     types
         .iter()
@@ -128,6 +130,57 @@ fn convert_protocols(types: &[String]) -> Vec<Protocol> {
         .collect()
 }
 
+/// Splits the positional `TYPES` tokens into singleton protocols (OR across
+/// entries) and AND groups. A token without `+` is a singleton; a token with
+/// `+` (e.g. `HTTP+HTTPS`) becomes a group whose every protocol must pass.
+///
+/// Duplicate protocols inside a group are collapsed so a repeated member can
+/// never double-probe or double-emit.
+fn split_type_groups(tokens: &[String]) -> (Vec<Protocol>, Vec<Vec<Protocol>>) {
+    let mut types = Vec::new();
+    let mut groups: Vec<Vec<Protocol>> = Vec::new();
+    for token in tokens {
+        let mut parts: Vec<Protocol> = Vec::new();
+        for part in token.split('+') {
+            match Protocol::from_str(part) {
+                Ok(protocol) => parts.push(protocol),
+                Err(_) => report_invalid_type_value(part),
+            }
+        }
+        match parts.len() {
+            0 => {}
+            1 => types.push(parts[0]),
+            _ => {
+                let mut seen: Vec<Protocol> = Vec::with_capacity(parts.len());
+                parts.retain(|protocol| {
+                    if seen.contains(protocol) {
+                        false
+                    } else {
+                        seen.push(*protocol);
+                        true
+                    }
+                });
+                groups.push(parts);
+            }
+        }
+    }
+    (types, groups)
+}
+
+/// Chooses the concrete output format for a run.
+///
+/// `default` prints plain text on a terminal and switches to `json-lines`
+/// whenever the result stream is not a terminal, so `flx find ... | jq` works
+/// without spelling `-f`. Writing to a file (`-o`) always keeps the configured
+/// format.
+fn effective_format(format: &str, has_output_file: bool, stdout_is_tty: bool) -> &str {
+    if format == "default" && !has_output_file && !stdout_is_tty {
+        "json-lines"
+    } else {
+        format
+    }
+}
+
 async fn process_result<S, C>(
     source: S,
     options: OutputOptions,
@@ -137,6 +190,11 @@ where
     S: Stream<Item = Proxy>,
     C: Future<Output = ()>,
 {
+    let format = effective_format(
+        &options.format,
+        options.output_file.is_some(),
+        std::io::stdout().is_terminal(),
+    );
     let mut output_file = match options.output_file.as_ref() {
         Some(file_path) => Some(tokio::io::BufWriter::new(
             tokio::fs::OpenOptions::new()
@@ -150,8 +208,8 @@ where
         None => None,
     };
 
-    let json = matches!(options.format.as_str(), "json" | "pretty-json");
-    let _csv = options.format.as_str() == "csv";
+    let json = matches!(format, "json" | "pretty-json");
+    let _csv = format == "csv";
     let mut found_proxy = false;
     let mut cancelled = false;
     let mut source = std::pin::pin!(source.enumerate());
@@ -202,7 +260,7 @@ where
                 let Some((index, proxy)) = item else { break };
                 let should_end = options.limit > 0 && index + 1 >= options.limit;
                 buf.clear();
-                match options.format.as_str() {
+                match format {
                     "text" => {
                         buf.extend_from_slice(proxy.as_text().as_bytes());
                         buf.push(b'\n');
@@ -468,9 +526,10 @@ where
         return Ok(RunOutcome::Finished);
     }
 
-    let protocols = convert_protocols(&find.validator.types);
-    if protocols.is_empty() {
-        return Err(anyhow::anyhow!("no valid protocols parsed from --types"));
+    let (mut protocols, groups) = split_type_groups(&find.validator.types);
+    if protocols.is_empty() && groups.is_empty() {
+        // Omitted `TYPES` defaults to plain HTTP validation.
+        protocols.push(Protocol::Http(Anonymity::Unknown));
     }
 
     let source: BoxStream = match &find.file {
@@ -483,7 +542,7 @@ where
     };
 
     let validated_proxies =
-        ProxyValidator::validate(source, validator_config(&find.validator, protocols))
+        ProxyValidator::validate(source, validator_config(&find.validator, protocols, groups))
             .await
             .context("failed to start proxy validator")?;
     process_result(validated_proxies, find.output, cancel).await
@@ -511,9 +570,14 @@ async fn run_geo_update() -> anyhow::Result<RunOutcome> {
     Ok(RunOutcome::Finished)
 }
 
-fn validator_config(options: &ValidatorArgs, protocols: Vec<Protocol>) -> fluxy::validator::Config {
+fn validator_config(
+    options: &ValidatorArgs,
+    protocols: Vec<Protocol>,
+    groups: Vec<Vec<Protocol>>,
+) -> fluxy::validator::Config {
     fluxy::validator::Config {
         types: protocols,
+        groups,
         concurrency_limit: options.max_connections as usize,
         max_attempts: options.max_attempts,
         request_timeout: options.timeout,
@@ -531,10 +595,11 @@ fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
     let ip = proxy.ip.to_string();
     let port = proxy.port.to_string();
     let proxy_type = proxy
-        .proxy_type
-        .as_ref()
+        .proxy_types
+        .iter()
         .map(|pt| pt.protocol.to_string())
-        .unwrap_or_default();
+        .collect::<Vec<_>>()
+        .join(",");
     let response_time = format!("{:.2}", proxy.avg_response_time());
     let country = proxy.geo.iso_code.as_deref().unwrap_or("");
 
@@ -727,7 +792,6 @@ mod tests {
         // declared twice; ensure the flag still accepts a custom value and
         // lands in the right field.
         let cli = find_from(&[
-            "--types",
             "SOCKS5",
             "--https-judge-urls",
             "https://example.com/azenv.php",
@@ -737,7 +801,7 @@ mod tests {
             vec!["https://example.com/azenv.php".to_owned()]
         );
         // default still intact when flag omitted
-        let defaults = find_from(&["--types", "SOCKS5"]);
+        let defaults = find_from(&["SOCKS5"]);
         assert_eq!(
             defaults.validator.https_judge_urls,
             vec![
@@ -793,9 +857,48 @@ mod tests {
     }
 
     #[test]
-    fn find_requires_types() {
-        let result = Cli::try_parse_from(["flx", "find"]);
-        assert!(result.is_err());
+    fn find_without_types_parses_cleanly() {
+        let cli = find_from(&[]);
+        assert!(cli.validator.types.is_empty());
+    }
+
+    #[test]
+    fn types_split_into_singletons_and_and_groups() {
+        let (types, groups) = split_type_groups(&[
+            "HTTP".to_owned(),
+            "HTTP+HTTPS".to_owned(),
+            "SOCKS5".to_owned(),
+        ]);
+        assert_eq!(
+            types,
+            vec![Protocol::Http(Anonymity::Unknown), Protocol::Socks5]
+        );
+        assert_eq!(
+            groups,
+            vec![vec![
+                Protocol::Http(Anonymity::Unknown),
+                Protocol::Https(Anonymity::Unknown)
+            ]]
+        );
+    }
+
+    #[test]
+    fn and_group_deduplicates_repeated_members() {
+        let (types, groups) = split_type_groups(&["HTTP+HTTPS+HTTP".to_owned()]);
+        assert!(types.is_empty());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn default_format_switches_to_json_lines_when_piped() {
+        assert_eq!(effective_format("default", false, true), "default");
+        assert_eq!(effective_format("default", false, false), "json-lines");
+        // Redirected to a file keeps "default" untouched.
+        assert_eq!(effective_format("default", true, false), "default");
+        // Explicit formats are never overridden.
+        assert_eq!(effective_format("json", false, false), "json");
+        assert_eq!(effective_format("pretty-json", false, false), "pretty-json");
     }
 
     #[test]
@@ -809,8 +912,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_zero_max_attempts() {
-        let result =
-            Cli::try_parse_from(["flx", "find", "--types", "SOCKS5", "--max-attempts", "0"]);
+        let result = Cli::try_parse_from(["flx", "find", "SOCKS5", "--max-attempts", "0"]);
         assert!(result.is_err());
     }
 
