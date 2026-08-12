@@ -95,13 +95,13 @@ impl TypedValueParser for TypesValueParser {
 
 /// Fluxy is a proxy scraper and validator.
 ///
-/// The pipeline is split into three commands: `fetch` scrapes the built-in
+/// The pipeline is split into three commands: `grab` scrapes the built-in
 /// providers, `find` validates proxies against online judges, and `geo-update`
 /// ensures the GeoLite2 database is present. A subcommand is required; running
-/// `fluxy` with no subcommand prints the help text and exits with a usage error.
+/// `flx` with no subcommand prints the help text and exits with a usage error.
 #[derive(Parser, Debug)]
 #[command(
-    name = "fluxy",
+    name = "flx",
     after_help = "Suggestions and bug reports are greatly appreciated:\nhttps://github.com/zevtyardt/fluxy/issues",
     styles=get_styles()
 )]
@@ -146,7 +146,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Scrape proxies from the built-in providers and print them.
-    Fetch(FetchArgs),
+    Grab(FetchArgs),
     /// Validate proxies from a file or the built-in providers against online
     /// judges, printing the survivors.
     Find(FindArgs),
@@ -239,7 +239,7 @@ pub struct FetcherArgs {
     pub dry_run: bool,
 }
 
-/// `fluxy fetch`: scrape proxies from the built-in providers and print them.
+/// `flx grab`: scrape proxies from the built-in providers and print them.
 #[derive(Args, Debug, Default)]
 pub struct FetchArgs {
     #[command(flatten)]
@@ -317,7 +317,7 @@ pub struct ValidatorArgs {
     pub insecure: bool,
 }
 
-/// `fluxy find`: validate proxies from a file or the built-in providers.
+/// `flx find`: validate proxies from a file or the built-in providers.
 #[derive(Args, Debug, Default)]
 pub struct FindArgs {
     #[command(flatten)]

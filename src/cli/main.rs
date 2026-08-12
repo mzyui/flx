@@ -383,7 +383,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     let cli = Cli::parse();
 
     if let Some(shell) = cli.generate_completions {
-        clap_complete::generate(shell, &mut Cli::command(), "fluxy", &mut std::io::stdout());
+        clap_complete::generate(shell, &mut Cli::command(), "flx", &mut std::io::stdout());
         return Ok(RunOutcome::Finished);
     }
 
@@ -405,14 +405,19 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         initialize_logging(log_level)?;
     }
 
-    // No subcommand: a bare invocation is not an implicit fetch. Print the
+    // No subcommand: a bare invocation is not an implicit grab. Print the
     // help text and report a usage error (exit code 2) instead of running.
     let Some(command) = cli.command else {
         use clap::CommandFactory as _;
+        use std::io::IsTerminal as _;
         use std::io::Write as _;
+        let help = Cli::command().render_help();
         let mut stderr = std::io::stderr().lock();
-        let _ = Cli::command().write_help(&mut stderr);
-        let _ = writeln!(stderr);
+        if cli.no_color || !stderr.is_terminal() {
+            writeln!(stderr, "{help}")?;
+        } else {
+            writeln!(stderr, "{}", help.ansi())?;
+        }
         return Ok(RunOutcome::NoCommand);
     };
 
@@ -431,7 +436,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
 
     let outcome = runtime.block_on(async move {
         match command {
-            Command::Fetch(fetch) => run_fetch(fetch, cancel).await,
+            Command::Grab(grab) => run_grab(grab, cancel).await,
             Command::Find(find) => run_find(find, cancel).await,
             Command::GeoUpdate => run_geo_update().await,
         }
@@ -440,18 +445,18 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     outcome
 }
 
-async fn run_fetch<C>(fetch: FetchArgs, cancel: C) -> anyhow::Result<RunOutcome>
+async fn run_grab<C>(grab: FetchArgs, cancel: C) -> anyhow::Result<RunOutcome>
 where
     C: Future<Output = ()>,
 {
-    if fetch.fetcher.dry_run {
+    if grab.fetcher.dry_run {
         list_sources();
         return Ok(RunOutcome::Finished);
     }
-    let source = ProxySource::from_fetcher(fetcher_config(&fetch.fetcher))
+    let source = ProxySource::from_fetcher(fetcher_config(&grab.fetcher))
         .await
         .context("failed to start proxy fetcher")?;
-    process_result(source, fetch.output, cancel).await
+    process_result(source, grab.output, cancel).await
 }
 
 async fn run_find<C>(find: FindArgs, cancel: C) -> anyhow::Result<RunOutcome>
@@ -578,19 +583,19 @@ mod tests {
     use fluxy::proxy::models::Anonymity;
     use futures_util::stream;
 
-    /// Parses a `fluxy fetch <args>` invocation and returns its fetch args.
+    /// Parses a `flx grab <args>` invocation and returns its fetch args.
     fn fetch_from(args: &[&str]) -> FetchArgs {
-        let mut full = vec!["fluxy", "fetch"];
+        let mut full = vec!["flx", "grab"];
         full.extend_from_slice(args);
         match Cli::parse_from(full).command {
-            Some(Command::Fetch(fetch)) => fetch,
-            _ => panic!("expected a fetch subcommand"),
+            Some(Command::Grab(grab)) => grab,
+            _ => panic!("expected a grab subcommand"),
         }
     }
 
     /// Parses an invocation naming the `find` subcommand and returns its args.
     fn find_from(args: &[&str]) -> FindArgs {
-        let mut full = vec!["fluxy", "find"];
+        let mut full = vec!["flx", "find"];
         full.extend_from_slice(args);
         match Cli::parse_from(full).command {
             Some(Command::Find(find)) => find,
@@ -599,18 +604,18 @@ mod tests {
     }
 
     #[test]
-    fn bare_fluxy_has_no_subcommand() {
+    fn bare_flx_has_no_subcommand() {
         // A bare invocation parses with no command; `run_application` turns
-        // that into a help message instead of an implicit fetch.
-        let cli = Cli::parse_from(["fluxy"]);
+        // that into a help message instead of an implicit run.
+        let cli = Cli::parse_from(["flx"]);
         assert!(cli.command.is_none());
     }
 
     #[test]
-    fn bare_fluxy_rejects_fetch_flags() {
-        // Fetch-only flags must be spelled `fluxy fetch ...`; a bare invocation
+    fn bare_flx_rejects_fetch_flags() {
+        // Fetch-only flags must be spelled `flx grab ...`; a bare invocation
         // that carries no subcommand cannot carry subcommand-scoped flags.
-        assert!(Cli::try_parse_from(["fluxy", "--dry-run"]).is_err());
+        assert!(Cli::try_parse_from(["flx", "--dry-run"]).is_err());
     }
 
     #[test]
@@ -679,9 +684,9 @@ mod tests {
 
     #[test]
     fn generate_completions_flag_is_accepted() {
-        let cli = Cli::parse_from(["fluxy", "--generate-completions", "bash"]);
+        let cli = Cli::parse_from(["flx", "--generate-completions", "bash"]);
         assert_eq!(cli.generate_completions, Some(clap_complete::Shell::Bash));
-        assert!(Cli::parse_from(["fluxy", "--generate-man-page"]).generate_man_page);
+        assert!(Cli::parse_from(["flx", "--generate-man-page"]).generate_man_page);
     }
 
     #[test]
@@ -690,11 +695,11 @@ mod tests {
         clap_complete::generate(
             clap_complete::Shell::Bash,
             &mut Cli::command(),
-            "fluxy",
+            "flx",
             &mut out,
         );
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("fluxy"));
+        assert!(text.contains("flx"));
     }
 
     #[test]
@@ -704,7 +709,7 @@ mod tests {
             .render(&mut out)
             .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("fluxy"));
+        assert!(text.contains("flx"));
     }
 
     #[test]
@@ -789,23 +794,23 @@ mod tests {
 
     #[test]
     fn find_requires_types() {
-        let result = Cli::try_parse_from(["fluxy", "find"]);
+        let result = Cli::try_parse_from(["flx", "find"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn geo_update_subcommand_is_accepted() {
-        let cli = Cli::parse_from(["fluxy", "geo-update"]);
+        let cli = Cli::parse_from(["flx", "geo-update"]);
         assert!(matches!(cli.command, Some(Command::GeoUpdate)));
         // a bare invocation carries no command
-        let bare = Cli::parse_from(["fluxy"]);
+        let bare = Cli::parse_from(["flx"]);
         assert!(bare.command.is_none());
     }
 
     #[test]
     fn cli_rejects_zero_max_attempts() {
         let result =
-            Cli::try_parse_from(["fluxy", "find", "--types", "SOCKS5", "--max-attempts", "0"]);
+            Cli::try_parse_from(["flx", "find", "--types", "SOCKS5", "--max-attempts", "0"]);
         assert!(result.is_err());
     }
 
@@ -925,25 +930,25 @@ mod tests {
 
     #[test]
     fn quiet_flag_is_accepted() {
-        let cli = Cli::parse_from(["fluxy", "--quiet"]);
+        let cli = Cli::parse_from(["flx", "--quiet"]);
         assert!(cli.quiet);
-        assert!(!Cli::parse_from(["fluxy"]).quiet);
+        assert!(!Cli::parse_from(["flx"]).quiet);
     }
 
     #[test]
     fn no_color_flag_is_accepted() {
-        let cli = Cli::parse_from(["fluxy", "--no-color"]);
+        let cli = Cli::parse_from(["flx", "--no-color"]);
         assert!(cli.no_color);
-        assert!(!Cli::parse_from(["fluxy"]).no_color);
+        assert!(!Cli::parse_from(["flx"]).no_color);
     }
 
     #[test]
     fn quiet_with_json_format_is_valid() {
-        let cli = Cli::parse_from(["fluxy", "--quiet", "fetch", "--format", "json"]);
+        let cli = Cli::parse_from(["flx", "--quiet", "grab", "--format", "json"]);
         assert!(cli.quiet);
         match cli.command {
-            Some(Command::Fetch(fetch)) => assert_eq!(fetch.output.format, "json"),
-            _ => panic!("expected fetch subcommand"),
+            Some(Command::Grab(grab)) => assert_eq!(grab.output.format, "json"),
+            _ => panic!("expected grab subcommand"),
         }
     }
 
@@ -1021,11 +1026,11 @@ mod tests {
 
     #[test]
     fn no_color_with_json_format_is_valid() {
-        let cli = Cli::parse_from(["fluxy", "--no-color", "fetch", "--format", "json"]);
+        let cli = Cli::parse_from(["flx", "--no-color", "grab", "--format", "json"]);
         assert!(cli.no_color);
         match cli.command {
-            Some(Command::Fetch(fetch)) => assert_eq!(fetch.output.format, "json"),
-            _ => panic!("expected fetch subcommand"),
+            Some(Command::Grab(grab)) => assert_eq!(grab.output.format, "json"),
+            _ => panic!("expected grab subcommand"),
         }
     }
 }

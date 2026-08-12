@@ -73,7 +73,7 @@ path = "src/lib.rs"
 
 [[bin]]
 path = "src/cli/main.rs"
-name = "fluxy"
+name = "flx"
 required-features = ["clap"]
 
 
