@@ -245,24 +245,76 @@ pub(crate) fn data_dir() -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Downloads the GeoLite2 city database from the P3TERX mirror into
-/// `mmdb_path`, enforcing a 120s deadline and a 128MB size cap.
+/// Path of the cached GeoLite2 database under the platform data directory.
+fn database_path() -> anyhow::Result<PathBuf> {
+    let mut mmdb_path = data_dir()?;
+    mmdb_path.set_file_name("geolite2-city.mmdb");
+    Ok(mmdb_path)
+}
+
+/// Reads the MaxMind build epoch from the cached database.
 ///
-/// # Errors
+/// Returns `None` when the database is missing or cannot be opened as an MMDB
+/// database (corrupt or truncated).
+fn local_build_epoch(mmdb_path: &Path) -> Option<u64> {
+    Reader::open_readfile(mmdb_path)
+        .ok()
+        .map(|reader| reader.metadata.build_epoch)
+}
+
+/// Path of the sidecar file recording which mirror revision was installed.
+fn sync_marker_path(mmdb_path: &Path) -> PathBuf {
+    let file_name = mmdb_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("geolite2-city.mmdb");
+    let mut marker = mmdb_path.to_path_buf();
+    marker.set_file_name(format!("{file_name}.etag"));
+    marker
+}
+
+/// Reads the ETag recorded after the last successful download.
+fn read_synced_etag(mmdb_path: &Path) -> Option<String> {
+    let content = fs::read(sync_marker_path(mmdb_path)).ok()?;
+    let etag = std::str::from_utf8(&content).ok()?.trim();
+    (!etag.is_empty()).then(|| etag.to_owned())
+}
+
+/// Records the ETag of the database that was just installed.
 ///
-/// Returns an error when the download fails, times out, exceeds the size cap,
-/// or produces a file that cannot be opened as an MMDB database.
-pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
+/// The marker is written to a scratch file and renamed into place so a crash
+/// never leaves a torn ETag behind.
+async fn write_synced_etag(mmdb_path: &Path, etag: &str) -> anyhow::Result<()> {
+    let marker = sync_marker_path(mmdb_path);
+    let temporary = temporary_path(&marker);
+    tokio::fs::write(&temporary, etag.as_bytes())
+        .await
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    tokio::fs::rename(&temporary, &marker)
+        .await
+        .with_context(|| format!("failed to install {}", marker.display()))
+}
+
+/// Fetches the database from the mirror, optionally asking for a `304 Not
+/// Modified` when `if_none_match` matches the locally installed revision.
+///
+/// Returns the response together with its `ETag` header value when the mirror
+/// supplies one. The request shares `deadline` with the body read.
+async fn fetch_database(
+    if_none_match: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<(hyper::Response<hyper::body::Incoming>, Option<String>)> {
     let https_connector = HttpsConnector::new();
     let client = Client::builder(TokioExecutor::new()).build(https_connector);
 
-    let req = Request::builder()
-        .uri(GEOLITE_ENDPOINT_URL)
-        .header(
-            hyper::header::USER_AGENT,
-            crate::user_agent::next_user_agent(),
-        )
+    let mut builder = Request::builder().uri(GEOLITE_ENDPOINT_URL).header(
+        hyper::header::USER_AGENT,
+        crate::user_agent::next_user_agent(),
+    );
+    if let Some(etag) = if_none_match {
+        builder = builder.header(hyper::header::IF_NONE_MATCH, etag);
+    }
+    let req = builder
         .body(Empty::<Bytes>::new())
         .context("failed to build GeoLite2 download request")?;
 
@@ -275,7 +327,21 @@ pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
                 GEOLITE_ENDPOINT_URL
             )
         })?;
+    let etag = response
+        .headers()
+        .get(hyper::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    Ok((response, etag))
+}
 
+/// Streams a successful database response into `mmdb_path`, enforcing a
+/// deadline and the 128MB size cap.
+async fn install_response(
+    response: hyper::Response<hyper::body::Incoming>,
+    mmdb_path: &Path,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
     if !response.status().is_success() {
         anyhow::bail!(
             "GeoLite2 download from {} returned status {}",
@@ -338,6 +404,61 @@ pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
     .await
 }
 
+/// Result of a GeoLite2 database sync against the mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// The local database is at least as fresh as the mirror; nothing was
+    /// downloaded.
+    UpToDate,
+    /// A newer (or the first) database was downloaded from the mirror.
+    Synced,
+}
+
+/// Ensures the local GeoLite2 database matches the mirror's latest revision.
+///
+/// Checks GitHub's mirror first via a conditional request: when the locally
+/// installed database is valid and its recorded ETag matches the mirror, the
+/// mirror answers `304 Not Modified` and nothing is downloaded. Otherwise the
+/// new body is streamed in and the ETag is recorded.
+pub async fn sync_database() -> anyhow::Result<SyncOutcome> {
+    let mmdb_path = database_path()?;
+    let db_valid = local_build_epoch(&mmdb_path).is_some();
+    let stored_etag = read_synced_etag(&mmdb_path);
+    let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
+
+    // A valid local copy with a recorded ETag can be checked with `If-None-
+    // Match`; a missing or corrupt copy always needs the full body.
+    let conditional = db_valid && stored_etag.is_some();
+    let (response, remote_etag) = if conditional {
+        fetch_database(stored_etag.as_deref(), deadline).await?
+    } else {
+        fetch_database(None, deadline).await?
+    };
+
+    if response.status() == hyper::StatusCode::NOT_MODIFIED {
+        return Ok(SyncOutcome::UpToDate);
+    }
+
+    install_response(response, &mmdb_path, deadline).await?;
+    if let Some(etag) = remote_etag {
+        write_synced_etag(&mmdb_path, &etag).await?;
+    }
+    Ok(SyncOutcome::Synced)
+}
+
+/// Downloads the GeoLite2 city database from the P3TERX mirror into
+/// `mmdb_path`, enforcing a 120s deadline and a 128MB size cap.
+///
+/// # Errors
+///
+/// Returns an error when the download fails, times out, exceeds the size cap,
+/// or produces a file that cannot be opened as an MMDB database.
+pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
+    let (response, _etag) = fetch_database(None, deadline).await?;
+    install_response(response, mmdb_path, deadline).await
+}
+
 /// Geographically resolves proxy IP addresses against the GeoLite2 database.
 pub struct GeoLookup {
     reader: Reader<Vec<u8>>,
@@ -350,8 +471,7 @@ impl GeoLookup {
     ///
     /// A result containing the initialized `GeoLookup` instance.
     pub async fn new() -> anyhow::Result<Self> {
-        let mut mmdb_path = data_dir()?;
-        mmdb_path.set_file_name("geolite2-city.mmdb");
+        let mmdb_path = database_path()?;
 
         let _download_guard = download_lock().lock().await;
         if !mmdb_path.exists() {
@@ -436,9 +556,31 @@ impl GeoLookup {
 
 #[cfg(test)]
 mod tests {
-    use super::{temporary_path, write_database_chunks};
+    use super::{
+        read_synced_etag, sync_marker_path, temporary_path, write_database_chunks,
+        write_synced_etag,
+    };
     use futures_util::stream;
     use hyper::body::Bytes;
+
+    #[tokio::test]
+    async fn etag_marker_round_trips_through_sidecar() {
+        let path = test_path("etag");
+        let marker = sync_marker_path(&path);
+        assert!(read_synced_etag(&path).is_none());
+
+        write_synced_etag(&path, "\"1c87b8b3c4670be9\"")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_synced_etag(&path).as_deref(),
+            Some("\"1c87b8b3c4670be9\"")
+        );
+        // the scratch file must not linger next to the marker
+        assert!(!temporary_path(&marker).exists());
+
+        let _ = std::fs::remove_file(&marker);
+    }
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

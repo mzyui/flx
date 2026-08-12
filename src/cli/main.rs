@@ -457,16 +457,25 @@ where
     process_result(validated_proxies, find.output, cancel).await
 }
 
-/// Ensures the GeoLite2 database is present and readable.
+/// Ensures the GeoLite2 database is fresh.
 ///
-/// `GeoLookup::new` downloads the database when it is missing and drops a
-/// corrupt copy so the next run can re-download it, making this subcommand a
-/// cheap pre-flight check for scripts that later run `fetch --with-geo`.
+/// Checks the P3TERX mirror on GitHub with a conditional request keyed on the
+/// ETag of the last downloaded revision, re-fetching only when the mirror's
+/// content changed. A missing or corrupt local copy is always replaced. The
+/// process exits 0 whether or not a download happened; failures are reported
+/// as errors.
 async fn run_geo_update() -> anyhow::Result<RunOutcome> {
-    let _lookup = fluxy::GeoLookup::new()
+    match fluxy::sync_database()
         .await
-        .context("failed to prepare the GeoLite2 database")?;
-    println!("GeoLite2 database is ready");
+        .context("failed to sync the GeoLite2 database")?
+    {
+        fluxy::SyncOutcome::Synced => {
+            println!("GeoLite2 database synced from the P3TERX mirror");
+        }
+        fluxy::SyncOutcome::UpToDate => {
+            println!("GeoLite2 database is up to date");
+        }
+    }
     Ok(RunOutcome::Finished)
 }
 
