@@ -67,7 +67,9 @@ pub use providers::all_providers;
 pub use providers::models::{ProviderTier, ScrapeMode, Source};
 pub use providers::ProxyProvider;
 pub use proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
-pub use validator::{Config as ValidatorConfig, ProxyValidator, ValidationStatus};
+pub use validator::{
+    Config as ValidatorConfig, ProxyValidator, ValidationProgress, ValidationStatus,
+};
 
 /// Common items, re-exported for convenient glob imports.
 ///
@@ -78,7 +80,7 @@ pub mod prelude {
     pub use crate::{
         all_providers, sync_database, Anonymity, FetcherConfig, Fluxy, GeoData, GeoLookup,
         Protocol, Proxy, ProxyFetcher, ProxyParseError, ProxySource, ProxyType, ProxyValidator,
-        RuntimeStats, ScrapeMode, Source, SyncOutcome, ValidatorConfig,
+        RuntimeStats, ScrapeMode, Source, SyncOutcome, ValidationProgress, ValidatorConfig,
     };
 }
 

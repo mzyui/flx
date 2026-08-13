@@ -13,7 +13,7 @@ use futures_util::{stream, Stream, StreamExt};
 
 use crate::{
     proxy::models::{Protocol, Proxy},
-    FetcherConfig, ProxySource, ProxyValidator, ValidatorConfig,
+    FetcherConfig, ProxySource, ProxyValidator, ValidationProgress, ValidatorConfig,
 };
 
 /// Owned, boxed, `Send` stream of proxies. The concrete source type
@@ -239,6 +239,20 @@ impl Fluxy {
     ///
     /// Returns an error when the fetcher or validator cannot start.
     pub async fn stream(self) -> anyhow::Result<BoxStream> {
+        let (stream, _progress) = self.stream_with_progress().await?;
+        Ok(stream)
+    }
+
+    /// Runs the pipeline like [`Fluxy::stream`] and exposes the live validation
+    /// counters alongside the stream.
+    ///
+    /// Use the returned [`ValidationProgress`] to drive a progress bar while
+    /// consuming `stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fetcher or validator cannot start.
+    pub async fn stream_with_progress(self) -> anyhow::Result<(BoxStream, ValidationProgress)> {
         let Fluxy {
             source,
             fetcher_config,
@@ -253,20 +267,25 @@ impl Fluxy {
             SourceKind::File(source) => Box::pin(stream::iter(source)) as BoxStream,
         };
 
-        let output = if validator_config.types.is_empty() && validator_config.groups.is_empty() {
-            source
-        } else {
-            Box::pin(ProxyValidator::validate(source, validator_config).await?) as BoxStream
-        };
+        let (output, progress) =
+            if validator_config.types.is_empty() && validator_config.groups.is_empty() {
+                (source, ValidationProgress::default())
+            } else {
+                let validator = ProxyValidator::validate(source, validator_config).await?;
+                let progress = validator.progress();
+                (Box::pin(validator) as BoxStream, progress)
+            };
 
         // Cap the final output. Dropping the stream when the limit is reached
         // propagates the early stop down the chain (validator → fetcher), so
         // production shuts down promptly, exactly like the CLI.
-        Ok(if limit > 0 {
+        let output = if limit > 0 {
             Box::pin(output.take(limit)) as BoxStream
         } else {
             output
-        })
+        };
+
+        Ok((output, progress))
     }
 
     /// Runs the configured pipeline and collects the validated proxies.
@@ -284,6 +303,7 @@ impl Fluxy {
 mod tests {
     use super::Fluxy;
     use crate::proxy::models::{Anonymity, Protocol};
+    use futures_util::StreamExt;
 
     #[test]
     fn fetch_defaults_to_no_validation() {
@@ -420,5 +440,33 @@ mod tests {
         assert_eq!(proxies.len(), 2);
         assert_eq!(proxies[0].as_text(), "192.0.2.1:8080");
         assert_eq!(proxies[1].as_text(), "192.0.2.2:3128");
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_without_validation_returns_zeroed_counters() {
+        let path = std::env::temp_dir().join(format!(
+            "fluxy_lib_test_progress_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "192.0.2.1:8080\n").unwrap();
+
+        let (mut stream, progress) = Fluxy::from_file(&path)
+            .unwrap()
+            .stream_with_progress()
+            .await
+            .unwrap();
+
+        assert!(stream.next().await.is_some());
+        assert!(stream.next().await.is_none());
+        let _ = std::fs::remove_file(&path);
+
+        // Without validation there is nothing to count; the handle is zeroed.
+        assert_eq!(progress.total(), 0);
+        assert_eq!(progress.done(), 0);
+        assert_eq!(progress.passed(), 0);
     }
 }

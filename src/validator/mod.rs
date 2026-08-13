@@ -50,16 +50,62 @@ fn report_dropped(url: &str, reason: &str) {
     let _ = (url, reason);
 }
 
+/// Shared, cloneable snapshot of the validation counters.
+///
+/// `total` counts the work units scheduled (one per advertised singleton job
+/// plus one per AND group), `done` counts units that finished probing
+/// regardless of the outcome, and `passed` counts units whose probe produced a
+/// validated proxy. A plain `ip:port` file line maps to one unit per matching
+/// advertised protocol, so for the common single-type run `done` tracks the
+/// proxies actually probed. Pollable from any thread via [`Arc`] atomics.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationProgress {
+    total: Arc<AtomicUsize>,
+    done: Arc<AtomicUsize>,
+    passed: Arc<AtomicUsize>,
+}
+
+impl ValidationProgress {
+    /// Work units scheduled for validation so far.
+    pub fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Work units that finished probing, whether they passed or failed.
+    pub fn done(&self) -> usize {
+        self.done.load(Ordering::Relaxed)
+    }
+
+    /// Work units whose probe produced a validated proxy.
+    pub fn passed(&self) -> usize {
+        self.passed.load(Ordering::Relaxed)
+    }
+
+    /// Scheduled units still being probed.
+    pub fn remaining(&self) -> usize {
+        self.total().saturating_sub(self.done())
+    }
+
+    /// Fraction of scheduled units that finished, `0.0` before any are
+    /// scheduled.
+    pub fn fraction(&self) -> f64 {
+        let total = self.total();
+        if total == 0 {
+            0.0
+        } else {
+            self.done() as f64 / total as f64
+        }
+    }
+}
+
 /// Validates a stream of proxies and yields the ones that pass.
 ///
 /// Consume it with [`ProxyValidator::get_one`] or as a [`Stream`]
-/// ([`futures_util::StreamExt`]).
+/// ([`futures_util::StreamExt`]). [`ProxyValidator::progress`] exposes the
+/// live counters.
 pub struct ProxyValidator {
     receiver: mpsc::Receiver<Proxy>,
-    #[cfg(feature = "log")]
-    total: Arc<AtomicUsize>,
-    #[cfg(feature = "log")]
-    counter: Arc<AtomicUsize>,
+    progress: ValidationProgress,
     #[cfg(feature = "log")]
     timer: Instant,
     task_handle: JoinHandle<()>,
@@ -189,14 +235,14 @@ async fn run_probe(
 async fn do_work(
     proxy: Arc<Proxy>,
     sender: mpsc::Sender<Proxy>,
-    counter: Arc<AtomicUsize>,
+    counters: ValidationProgress,
     protocol: Protocol,
     requested: Protocol,
     targets: JudgeTargets,
     params: WorkParams,
 ) -> anyhow::Result<()> {
     let mut proxy = proxy.validation_probe();
-    if let Some(proxy_type) = run_probe(
+    let result = run_probe(
         &mut proxy,
         Duration::from_secs(params.request_timeout),
         params.max_attempts,
@@ -205,10 +251,11 @@ async fn do_work(
         requested,
         &targets,
     )
-    .await?
-    {
+    .await;
+    counters.done.fetch_add(1, Ordering::Relaxed);
+    if let Some(proxy_type) = result? {
         proxy.proxy_types.push(proxy_type);
-        counter.fetch_add(1, Ordering::Relaxed);
+        counters.passed.fetch_add(1, Ordering::Relaxed);
         let _ = sender.send(proxy).await;
     }
     Ok(())
@@ -305,7 +352,7 @@ fn group_finish(state: GroupState) -> Option<Proxy> {
 async fn aggregate_groups(
     mut group_rx: mpsc::Receiver<GroupWorkResult>,
     aggregate_sender: mpsc::Sender<Proxy>,
-    aggregate_counter: Arc<AtomicUsize>,
+    aggregate_progress: ValidationProgress,
 ) {
     let mut states: HashMap<GroupKey, GroupState> = HashMap::new();
     while let Some(msg) = group_rx.recv().await {
@@ -319,8 +366,9 @@ async fn aggregate_groups(
             let finished = states
                 .remove(&msg.key)
                 .expect("current group state was pushed above");
+            aggregate_progress.done.fetch_add(1, Ordering::Relaxed);
             if let Some(proxy) = group_finish(finished) {
-                aggregate_counter.fetch_add(1, Ordering::Relaxed);
+                aggregate_progress.passed.fetch_add(1, Ordering::Relaxed);
                 // A closed receiver simply means the consumer stopped early.
                 let _ = aggregate_sender.send(proxy).await;
             }
@@ -365,10 +413,10 @@ impl ProxyValidator {
 
         let (sender, receiver) =
             mpsc::channel(validator_channel_capacity(config.concurrency_limit));
-        let total = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::new(AtomicUsize::new(0));
-        let manager_total = Arc::clone(&total);
-        let manager_counter = Arc::clone(&counter);
+        let progress = ValidationProgress::default();
+        let manager_total = Arc::clone(&progress.total);
+        let manager_done = Arc::clone(&progress.done);
+        let manager_passed = Arc::clone(&progress.passed);
         let expected: Arc<[Protocol]> = Arc::from(config.types.into_boxed_slice());
         // Deduplicate protocols inside each AND group so a duplicated member
         // can never double-probe the same slot or emit a duplicate record.
@@ -474,11 +522,11 @@ impl ProxyValidator {
         // reported. Any missing/failed slot drops the whole group. Runs
         // concurrently so multi-type results stream out as they complete.
         let aggregate_sender = sender.clone();
-        let aggregate_counter = Arc::clone(&manager_counter);
+        let aggregate_progress = progress.clone();
         let group_aggregator = tokio::spawn(aggregate_groups(
             group_rx,
             aggregate_sender,
-            aggregate_counter,
+            aggregate_progress,
         ));
 
         let manager = tokio::spawn(async move {
@@ -496,6 +544,15 @@ impl ProxyValidator {
                     group_len: usize,
                 },
             }
+
+            // Shared by the worker tasks (`for_each_concurrent`). The `total`
+            // increment happens inside the `flat_map` closure below, which moves
+            // `manager_total`, so give the workers their own clone up front.
+            let worker_counters = ValidationProgress {
+                total: Arc::clone(&manager_total),
+                done: Arc::clone(&manager_done),
+                passed: Arc::clone(&manager_passed),
+            };
 
             // Expand each proxy into its singleton jobs (advertised-gated, OR
             // semantics) plus its AND-group jobs (every member always probed).
@@ -597,7 +654,7 @@ impl ProxyValidator {
             let worker_group_tx = group_tx.clone();
             jobs.for_each_concurrent(concurrency_limit, move |job| {
                 let sender = sender.clone();
-                let counter = Arc::clone(&manager_counter);
+                let counters = worker_counters.clone();
                 let targets = targets.clone();
                 let group_tx = worker_group_tx.clone();
                 let params = WorkParams {
@@ -613,7 +670,7 @@ impl ProxyValidator {
                             requested,
                         } => {
                             if let Err(_e) = do_work(
-                                proxy, sender, counter, protocol, requested, targets, params,
+                                proxy, sender, counters, protocol, requested, targets, params,
                             )
                             .await
                             {
@@ -657,15 +714,20 @@ impl ProxyValidator {
 
         Ok(Self {
             receiver,
-            #[cfg(feature = "log")]
-            total,
-            #[cfg(feature = "log")]
-            counter,
+            progress,
             #[cfg(feature = "log")]
             timer: Instant::now(),
             task_handle: manager,
             group_task: group_aggregator,
         })
+    }
+
+    /// Returns a clone of the live validation counters.
+    ///
+    /// The handle shares the same atomics the validator's tasks update, so
+    /// consumers can poll progress from any thread while the stream runs.
+    pub fn progress(&self) -> ValidationProgress {
+        self.progress.clone()
     }
 
     /// Awaits the next validated proxy, or `None` once validation finished.
@@ -690,8 +752,8 @@ impl Drop for ProxyValidator {
         #[cfg(feature = "log")]
         log::info!(
             "Proxy validator completed: {}/{} proxies validated ({:?})",
-            self.counter.load(Ordering::Acquire),
-            self.total.load(Ordering::Acquire),
+            self.progress.passed.load(Ordering::Acquire),
+            self.progress.total.load(Ordering::Acquire),
             self.timer.elapsed(),
         );
     }
@@ -830,5 +892,93 @@ mod tests {
         drop(validator);
         // If the channel were still open, poll_next would just pending; the
         // key property is that Drop runs synchronously and never panics.
+    }
+
+    #[test]
+    fn progress_defaults_to_zeroed_counters() {
+        let progress = super::ValidationProgress::default();
+        assert_eq!(progress.total(), 0);
+        assert_eq!(progress.done(), 0);
+        assert_eq!(progress.passed(), 0);
+        assert_eq!(progress.remaining(), 0);
+        assert_eq!(progress.fraction(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn progress_advances_as_candidates_are_probed() {
+        // Offline-safe: a local judge echoes the request token for the
+        // preflight, while every candidate points at a closed local port, so
+        // each probe fails fast. Done and total must still advance even when
+        // nothing passes.
+        let judge = spawn_echo_judge().await;
+        let config = Config {
+            types: vec![Protocol::Http(Anonymity::Unknown)],
+            http_judge_urls: vec![judge],
+            https_judge_urls: vec![],
+            ..Config::default()
+        };
+        let candidates = (1u16..=5).map(|port| {
+            Proxy::with_expected_types(
+                std::net::Ipv4Addr::LOCALHOST,
+                port,
+                std::sync::Arc::from([Protocol::Http(Anonymity::Unknown)]),
+            )
+        });
+        let mut validator =
+            ProxyValidator::validate(futures_util::stream::iter(candidates), config)
+                .await
+                .unwrap();
+        let progress = validator.progress();
+
+        while validator.get_one().await.is_some() {}
+
+        assert_eq!(progress.total(), 5);
+        assert_eq!(progress.done(), 5);
+        assert_eq!(progress.passed(), 0);
+        assert_eq!(progress.remaining(), 0);
+        assert!((progress.fraction() - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// Spawns a plain-HTTP judge that echoes the `X-Fluxy-Token` header, enough
+    /// to pass the startup preflight without touching the network.
+    async fn spawn_echo_judge() -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let mut received = Vec::new();
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    received.extend_from_slice(&buf[..n]);
+                    if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let mut token = String::new();
+                for line in received.split(|&b| b == b'\n') {
+                    let line = String::from_utf8_lossy(line);
+                    let (name, value) = line.split_once(':').unwrap_or(("", ""));
+                    if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
+                        token = value.trim().to_owned();
+                        break;
+                    }
+                }
+                let body = format!("HTTP_X_FLUXY_TOKEN = {token}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{address}/azenv.php")
     }
 }
