@@ -71,9 +71,12 @@ impl Display for Frame {
 /// Whether a status line should be shown at all.
 ///
 /// Non-essential output is suppressed by `--quiet`, and there is no point
-/// rendering to a redirected stderr.
-fn show_progress(quiet: bool, stderr_is_terminal: bool) -> bool {
-    !quiet && stderr_is_terminal
+/// rendering to a redirected stderr. The bar is also hidden when stdout is not
+/// a terminal: in a pipe (`flx find | jq`) the downstream process writes to the
+/// shared terminal, and its output cannot be coordinated with the bar the way
+/// our own stdout writes can.
+fn show_progress(quiet: bool, stderr_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    !quiet && stderr_is_terminal && stdout_is_terminal
 }
 
 /// Renders the status line with ANSI colors unless `--no-color` was given.
@@ -87,7 +90,6 @@ fn use_color(no_color: bool) -> bool {
 /// `Drop` erases it, so keeping this value alive is all that is needed.
 pub struct ValidationBar {
     _status: StatusLine<Frame>,
-    guards_stdout: bool,
 }
 
 impl ValidationBar {
@@ -95,17 +97,18 @@ impl ValidationBar {
     pub fn new(progress: ValidationProgress, quiet: bool, no_color: bool) -> Option<Self> {
         use std::io::IsTerminal as _;
 
-        if !show_progress(quiet, std::io::stderr().is_terminal()) {
+        if !show_progress(
+            quiet,
+            std::io::stderr().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ) {
             return None;
         }
         // `colored` decides by the stdout TTY, but the bar paints on stderr, so
         // force the color choice from `--no-color` for the rest of the run.
         colored::control::set_override(use_color(no_color));
         let status = StatusLine::new(Frame::new(progress, use_color(no_color)));
-        Some(Self {
-            _status: status,
-            guards_stdout: std::io::stdout().is_terminal(),
-        })
+        Some(Self { _status: status })
     }
 
     fn hide(&self) {
@@ -119,17 +122,13 @@ impl ValidationBar {
 
 impl OutputGuard for ValidationBar {
     fn before_write(&self) {
-        // Only a shared terminal needs coordination; a redirected stdout
-        // (pipe/file) never touches the line the bar is drawn on.
-        if self.guards_stdout {
-            self.hide();
-        }
+        // The bar only exists when stdout reaches the same terminal, so every
+        // stdout write needs the line hidden until it is flushed.
+        self.hide();
     }
 
     fn after_write(&self) {
-        if self.guards_stdout {
-            self.show();
-        }
+        self.show();
     }
 }
 
@@ -140,9 +139,12 @@ mod tests {
 
     #[test]
     fn progress_is_hidden_when_quiet_or_not_a_terminal() {
-        assert!(show_progress(false, true));
-        assert!(!show_progress(true, true));
-        assert!(!show_progress(false, false));
+        assert!(show_progress(false, true, true));
+        assert!(!show_progress(true, true, true));
+        assert!(!show_progress(false, false, true));
+        // A piped stdout means a downstream process owns the terminal; the bar
+        // must stay quiet there.
+        assert!(!show_progress(false, true, false));
     }
 
     #[test]
