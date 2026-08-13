@@ -16,9 +16,6 @@ use status_line::StatusLine;
 
 use crate::OutputGuard;
 
-/// Width of the filled bar, in terminal cells.
-const BAR_WIDTH: usize = 24;
-
 /// Local timing state around the live [`ValidationProgress`] counters.
 ///
 /// The counters are re-read from the shared handle on every redraw so the line
@@ -52,7 +49,6 @@ impl Display for Frame {
         } else {
             done as f64 / total as f64
         };
-        let filled = (fraction * BAR_WIDTH as f64).round() as usize;
         let rate = if elapsed > 0.0 {
             done as f64 / elapsed
         } else {
@@ -64,15 +60,11 @@ impl Display for Frame {
             None
         };
 
-        let blocks = "█".repeat(filled);
-        let dots = "░".repeat(BAR_WIDTH.saturating_sub(filled));
-
         if self.color {
-            let bar = format!("{blocks}{dots}").cyan();
             let ok = format!("{passed} ok").green();
             write!(
                 f,
-                "{} ▐{bar}▌ {done}/{total} {:.0}%  {ok} ({rate:.0}/s)  {}",
+                "{} {done}/{total} {:.0}%  {ok} ({rate:.0}/s)  {}",
                 "Validating".cyan().bold(),
                 fraction * 100.0,
                 format_eta(eta),
@@ -80,7 +72,7 @@ impl Display for Frame {
         } else {
             write!(
                 f,
-                "Validating ▐{blocks}{dots}▌ {done}/{total} {:.0}%  {passed} ok ({rate:.0}/s)  {}",
+                "Validating {done}/{total} {:.0}%  {passed} ok ({rate:.0}/s)  {}",
                 fraction * 100.0,
                 format_eta(eta),
             )
@@ -169,7 +161,7 @@ impl OutputGuard for ValidationBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_eta, show_progress, use_color, Frame, BAR_WIDTH};
+    use super::{format_eta, show_progress, use_color, Frame};
     use fluxy::ValidationProgress;
 
     #[test]
@@ -186,14 +178,15 @@ mod tests {
     }
 
     #[test]
-    fn frame_renders_layout_with_counters_and_bar() {
+    fn frame_renders_layout_with_counters() {
         let frame = Frame::new(ValidationProgress::default(), false);
         let rendered = frame.to_string();
 
-        assert!(rendered.contains("Validating ▐"));
-        assert!(rendered.contains("▌ 0/0 0%"));
+        assert!(rendered.starts_with("Validating "));
+        assert!(rendered.contains(" 0/0 0%"));
         assert!(rendered.contains("0 ok"));
         assert!(rendered.contains("ETA --"));
+        assert!(!rendered.contains('▐') && !rendered.contains('▌'));
     }
 
     #[test]
@@ -206,18 +199,6 @@ mod tests {
 
         assert!(!plain.contains('\x1b'));
         assert!(colored.contains('\x1b'));
-    }
-
-    #[test]
-    fn bar_width_is_bounded() {
-        let frame = Frame::new(ValidationProgress::default(), false);
-        let rendered = frame.to_string();
-        let inside = rendered
-            .split_once("▐")
-            .and_then(|(_, rest)| rest.split_once('▌'))
-            .map(|(bar, _)| bar)
-            .expect("bar delimiters present");
-        assert_eq!(inside.chars().count(), BAR_WIDTH);
     }
 
     #[test]
