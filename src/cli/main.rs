@@ -89,11 +89,10 @@ fn format_validation_stats(
     rate: f64,
     dst: Option<&str>,
 ) -> String {
-    let v = format!("{valid} valid").green().bold();
-    let f = format!("{failed} failed").red().bold();
-    let c = format!("{checked} checked").bright_white();
+    let v = format!("{valid} valid").green();
+    let f = format!("{failed} failed").red();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
-    format!("\n{v} · {f} · {c} in {elapsed:?} ({rate:.1}/s){suffix}")
+    format!("\n{v} · {f} · {checked} checked in {elapsed:?} ({rate:.1}/s){suffix}")
 }
 
 #[cfg(not(feature = "progress_bar"))]
@@ -118,7 +117,7 @@ fn format_gathered_stats(
     rate: f64,
     dst: Option<&str>,
 ) -> String {
-    let n = format!("{gathered} proxies").green().bold();
+    let n = format!("{gathered} proxies").green();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     format!("\nGathered {n} in {elapsed:?} ({rate:.1}/s){suffix}")
 }
