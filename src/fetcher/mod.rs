@@ -419,6 +419,14 @@ impl ProxyFetcher {
         }
     }
 
+    /// Cloneable handle to the number of proxies accepted so far.
+    ///
+    /// The count grows as candidates survive dedup and country filtering; read
+    /// it after the stream ends to report a final tally.
+    pub fn accepted_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.accepted)
+    }
+
     fn check_drain(&mut self) {
         match self.receiver.try_recv() {
             Ok(proxy) => {

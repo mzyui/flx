@@ -507,7 +507,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
 
     let outcome = runtime.block_on(async move {
         match command {
-            Command::Grab(grab) => run_grab(grab, cancel).await,
+            Command::Grab(grab) => run_grab(grab, cli.quiet, cancel).await,
             Command::Find(find) => run_find(find, cli.quiet, cli.no_color, cancel).await,
             Command::GeoUpdate => run_geo_update().await,
         }
@@ -516,7 +516,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     outcome
 }
 
-async fn run_grab<C>(grab: FetchArgs, cancel: C) -> anyhow::Result<RunOutcome>
+async fn run_grab<C>(grab: FetchArgs, quiet: bool, cancel: C) -> anyhow::Result<RunOutcome>
 where
     C: Future<Output = ()>,
 {
@@ -527,7 +527,17 @@ where
     let source = ProxySource::from_fetcher(fetcher_config(&grab.fetcher))
         .await
         .context("failed to start proxy fetcher")?;
-    process_result(source, grab.output, cancel, &NoopGuard).await
+    let accepted = source.accepted_handle();
+    let started = std::time::Instant::now();
+    let outcome = process_result(source, grab.output, cancel, &NoopGuard).await;
+    if !quiet {
+        eprintln!(
+            "Gathered {} proxies in {:.2}s",
+            accepted.load(std::sync::atomic::Ordering::Relaxed),
+            started.elapsed().as_secs_f64(),
+        );
+    }
+    outcome
 }
 
 async fn run_find<C>(
@@ -563,21 +573,33 @@ where
         ProxyValidator::validate(source, validator_config(&find.validator, protocols, groups))
             .await
             .context("failed to start proxy validator")?;
+    let progress = validated_proxies.progress();
+    let started = std::time::Instant::now();
 
     // The status line (stderr) repaints on a background thread and erases
     // itself on drop. It also hides around each stdout write so streamed
     // results never overwrite the line it is drawn on.
     #[cfg(feature = "progress_bar")]
     let guard: OutputGuardEither<progress::ValidationBar> =
-        match progress::ValidationBar::new(validated_proxies.progress(), quiet, no_color) {
+        match progress::ValidationBar::new(progress.clone(), quiet, no_color) {
             Some(bar) => OutputGuardEither::Bar(bar),
             None => OutputGuardEither::Noop(NoopGuard),
         };
     #[cfg(not(feature = "progress_bar"))]
     let guard = NoopGuard;
     #[cfg(not(feature = "progress_bar"))]
-    let _ = (quiet, no_color);
-    process_result(validated_proxies, find.output, cancel, &guard).await
+    let _ = no_color;
+    let outcome = process_result(validated_proxies, find.output, cancel, &guard).await;
+    if !quiet {
+        let passed = progress.passed();
+        let failed = progress.done().saturating_sub(passed);
+        eprintln!(
+            "{passed} ok, {failed} failed, {} checked in {:.2}s",
+            progress.total(),
+            started.elapsed().as_secs_f64(),
+        );
+    }
+    outcome
 }
 
 async fn run_geo_update() -> anyhow::Result<RunOutcome> {
