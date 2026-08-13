@@ -532,7 +532,7 @@ where
     let outcome = process_result(source, grab.output, cancel, &NoopGuard).await;
     if !quiet {
         eprintln!(
-            "Gathered {} proxies in {:.2}s",
+            "\nGathered {} proxies in {:.2}s",
             accepted.load(std::sync::atomic::Ordering::Relaxed),
             started.elapsed().as_secs_f64(),
         );
@@ -594,7 +594,7 @@ where
         let passed = progress.passed();
         let failed = progress.done().saturating_sub(passed);
         eprintln!(
-            "{passed} ok, {failed} failed, {} checked in {:.2}s",
+            "\n{passed} valid, {failed} failed, {} checked in {:.2}s",
             progress.total(),
             started.elapsed().as_secs_f64(),
         );

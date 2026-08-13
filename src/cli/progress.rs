@@ -42,17 +42,17 @@ impl Display for Frame {
         };
 
         if self.color {
-            let ok = format!("{passed} ok").green();
+            let valid = format!("{passed} valid").green();
             let fail = format!("{failed} fail").red();
             write!(
                 f,
-                "{} {done}/{total}  {ok} · {fail} ({rate:.0}/s)",
+                "{} {done}/{total}  {valid} · {fail} ({rate:.0}/s)",
                 "Validating".cyan().bold(),
             )
         } else {
             write!(
                 f,
-                "Validating {done}/{total}  {passed} ok · {failed} fail ({rate:.0}/s)",
+                "Validating {done}/{total}  {passed} valid · {failed} fail ({rate:.0}/s)",
             )
         }
     }
@@ -137,7 +137,7 @@ mod tests {
 
         assert!(rendered.starts_with("Validating "));
         assert!(rendered.contains(" 0/0 "));
-        assert!(rendered.contains("0 ok · 0 fail"));
+        assert!(rendered.contains("0 valid · 0 fail"));
         assert!(rendered.contains("0/s"));
         assert!(!rendered.contains('%'));
         assert!(!rendered.contains("ETA"));
