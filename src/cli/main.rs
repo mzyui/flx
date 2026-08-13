@@ -531,11 +531,14 @@ where
     let started = std::time::Instant::now();
     let outcome = process_result(source, grab.output, cancel, &NoopGuard).await;
     if !quiet {
-        eprintln!(
-            "\nGathered {} proxies in {:.2}s",
-            accepted.load(std::sync::atomic::Ordering::Relaxed),
-            started.elapsed().as_secs_f64(),
-        );
+        let gathered = accepted.load(std::sync::atomic::Ordering::Relaxed);
+        let elapsed = started.elapsed();
+        let rate = if elapsed.is_zero() {
+            0.0
+        } else {
+            gathered as f64 / elapsed.as_secs_f64()
+        };
+        eprintln!("\nGathered {gathered} proxies in {elapsed:?} ({rate:.1}/s)");
     }
     outcome
 }
@@ -590,13 +593,21 @@ where
     #[cfg(not(feature = "progress_bar"))]
     let _ = no_color;
     let outcome = process_result(validated_proxies, find.output, cancel, &guard).await;
+    // Erase the status line before the summary so the two never share a row.
+    #[cfg(feature = "progress_bar")]
+    drop(guard);
     if !quiet {
         let passed = progress.passed();
         let failed = progress.done().saturating_sub(passed);
+        let checked = progress.total();
+        let elapsed = started.elapsed();
+        let rate = if elapsed.is_zero() {
+            0.0
+        } else {
+            checked as f64 / elapsed.as_secs_f64()
+        };
         eprintln!(
-            "\n{passed} valid, {failed} failed, {} checked in {:.2}s",
-            progress.total(),
-            started.elapsed().as_secs_f64(),
+            "\n{passed} valid · {failed} failed · {checked} checked in {elapsed:?} ({rate:.1}/s)"
         );
     }
     outcome
