@@ -116,9 +116,11 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub generate_man_page: bool,
 
+    /// Suppress non-essential output, such as the validation progress line.
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
 
+    /// Disable colored output, including colors in the validation progress line.
     #[arg(long, default_value_t = false)]
     pub no_color: bool,
 }
