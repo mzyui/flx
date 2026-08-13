@@ -38,51 +38,20 @@ use crate::{
     proxy::models::{Protocol, Proxy},
 };
 
-/// Capacity of the bounded channel between the fetching tasks and the consumer.
-///
-/// A bounded channel gives us backpressure: providers stop producing once the
-/// consumer falls behind instead of buffering the whole internet in memory.
 pub(crate) const FETCH_CHANNEL_CAPACITY: usize = 2_048;
 
-/// Upper bound on how long the primary phase may hold up the fallback phase.
-///
-/// One unresponsive website must not stall the GitHub mirrors forever: once
-/// this elapses the remaining primary tasks are aborted and joined before the
-/// fallback phase starts, releasing every semaphore permit deterministically.
 const PRIMARY_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound on how many unique endpoints the fetcher's dedup keeps.
-///
-/// Proxy list fetches legitimately yield tens of thousands of endpoints;
-/// without a bound the uniqueness set would grow without limit. When full,
-/// the oldest entry is evicted (FIFO) so the table stays small and the run
-/// can never hold 100K+ entries forever (A.3).
 const MAX_DEDUP_ENDPOINTS: usize = 100_000;
 
-/// Unique-endpoint key `(ip, port, protocol-set hash)`.
-///
-/// Pre-hashing the advertised protocol set once (A.4) turns the key into
-/// 12 bytes — the `Arc` and its slice no longer need to be stored or hashed
-/// on every probe — while preserving the existing semantics: an endpoint is
-/// only considered new when a different protocol set shows up.
 type EndpointKey = (Ipv4Addr, u16, u64);
 
-/// A stable fingerprint of a protocol set, computed once per candidate.
-///
-/// Ordered (like `[Protocol]`'s `Hash` impl) so `[Socks5, Http]` and
-/// `[Http, Socks5]` are distinct, matching the previous equality semantics.
 fn protocol_hash(protocols: &[Protocol]) -> u64 {
     let mut hasher = DefaultHasher::new();
     protocols.hash(&mut hasher);
     hasher.finish()
 }
 
-/// Bounded set of unique endpoints seen so far.
-///
-/// A FIFO eviction policy keeps memory bounded under `capacity` entries:
-/// once full, registering a new endpoint evicts the oldest one first. The
-/// trade-off (a long-ago endpoint can slip back in) is what keeps the table
-/// a fixed size instead of an ever-growing one.
 struct DedupTable {
     seen: HashSet<EndpointKey>,
     order: VecDeque<EndpointKey>,
@@ -90,9 +59,6 @@ struct DedupTable {
 }
 
 impl DedupTable {
-    /// A table bound to [`MAX_DEDUP_ENDPOINTS`]. The obvious consequence:
-    /// duplicate proxies that were first seen beyond the capacity window are
-    /// no longer cheaply filterable, which is exactly the point of the cap.
     fn new() -> Self {
         Self::with_capacity(MAX_DEDUP_ENDPOINTS)
     }
@@ -105,9 +71,6 @@ impl DedupTable {
         }
     }
 
-    /// Returns `false` when `endpoint` was already registered; otherwise
-    /// registers it and returns `true`, evicting the oldest entry first when
-    /// the table is at capacity.
     fn insert(&mut self, endpoint: EndpointKey) -> bool {
         if self.seen.contains(&endpoint) {
             return false;
@@ -123,7 +86,7 @@ impl DedupTable {
     }
 }
 
-/// Responsible for fetching proxies from various sources.
+/// Async stream of scraped proxy candidates.
 pub struct ProxyFetcher {
     receiver: mpsc::Receiver<Proxy>, // Channel receiver for receiving proxies.
     counter: usize,                  // Counter for tracking the number of fetched proxies.
@@ -131,39 +94,17 @@ pub struct ProxyFetcher {
     elapsed: Option<Duration>,       // Duration of the fetcher operation.
     geolookup: Option<GeoLookup>,    // Optional GeoIP instance for location lookups.
     countries: HashSet<String>,      // Normalized ISO country filter.
-    /// Bounded (FIFO-evicted) set of unique endpoints seen so far.
     unique_ips: DedupTable,
-    /// Coordinator owns every provider task through phase-local `JoinSet`s.
     coordinator: JoinHandle<()>,
     config: Config, // Configuration for the proxy fetcher.
-    /// Proxies accepted so far, shared with the phase coordinator so it can
-    /// evaluate `fallback_threshold`.
     accepted: Arc<AtomicUsize>,
-    /// Notify the phase coordinator when the fetch channel has been drained so
-    /// it can evaluate `fallback_threshold` without busy-waiting.
     drain_notify: Arc<Notify>,
-    /// Item stashed by `check_drain` when `try_recv` succeeds during a drain
-    /// check (the item is already consumed from the channel and must be
-    /// returned on the next call before the channel is polled again).
     prefetched: Option<Proxy>,
-    /// Signals the fetcher coordinator and provider tasks to stop producing
-    /// when the consumer has collected enough proxies (threshold met).
     stop_tx: watch::Sender<bool>,
-    /// Guards the stop signal so the `watch` send happens exactly once even
-    /// when several accepted proxies cross the threshold at the same time.
     stop_signaled: AtomicBool,
 }
 
 impl ProxyFetcher {
-    /// Starts a new `ProxyFetcher` with the given configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: The configuration for the proxy fetcher.
-    ///
-    /// # Returns
-    ///
-    /// A result containing the initialized `ProxyFetcher`.
     pub async fn gather(config: Config) -> anyhow::Result<Self> {
         if config.concurrency_limit == 0 {
             anyhow::bail!("config.concurrency_limit must be greater than zero");
@@ -356,16 +297,6 @@ impl ProxyFetcher {
     }
 }
 
-/// Waits for a phase to finish within `timeout`. If the phase stalls, every
-/// remaining task is aborted and then joined so cancellation has completed and
-/// all semaphore permits are released before the next phase starts.
-///
-/// F-14 (barrier): this is the primary-phase barrier. The coordinator only
-/// proceeds to the fallback phase after `finish_phase` returns, which means
-/// every primary task has either completed or been aborted+joined. Combined
-/// with the subsequent channel-drain signal (`Notify` from the consumer),
-/// it proves the primary counter (`produced`) is stable before fallback
-/// runs — no primary result can be lost or double counted.
 #[cfg(test)]
 async fn finish_phase(mut handles: JoinSet<()>, timeout: Duration) -> bool {
     let drain = async { while handles.join_next().await.is_some() {} };
@@ -377,8 +308,6 @@ async fn finish_phase(mut handles: JoinSet<()>, timeout: Duration) -> bool {
     false
 }
 
-/// Spawns one task per source, each gated by `sem`, and returns their handles.
-/// Also registers every spawned handle in `registry` for drop-time abort.
 fn spawn_phase(
     tasks: Vec<(Arc<Source>, Arc<dyn ProxyProvider + Send + Sync>)>,
     client: &Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
@@ -409,12 +338,6 @@ fn spawn_phase(
     handles
 }
 
-/// Fetches one source and forwards every proxy it yields.
-///
-/// The semaphore permit covers the network fetch only. Parsing is CPU-bound
-/// and needs no network slot, so the permit is released before `scrape_with`
-/// runs — otherwise a slow parser would idle a connection slot. A fresh cache
-/// hit skips both the network and the permit entirely.
 async fn do_work(
     provider: Arc<dyn ProxyProvider + Send + Sync>,
     client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
@@ -475,14 +398,6 @@ async fn do_work(
 }
 
 impl ProxyFetcher {
-    /// Retrieves one proxy from the receiver, awaiting until one is available.
-    ///
-    /// If geo lookup is enabled, it will apply geographic filtering.
-    ///
-    /// # Returns
-    ///
-    /// An optional `Proxy` if one is available, otherwise `None` once every
-    /// producing task has finished.
     pub async fn get_one(&mut self) -> Option<Proxy> {
         loop {
             let proxy = if let Some(proxy) = self.prefetched.take() {
@@ -515,9 +430,6 @@ impl ProxyFetcher {
         }
     }
 
-    /// Applies geo lookup, country filtering and uniqueness rules to `proxy`.
-    ///
-    /// Returns `None` when the proxy must be skipped.
     fn accept(&mut self, proxy: Proxy) -> Option<Proxy> {
         let result = accept_proxy(
             &mut self.unique_ips,
@@ -623,7 +535,6 @@ impl Stream for ProxyFetcher {
 }
 
 impl Drop for ProxyFetcher {
-    /// Cleans up resources when `ProxyFetcher` is dropped.
     fn drop(&mut self) {
         // Closing the receiver makes every pending `send` fail, which unwinds
         // the producing tasks on their own so they don't outlive us.

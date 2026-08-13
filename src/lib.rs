@@ -1,13 +1,4 @@
-//! Fluxy is a proxy scraper and validator.
-//!
-//! The crate is both a library and a CLI (`bin/fluxy`). As a library it offers
-//! two layers:
-//!
-//! * the [`Fluxy`] builder facade — fetch from the built-in providers and
-//!   optionally validate with a few method calls;
-//! * the lower-level pieces the facade composes: [`ProxyFetcher`] (an async
-//!   stream of scraped candidates), [`ProxyValidator`] (an async stream of
-//!   validated proxies), and the [`Proxy`] model.
+//! Proxy scraper and validator library.
 //!
 //! # Example
 //!
@@ -28,8 +19,6 @@
 //!     Ok(())
 //! }
 //! ```
-//!
-//! See the [`Fluxy`] docs for the file-backed variant and for streaming.
 
 pub mod error;
 pub mod fetcher;
@@ -54,9 +43,6 @@ use std::{
 };
 
 // ── Root re-exports ───────────────────────────────────────────────────
-//
-// The most commonly used types are re-exported at the crate root so consumers
-// can write `fluxy::Proxy` instead of `fluxy::proxy::models::Proxy`.
 
 pub use api::Fluxy;
 pub use error::{ProtocolParseError, ProxyParseError};
@@ -71,11 +57,7 @@ pub use validator::{
     Config as ValidatorConfig, ProxyValidator, ValidationProgress, ValidationStatus,
 };
 
-/// Common items, re-exported for convenient glob imports.
-///
-/// ```no_run
-/// use fluxy::prelude::*;
-/// ```
+/// Convenience glob for common types.
 pub mod prelude {
     pub use crate::{
         all_providers, sync_database, Anonymity, FetcherConfig, Fluxy, GeoData, GeoLookup,
@@ -84,11 +66,7 @@ pub mod prelude {
     };
 }
 
-/// Initializes the logging system with the requested verbosity.
-///
-/// # Errors
-///
-/// Returns an error if the `stderrlog` logger cannot be initialized.
+/// Initializes the logging system.
 #[cfg(feature = "log")]
 pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
     #[cfg(feature = "log")]
@@ -100,21 +78,13 @@ pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Source of proxies to be validated.
-///
-/// Wraps a plaintext file of `ip:port` lines, yielding one [`Proxy`] at a
-/// time. For provider-fetched proxies use [`ProxySource::from_fetcher`], which
-/// returns an asynchronous [`ProxyFetcher`] stream directly instead of a
-/// `ProxySource`.
+/// File-backed proxy source (ip:port per line).
 pub struct ProxySource {
     lines: Lines<BufReader<File>>,
     default_proxy_types: Arc<[Protocol]>,
 }
 
 /// Default protocol set inherited by proxies read from a file.
-///
-/// Built once and shared via `Arc::clone` instead of allocating a fresh
-/// `Vec<Protocol>` + `Arc` per `ProxySource` (audit A.11).
 static FILE_DEFAULT_PROTOCOLS: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| {
     Arc::from([
         Protocol::Http(Anonymity::Unknown),
@@ -126,9 +96,6 @@ static FILE_DEFAULT_PROTOCOLS: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| {
 
 /// Writes `args` into `buf` using `Cursor`, returning a borrowed view of the
 /// written region when possible and an owned `String` only for overlong output.
-///
-/// The return value is always ASCII (the callers only format ASCII content), so
-/// a panic on invalid UTF-8 is a bug.
 pub(crate) fn write_to_buffer<'a>(
     buf: &'a mut [u8],
     args: std::fmt::Arguments<'_>,
@@ -144,23 +111,11 @@ pub(crate) fn write_to_buffer<'a>(
 }
 
 impl ProxySource {
-    /// Starts a [`ProxyFetcher`] fed by every configured provider.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when provider fetching cannot be started
-    /// (e.g. invalid configuration or a failed GeoIP setup).
     pub async fn from_fetcher(config: FetcherConfig) -> anyhow::Result<ProxyFetcher> {
         ProxyFetcher::gather(config).await
     }
 
-    /// Builds a `ProxySource` that reads `ip:port` lines from `filepath`.
-    ///
-    /// Each parsed proxy inherits the source-wide default protocol set.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `filepath` cannot be opened.
+    /// Opens an ip:port file for reading.
     pub fn from_file(filepath: PathBuf) -> anyhow::Result<Self> {
         let file = anyhow::Context::with_context(File::open(&filepath), || {
             format!("failed to open proxy file {}", filepath.display())
@@ -180,10 +135,6 @@ impl ProxySource {
 impl Iterator for ProxySource {
     type Item = Proxy;
 
-    /// Parses the next line into a [`Proxy`], inheriting the source-wide
-    /// default protocol set.
-    ///
-    /// Returns `None` once no parseable `ip:port` line remains.
     fn next(&mut self) -> Option<Self::Item> {
         for line in self.lines.by_ref() {
             let line = match line {

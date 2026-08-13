@@ -1,13 +1,7 @@
-//! Fetch proxies from the built-in providers, validate them as HTTP proxies,
-//! and print the survivors with their measured anonymity.
-//!
-//! ```sh
-//! cargo run --example fetch_and_validate -- --limit 20 --country ID
-//! ```
+//! Fetch proxies, validate them as HTTP, and print the survivors.
 
 use fluxy::{Anonymity, Fluxy, Protocol};
 
-/// Reads `--name value` or `--name=value` from the argument list.
 fn flag(args: &[String], name: &str) -> Option<String> {
     let long = format!("--{name}");
     let mut iter = args.iter();

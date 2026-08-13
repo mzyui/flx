@@ -1,7 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use fluxy::providers::parsers::visit_plaintext;
 
-/// Builds a ~5 MB plaintext body of `ip:port` lines.
 fn large_plaintext_body() -> String {
     let mut body = String::with_capacity(5 * 1024 * 1024);
     for i in 0..80_000u32 {

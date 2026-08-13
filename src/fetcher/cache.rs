@@ -1,9 +1,4 @@
 //! Local cache of raw provider response bodies.
-//!
-//! Fetching a proxy list is the slowest part of startup: dozens of source URLs,
-//! each with a multi-second timeout. Bodies change on the order of minutes, so
-//! a fresh cache hit skips the network entirely (and the network semaphore)
-//! and re-runs the cheap CPU-side scrape on the stored body.
 
 use std::{
     path::{Path, PathBuf},
@@ -12,25 +7,15 @@ use std::{
 
 use anyhow::Context;
 
-/// Age beyond which a leftover `.tmp-*` scratch file is considered orphaned.
-///
-/// `store` writes to a process-unique `.tmp-{pid}` file and renames it into
-/// place; a process killed between the write and the rename leaves the scratch
-/// file behind forever. A live writer's scratch file is seconds old, so only
-/// files older than this are safe to delete at startup.
 const ORPHANED_TMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
-/// Local cache of provider response bodies, keyed by source URL.
+/// Local cache of provider response bodies.
 pub struct Cache {
     dir: PathBuf,
     ttl: Duration,
     refresh: bool,
 }
 
-/// Removes `.tmp-*` scratch files that are older than [`ORPHANED_TMP_MAX_AGE`].
-///
-/// Best-effort: unreadable or locked entries are skipped so a concurrent
-/// writer's fresh scratch file is never touched.
 fn clean_orphaned_tmp(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -57,13 +42,6 @@ fn clean_orphaned_tmp(dir: &Path) {
 }
 
 impl Cache {
-    /// Opens (creating if needed) the cache directory under the platform data
-    /// dir. Bodies younger than `ttl` are reused; `refresh` forces a refetch.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the platform data dir is unavailable or the cache
-    /// directory cannot be created. Callers treat failure as "no caching".
     pub fn new(ttl: Duration, refresh: bool) -> anyhow::Result<Self> {
         let mut dir = crate::geolookup::data_dir()?;
         dir.push("cache");
@@ -77,8 +55,6 @@ impl Cache {
         Self { dir, ttl, refresh }
     }
 
-    /// Returns the cached body for `url` when present, younger than `ttl`, and
-    /// non-empty; `None` otherwise. Bypassed entirely under `refresh`.
     pub async fn load(&self, url: &str) -> Option<String> {
         if self.refresh {
             return None;
@@ -98,10 +74,6 @@ impl Cache {
         Some(body)
     }
 
-    /// Best-effort store of `body` for `url`. Empty bodies are skipped so a
-    /// source that answered nothing cannot shadow a future fetch. Writes go to
-    /// a process-unique temp file and are atomically renamed into place, so a
-    /// crash or a concurrent writer never leaves a corrupt entry.
     pub async fn store(&self, url: &str, body: &str) {
         if body.is_empty() {
             return;
@@ -124,11 +96,6 @@ impl Cache {
     }
 }
 
-/// Stable per-URL cache file name (16 hex digits of the URL's hash).
-///
-/// Uses hand-rolled FNV-1a 64-bit instead of `DefaultHasher`: the latter's
-/// internal algorithm is not guaranteed stable across Rust releases, so cache
-/// file names would silently change whenever the compiler is upgraded.
 fn cache_file_name(url: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in url.as_bytes() {

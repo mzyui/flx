@@ -6,10 +6,8 @@ use super::models::{valid_sources, Source};
 use super::ProxyProvider;
 use crate::proxy::models::Protocol;
 
-/// A provider for the api.openproxylist.xyz plaintext lists.
 pub struct OpenProxyListProvider;
 
-/// Per-request timeout, ported from the `mzyui/proxy-list` engine.
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[async_trait]

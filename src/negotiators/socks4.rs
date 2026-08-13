@@ -13,12 +13,9 @@ use hyper::Uri;
 use super::NegotiatorTrait;
 use crate::proxy::models::RuntimeStats;
 
-/// Negotiator for SOCKS4 proxies.
 pub struct Socks4Negotiator;
 
 impl Socks4Negotiator {
-    /// Builds the SOCKS4 CONNECT packet into a stack buffer, falling back to
-    /// an owned `Vec` only for hosts too long for the buffer.
     fn build_connect_request<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, [u8]> {
         // 2 (VN, CD) + 2 (port) + 4 (DST.IP) + 1 (USERID null) + host + 1.
         let total = 10 + host.len();

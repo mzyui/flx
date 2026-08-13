@@ -1,12 +1,7 @@
-//! Fetch proxies from the built-in providers and print them as `ip:port`.
-//!
-//! ```sh
-//! cargo run --example fetch -- --limit 10
-//! ```
+//! Fetch proxies and print them as ip:port.
 
 use fluxy::Fluxy;
 
-/// Reads `--name value` or `--name=value` from the argument list.
 fn flag(args: &[String], name: &str) -> Option<String> {
     let long = format!("--{name}");
     let mut iter = args.iter();

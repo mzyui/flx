@@ -1,9 +1,4 @@
 //! Proxy handshake negotiators.
-//!
-//! Each negotiator implements the transport handshake a given proxy protocol
-//! requires ([`HttpsNegotiator`] and the SOCKS family establish a tunnel or
-//! relay, while plain HTTP needs none). Validation and sending reuse these via
-//! the [`NegotiatorTrait`] bound.
 
 mod http;
 mod https;
@@ -22,22 +17,9 @@ use tokio::net::TcpStream;
 
 use crate::proxy::models::RuntimeStats;
 
-/// Handshake behaviour for a proxy protocol class.
+/// Handshake behaviour for a proxy protocol.
 #[async_trait]
 pub trait NegotiatorTrait {
-    /// Establishes the protocol handshake over the connected `stream`.
-    ///
-    /// # Parameters
-    ///
-    /// * `stream`: open TCP connection to the proxy.
-    /// * `runtimes`: per-phase latency accumulator updated by the handshake.
-    /// * `proxy_host`: the proxy's `ip:port`, used in diagnostic messages.
-    /// * `uri`: target the caller plans to reach through the proxy.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the proxy rejects the handshake, times out, or
-    /// answers with an unexpected protocol.
     async fn negotiate(
         &self,
         _stream: &mut TcpStream,

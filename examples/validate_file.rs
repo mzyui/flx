@@ -1,8 +1,4 @@
-//! Validate an existing plaintext `ip:port` file and print the survivors.
-//!
-//! ```sh
-//! cargo run --example validate_file -- proxies.txt SOCKS5
-//! ```
+//! Validate an ip:port file and print the survivors.
 
 use fluxy::{Fluxy, Protocol};
 

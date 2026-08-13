@@ -22,22 +22,8 @@ use crate::{
     proxy::models::{Proxy, RuntimeStats},
 };
 
-/// How long a background connection task is allowed to keep running after the
-/// response headers arrived, so the body can still be streamed by the caller.
-///
-/// Aborting the task immediately (the previous behaviour) truncated in-flight
-/// bodies and left the socket to be closed by the OS; letting the connection
-/// future finish on its own is the graceful path, and the linger caps the
-/// worst case so a stalled peer cannot leak the task forever.
 const CONNECTION_LINGER: Duration = Duration::from_secs(30);
 
-/// One cached TLS connector per `insecure` value.
-///
-/// Building a connector loads the system root certificate store, so we must
-/// NOT construct it per request/attempt (the previous behaviour repeated that
-/// cost for every single proxy check). `insecure` only takes two values, so we
-/// build exactly two connectors once and clone the relevant handle on demand.
-/// Cloning a `tokio_native_tls::TlsConnector` is cheap (it wraps an `Arc`).
 static TLS_CONNECTORS: LazyLock<[tokio_native_tls::TlsConnector; 2]> = LazyLock::new(|| {
     let build = |insecure: bool| -> tokio_native_tls::TlsConnector {
         let connector = TlsConnector::builder()
@@ -49,19 +35,10 @@ static TLS_CONNECTORS: LazyLock<[tokio_native_tls::TlsConnector; 2]> = LazyLock:
     [build(false), build(true)]
 });
 
-/// Returns a (cached) TLS connector for the requested `insecure` mode.
-///
-/// Certificates are validated by default; `insecure` opts into
-/// `danger_accept_invalid_certs` for self-hosted judges with self-signed certs
-/// (mirrors `prompt.txt` §5 — `--insecure`, default off).
 pub(crate) fn tls_connector(insecure: bool) -> tokio_native_tls::TlsConnector {
     TLS_CONNECTORS[insecure as usize].clone()
 }
 
-/// Drives a hyper connection to completion in the background.
-///
-/// The task ends on its own when the connection closes, or after
-/// `linger` if the peer never does.
 pub(crate) fn spawn_connection_driver<F, E>(
     conn: F,
     host: Arc<str>,
@@ -105,8 +82,6 @@ impl Drop for ConnectionDriver {
     }
 }
 
-/// The result of establishing a connection: the connected value plus the
-/// latency samples collected on the way.
 #[derive(Debug)]
 pub struct ProxyRuntimes<T> {
     pub inner: T,
@@ -115,7 +90,6 @@ pub struct ProxyRuntimes<T> {
 }
 
 impl<T> ProxyRuntimes<T> {
-    /// Merges the collected timing samples into `proxy.runtimes`.
     pub fn apply(&self, proxy: &mut Proxy) {
         // RuntimeStats is not additive across independent connect/negotiate/…
         // phases, so we record the aggregate instead of individual samples.
@@ -130,18 +104,10 @@ impl<T> ProxyRuntimes<T> {
 pub trait ProxyClient {
     fn host(&self) -> Cow<'_, str>;
 
-    /// Owned host string for `'static` consumers such as the background
-    /// connection driver. The default materializes a new allocation; proxy
-    /// types with a precomputed endpoint string override it to clone instead.
     fn host_arc(&self) -> Arc<str> {
         Arc::from(self.host().as_ref())
     }
 
-    /// Establishes a TCP connection to the proxy server.
-    ///
-    /// # Returns
-    ///
-    /// A `ProxyRuntimes<TcpStream>` with the connect latency recorded.
     async fn connect_timeout(
         &mut self,
         timeout: Duration,
@@ -307,7 +273,6 @@ pub trait ProxyClient {
         })
     }
 
-    /// Logs a trace message.
     fn log_trace<S>(&self, _msg: S)
     where
         S: Display,
@@ -316,7 +281,6 @@ pub trait ProxyClient {
         log::trace!("{}: {}", self.host(), _msg);
     }
 
-    /// Logs an error message.
     fn log_error<S>(&self, _msg: S)
     where
         S: Display,

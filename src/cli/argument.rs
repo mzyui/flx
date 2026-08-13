@@ -21,9 +21,6 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     }
 }
 
-/// Protocol values accepted by the positional `TYPES` argument, without the
-/// dynamic `CONNECT:<port>`. A token may combine several values with `+` to
-/// require all of them (`HTTP+HTTPS`).
 const VALID_TYPE_NAMES: &[&str] = &[
     "HTTP",
     "HTTP:Transparent",
@@ -37,8 +34,6 @@ const VALID_TYPE_NAMES: &[&str] = &[
     "SOCKS5",
 ];
 
-/// Validates a single `TYPES` token: every `+`-separated component must match
-/// the fixed protocol names plus the dynamic `CONNECT:<port>` form.
 fn is_valid_type_value(value: &str) -> bool {
     value.split('+').all(|part| {
         VALID_TYPE_NAMES.contains(&part)
@@ -48,11 +43,6 @@ fn is_valid_type_value(value: &str) -> bool {
     })
 }
 
-/// `value_parser` for the positional `TYPES` argument.
-///
-/// A static `[PossibleValue]` list cannot express `CONNECT:<port>` (the port is
-/// dynamic) nor `+`-separated AND groups, so validation is a typed parser over
-/// the same documented set.
 #[derive(Clone)]
 struct TypesValueParser;
 
@@ -96,12 +86,6 @@ impl TypedValueParser for TypesValueParser {
     }
 }
 
-/// Fluxy is a proxy scraper and validator.
-///
-/// The pipeline is split into three commands: `grab` scrapes the built-in
-/// providers, `find` validates proxies against online judges, and `geo-update`
-/// ensures the GeoLite2 database is present. A subcommand is required; running
-/// `flx` with no subcommand prints the help text and exits with a usage error.
 #[derive(Parser, Debug)]
 #[command(
     name = "flx",
@@ -109,11 +93,9 @@ impl TypedValueParser for TypesValueParser {
     styles=get_styles()
 )]
 pub struct Cli {
-    /// Subcommand to run.
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Log level for application output.
     #[arg(
         long = "log",
         default_value = "off",
@@ -128,40 +110,28 @@ pub struct Cli {
     )]
     pub log_level: String,
 
-    /// Generate a shell completion script and exit.
     #[arg(long, value_enum, value_name = "SHELL")]
     pub generate_completions: Option<clap_complete::Shell>,
 
-    /// Generate a man page and exit.
     #[arg(long, default_value_t = false)]
     pub generate_man_page: bool,
 
-    /// Suppress all non-essential output.
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
 
-    /// Disable colored output.
     #[arg(long, default_value_t = false)]
     pub no_color: bool,
 }
 
-/// The pipeline commands available in the CLI.
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Scrape proxies from the built-in providers and print them.
     Grab(FetchArgs),
-    /// Validate proxies from a file or the built-in providers against online
-    /// judges, printing the survivors.
     Find(FindArgs),
-    /// Download (if missing) and verify the GeoLite2 database used for GeoIP
-    /// lookups, then exit.
     GeoUpdate,
 }
 
-/// Options shared by every command that render proxies.
 #[derive(Args, Debug, Clone, Default)]
 pub struct OutputOptions {
-    /// Output format for the results.
     #[arg(
         short,
         long,
@@ -177,32 +147,21 @@ pub struct OutputOptions {
     )]
     pub format: String,
 
-    /// Maximum number of proxies to retrieve.
     #[arg(short, long, default_value = "0")]
     pub limit: usize,
 
-    /// File path to save the retrieved proxies. If not provided, output will go to the console.
     #[arg(short, long)]
     pub output_file: Option<std::path::PathBuf>,
 }
 
-/// Options controlling how proxies are scraped from the built-in providers.
 #[derive(Args, Debug, Clone, Default)]
 pub struct FetcherArgs {
-    /// List of ISO country codes to filter proxies by location.
     #[arg(short, long, num_args(1..))]
     pub countries: Vec<String>,
 
-    /// Enable GeoIP lookup so every proxy carries country information in the
-    /// output without filtering by location. Requires downloading GeoLite2-City
-    /// on first use; pair with --countries to also filter.
     #[arg(long)]
     pub with_geo: bool,
 
-    /// Maximum number of proxy sources fetched concurrently.
-    ///
-    /// Separate from `--max-connections`: fetching touches a few dozen source
-    /// URLs, while validation touches thousands of proxies.
     #[arg(
         long,
         help_heading = "Advanced",
@@ -211,11 +170,6 @@ pub struct FetcherArgs {
     )]
     pub fetch_concurrency: u64,
 
-    /// Freshness in minutes for the local provider-source cache.
-    ///
-    /// Fetched source bodies are stored under the platform data dir and reused
-    /// within this window, so repeat runs skip most of the network startup cost.
-    /// `0` disables the cache entirely.
     #[arg(
         long,
         help_heading = "Advanced",
@@ -224,27 +178,16 @@ pub struct FetcherArgs {
     )]
     pub cache_ttl: u64,
 
-    /// Ignore the local provider-source cache and fetch every source again.
-    ///
-    /// The freshly fetched bodies still repopulate the cache.
     #[arg(long, help_heading = "Advanced", default_value_t = false)]
     pub refresh_cache: bool,
 
-    /// Disable deduplication of identical endpoints across sources.
-    ///
-    /// Off by default (duplicates are filtered). Useful when auditing how many
-    /// times a source re-emits the same `ip:port`.
     #[arg(long, help_heading = "Advanced", default_value_t = false)]
     pub no_dedup: bool,
 
-    /// List the providers and sources that would be fetched, then exit.
-    ///
-    /// Performs no network I/O.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
 }
 
-/// `flx grab`: scrape proxies from the built-in providers and print them.
 #[derive(Args, Debug, Default)]
 pub struct FetchArgs {
     #[command(flatten)]
@@ -253,19 +196,11 @@ pub struct FetchArgs {
     pub output: OutputOptions,
 }
 
-/// Options controlling proxy validation against online judges.
 #[derive(Args, Debug, Default)]
 pub struct ValidatorArgs {
-    /// Proxy types (protocols) to validate. Combine several with `+` to
-    /// require all of them (e.g. `HTTP+HTTPS`); separate entries with spaces
-    /// to accept any (OR). Omitted types default to `HTTP`.
-    ///
-    /// [possible values: HTTP{:Transparent,:Anonymous,:Elite},
-    /// HTTPS{:Transparent,:Anonymous,:Elite}, SOCKS4, SOCKS5, CONNECT:<port>]
     #[arg(num_args(1..), value_parser = TypesValueParser)]
     pub types: Vec<String>,
 
-    /// Maximum number of concurrent proxy checks.
     #[arg(
         short,
         long,
@@ -275,7 +210,6 @@ pub struct ValidatorArgs {
     )]
     pub max_connections: u64,
 
-    /// Maximum number of attempts to validate a proxy.
     #[arg(
         long,
         help_heading = "Advanced",
@@ -284,7 +218,6 @@ pub struct ValidatorArgs {
     )]
     pub max_attempts: usize,
 
-    /// Timeout duration in seconds before giving up.
     #[arg(
         long,
         help_heading = "Advanced",
@@ -293,11 +226,6 @@ pub struct ValidatorArgs {
     )]
     pub timeout: u64,
 
-    /// Online judges used to validate plain HTTP proxy forwarding.
-    ///
-    /// May be supplied multiple times or as a comma-separated list. Every URL is
-    /// preflighted at startup; those that fail are dropped and the survivors are
-    /// used round-robin. If all fail, the run aborts with a message.
     #[arg(
         long,
         help_heading = "Advanced",
@@ -306,10 +234,6 @@ pub struct ValidatorArgs {
     )]
     pub http_judge_urls: Vec<String>,
 
-    /// Online HTTPS judges used for HTTPS, CONNECT and SOCKS tunnels.
-    ///
-    /// Same contract as `--http-judge-urls` but reached over a verified TLS
-    /// connection to port 443.
     #[arg(
         long,
         help_heading = "Advanced",
@@ -318,22 +242,15 @@ pub struct ValidatorArgs {
     )]
     pub https_judge_urls: Vec<String>,
 
-    /// Disable TLS certificate validation for judge connections.
-    ///
-    /// Off by default. Enable only for self-hosted judges that use self-signed
-    /// certificates; leaving it on for public HTTPS judges lets a MITM on the
-    /// judge path forge validation responses.
     #[arg(long, help_heading = "Advanced", default_value_t = false)]
     pub insecure: bool,
 }
 
-/// `flx find`: validate proxies from a file or the built-in providers.
 #[derive(Args, Debug, Default)]
 pub struct FindArgs {
     #[command(flatten)]
     pub fetcher: FetcherArgs,
 
-    /// File path containing proxies. Overrides providers if specified.
     #[arg(long)]
     pub file: Option<std::path::PathBuf>,
 

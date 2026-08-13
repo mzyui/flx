@@ -1,9 +1,4 @@
-//! Validation progress status line, rendered to stderr.
-//!
-//! A single self-refreshing line shown while `flx find` runs. It stays on
-//! stderr so stdout pipelines (`| jq`, `> file`, `-o`) are never contaminated.
-//! The line only appears on a terminal and is suppressed by `--quiet`; colors
-//! are dropped by `--no-color`.
+//! Validation progress status line.
 
 use std::{
     fmt::{Display, Formatter},
@@ -16,11 +11,6 @@ use status_line::StatusLine;
 
 use crate::OutputGuard;
 
-/// Local timing state around the live [`ValidationProgress`] counters.
-///
-/// The counters are re-read from the shared handle on every redraw so the line
-/// tracks the run; `Instant` plus the read-only handle satisfy the
-/// `Send + Sync` bound `status-line` needs for its background thread.
 struct Frame {
     progress: ValidationProgress,
     started: Instant,
@@ -68,32 +58,19 @@ impl Display for Frame {
     }
 }
 
-/// Whether a status line should be shown at all.
-///
-/// Non-essential output is suppressed by `--quiet`, and there is no point
-/// rendering to a redirected stderr. The bar is also hidden when stdout is not
-/// a terminal: in a pipe (`flx find | jq`) the downstream process writes to the
-/// shared terminal, and its output cannot be coordinated with the bar the way
-/// our own stdout writes can.
 fn show_progress(quiet: bool, stderr_is_terminal: bool, stdout_is_terminal: bool) -> bool {
     !quiet && stderr_is_terminal && stdout_is_terminal
 }
 
-/// Renders the status line with ANSI colors unless `--no-color` was given.
 fn use_color(no_color: bool) -> bool {
     !no_color
 }
 
-/// Owns a validation status line for the duration of a `flx find` run.
-///
-/// The background thread from `status-line` repaints the line periodically and
-/// `Drop` erases it, so keeping this value alive is all that is needed.
 pub struct ValidationBar {
     _status: StatusLine<Frame>,
 }
 
 impl ValidationBar {
-    /// Starts the status line, or returns `None` when it should stay hidden.
     pub fn new(progress: ValidationProgress, quiet: bool, no_color: bool) -> Option<Self> {
         use std::io::IsTerminal as _;
 

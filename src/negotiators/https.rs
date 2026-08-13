@@ -11,12 +11,9 @@ use tokio::{
 use super::NegotiatorTrait;
 use crate::proxy::models::RuntimeStats;
 
-/// Negotiator for HTTPS (HTTP CONNECT tunnel) proxies.
 pub struct HttpsNegotiator;
 
 impl HttpsNegotiator {
-    /// Writes `host:port` (bracketed for IPv6) into a stack buffer, falling
-    /// back to an owned `String` only for overlong hosts.
     fn write_authority<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, str> {
         let args = if host.contains(':') {
             format_args!("[{host}]:{port}")
@@ -26,8 +23,6 @@ impl HttpsNegotiator {
         crate::write_to_buffer(buf, args)
     }
 
-    /// Writes the HTTP `CONNECT` request line into a stack buffer, falling back
-    /// to an owned `String` only for pathologically overlong authorities.
     fn write_connect_request<'a>(buf: &'a mut [u8], authority: &str) -> Cow<'a, str> {
         crate::write_to_buffer(
             buf,
@@ -107,7 +102,6 @@ impl NegotiatorTrait for HttpsNegotiator {
         Ok(())
     }
 
-    /// HTTPS proxies require a TLS upgrade on the tunnel.
     fn with_tls(&self) -> bool {
         true
     }

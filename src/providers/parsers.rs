@@ -1,10 +1,4 @@
-//! Body parsers for the different shapes proxy sources come in.
-//!
-//! Each parser turns a raw response body into `(Ipv4Addr, u16, Option<Protocol>)`
-//! triples. A `Some(protocol)` means the source told us the protocol for that
-//! specific row and it overrides the source's `default_types`.
-//!
-//! Ported from the Node implementation in `mzyui/proxy-list` (engine/src/providers).
+//! Body parsers for proxy sources.
 
 use std::{borrow::Cow, cell::Cell, collections::HashMap, net::Ipv4Addr, sync::LazyLock};
 
@@ -20,7 +14,6 @@ use serde::{
 
 use crate::proxy::models::{Anonymity, Protocol};
 
-/// A single parsed row. `protocol` is `None` when the source does not say.
 pub type ParsedProxy = (Ipv4Addr, u16, Option<Protocol>);
 const VISITOR_STOPPED: &str = "fluxy parser visitor stopped";
 
@@ -141,9 +134,6 @@ where
     }
 }
 
-/// Walks a JSON response whose top-level object holds a `data` array, feeding
-/// each row to `visit`. A `false` return aborts the walk early without the
-/// deserializer having to parse the rest of the document.
 fn visit_json_data<T>(body: &str, mut visit: impl FnMut(T) -> bool) -> anyhow::Result<()>
 where
     T: DeserializeOwned,
@@ -168,19 +158,15 @@ where
 
 // ── Compile-once regexes ──────────────────────────────────────────────
 
-/// Extracts the `code-N` offset from a ProxyNova `String.fromCharCode` clause.
 static RE_PROXYNOVA_OFFSET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"code\s*-\s*(\d+)").unwrap());
 
-/// Matches the `atob("...")` base64 tail in a ProxyNova obfuscated IP.
 static RE_PROXYNOVA_ATOB: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"atob\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)"#).unwrap());
 
-/// Finds every `ip:port` pair in free-form HTML (my-proxy.com).
 static RE_IP_PORT_PAIR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b").unwrap());
 
-/// Decodes `Proxy('base64')` calls inside proxy-list.org rows.
 static RE_PROXY_CALL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Proxy\('([A-Za-z0-9+/=]+)'\)").unwrap());
 
@@ -193,9 +179,6 @@ static HEADER_SELECTOR: LazyLock<Selector> =
 static CELL_SELECTOR: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("td").expect("static cell selector is valid"));
 
-/// Maps a protocol label from a source into a [`Protocol`].
-///
-/// Unknown labels yield `None` so the caller falls back to the source defaults.
 pub fn protocol_from_str(raw: &str) -> Option<Protocol> {
     let raw = raw.trim().to_ascii_lowercase();
     match raw.as_str() {
@@ -207,7 +190,6 @@ pub fn protocol_from_str(raw: &str) -> Option<Protocol> {
     }
 }
 
-/// Maps an anonymity label from a source into an [`Anonymity`].
 fn anonymity_from_str(raw: &str) -> Anonymity {
     let raw = raw.trim().to_ascii_lowercase();
     if raw.contains("elite") || raw.contains("high") {
@@ -221,11 +203,6 @@ fn anonymity_from_str(raw: &str) -> Anonymity {
     }
 }
 
-/// Parses `ip:port` from the start of a line, ignoring any trailing fields.
-///
-/// Handles the `1.2.3.4:8080`, `1.2.3.4:8080 US`, and `1.2.3.4:8080#US`
-/// variants, as well as colon-delimited trailers such as
-/// `1.2.3.4:8080:Argentina` used by hideip.me.
 pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
     let text = text.trim();
     let head = text
@@ -244,7 +221,6 @@ pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
     Some((ip, port))
 }
 
-/// Visits newline-delimited `ip:port` rows without accumulating an output list.
 pub fn visit_plaintext(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
     for row in body
         .lines()
@@ -264,9 +240,6 @@ struct GeonodeRow {
     protocols: Vec<String>,
 }
 
-/// Parses the GeoNode JSON API.
-///
-/// A single entry may advertise several protocols; each becomes its own row.
 pub fn visit_geonode(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) -> anyhow::Result<()> {
     visit_json_data::<GeonodeRow>(body, |row| {
         let (Ok(ip), Ok(port)) = (row.ip.parse::<Ipv4Addr>(), row.port.parse::<u16>()) else {
@@ -290,16 +263,6 @@ struct ProxyNovaRow {
     port: serde_json::Value,
 }
 
-/// Decodes ProxyNova's obfuscated `ip` field without evaluating JavaScript.
-///
-/// The API returns an expression that concatenates two encoded halves, e.g.
-/// `[51,49,...].map((code) => String.fromCharCode(code-1)).join("").concat(atob("MTQ4"))`.
-/// Both encodings are decoded structurally:
-///
-/// * a `[..]` char-code array, each entry offset by the `code-N` term;
-/// * an `atob("..")` base64 literal.
-///
-/// Plain addresses are passed through unchanged.
 fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
     let raw = raw.trim();
     if let Ok(ip) = raw.parse::<Ipv4Addr>() {
@@ -343,7 +306,6 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
     decoded.trim().parse().ok()
 }
 
-/// Parses the ProxyNova JSON API.
 pub fn visit_proxynova(
     body: &str,
     mut visit: impl FnMut(ParsedProxy) -> bool,
@@ -362,15 +324,12 @@ pub fn visit_proxynova(
     })
 }
 
-/// Header cell texts that identify each proxy column, most specific first so
-/// an exact match is preferred when several names could apply.
 const IP_HEADER_NAMES: &[&str] = &["ip address", "ip"];
 const PORT_HEADER_NAMES: &[&str] = &["port"];
 const PROTOCOL_HEADER_NAMES: &[&str] = &["version", "type", "protocol"];
 const HTTPS_HEADER_NAMES: &[&str] = &["https"];
 const ANONYMITY_HEADER_NAMES: &[&str] = &["anonymity"];
 
-/// Column indices of a proxy `<table>` header row.
 struct HeaderColumns {
     ip: usize,
     port: usize,
@@ -379,11 +338,6 @@ struct HeaderColumns {
     anonymity: Option<usize>,
 }
 
-/// Resolves the proxy columns from a table header.
-///
-/// Lowercases and trims every header cell exactly once, then indexes the cells
-/// by their normalized text in a `HashMap` so all five columns resolve against
-/// a single map.
 fn header_columns(header: &[String]) -> HeaderColumns {
     let lower: Vec<String> = header
         .iter()
@@ -403,13 +357,6 @@ fn header_columns(header: &[String]) -> HeaderColumns {
     }
 }
 
-/// Returns the index of the first header cell matching any of `names`.
-///
-/// Cells whose normalized text equals one of `names` (the common case, e.g.
-/// "IP Address") are resolved with an O(1) map lookup; headers that only
-/// contain a name as a substring (e.g. "Proxy Type") fall back to a linear
-/// scan of the already-lowercased cells, so nothing is re-lowercased per
-/// column.
 fn find_column(by_text: &HashMap<&str, usize>, lower: &[String], names: &[&str]) -> Option<usize> {
     if let Some(&index) = names.iter().find_map(|name| by_text.get(name)) {
         return Some(index);
@@ -419,8 +366,6 @@ fn find_column(by_text: &HashMap<&str, usize>, lower: &[String], names: &[&str])
         .position(|cell| names.iter().any(|name| cell.contains(name)))
 }
 
-/// True when `text` contains no whitespace other than single ASCII spaces, so
-/// it is already in normalized shape (nothing to collapse, no tabs/newlines).
 fn is_simple_text(text: &str) -> bool {
     let mut previous_space = false;
     for ch in text.chars() {
@@ -438,13 +383,6 @@ fn is_simple_text(text: &str) -> bool {
     true
 }
 
-/// Normalizes an HTML fragment's text: whitespace runs collapse to single
-/// spaces and empty text nodes are dropped.
-///
-/// Borrows the source text when a single text node is already normalized (the
-/// common case for IP/port/protocol cells), avoiding a `String` allocation per
-/// cell. Multi-node cells and cells with whitespace runs fall back to the
-/// allocating fold.
 fn normalized_text(element: scraper::ElementRef<'_>) -> Cow<'_, str> {
     let mut fragments = element.text();
     let first = match fragments.next() {
@@ -470,11 +408,6 @@ fn normalized_text(element: scraper::ElementRef<'_>) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-/// Parses the HTML `<table>` markup shared by free-proxy-list.net,
-/// sslproxies.org, us-proxy.org, socks-proxy.net and freeproxy.world.
-///
-/// Column positions differ between those sites, so columns are located by
-/// header text rather than by fixed index.
 pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
     let document = Html::parse_document(body);
 
@@ -557,7 +490,6 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
     }
 }
 
-/// Extracts every `ip:port` pair from free-form HTML (my-proxy.com).
 pub fn visit_regex_pairs(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
     for row in RE_IP_PORT_PAIR.captures_iter(body).filter_map(|caps| {
         let ip = caps.get(1)?.as_str().parse::<Ipv4Addr>().ok()?;
@@ -570,8 +502,6 @@ pub fn visit_regex_pairs(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool)
     }
 }
 
-/// Parses proxy-list.org rows, whose `ip:port` is base64 encoded inside a
-/// `Proxy('...')` call.
 pub fn visit_base64_rows(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
     for row in RE_PROXY_CALL.captures_iter(body).filter_map(|caps| {
         let decoded = BASE64.decode(caps.get(1)?.as_str()).ok()?;

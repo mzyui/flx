@@ -6,8 +6,6 @@ use super::models::{valid_sources, ScrapeMode, Source};
 use super::ProxyProvider;
 use crate::proxy::models::{Anonymity, Protocol};
 
-/// The "free-proxy-list" family of sites (free-proxy-list.net, sslproxies.org,
-/// us-proxy.org, socks-proxy.net), which all share the same table markup.
 pub struct FreeProxyListProvider;
 
 #[async_trait]

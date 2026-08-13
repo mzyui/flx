@@ -1,8 +1,4 @@
-//! GeoIP lookup backed by a locally cached GeoLite2-City database.
-//!
-//! The database is downloaded from the P3TERX mirror on first use into the
-//! platform data directory, locked against concurrent processes, and cached for
-//! the rest of the run.
+//! GeoIP lookup via cached GeoLite2-City database.
 
 pub mod models;
 
@@ -47,7 +43,6 @@ fn download_lock() -> &'static tokio::sync::Mutex<()> {
     DOWNLOAD_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Derives the path of the `.part` scratch file used while downloading.
 fn temporary_path(path: &Path) -> PathBuf {
     let mut temporary = path.to_path_buf();
     let file_name = path
@@ -58,7 +53,6 @@ fn temporary_path(path: &Path) -> PathBuf {
     temporary
 }
 
-/// Derives the path of the cross-process lock file guarding a download.
 fn lock_path(path: &Path) -> PathBuf {
     let mut lock = path.to_path_buf();
     lock.set_file_name(format!(
@@ -70,10 +64,6 @@ fn lock_path(path: &Path) -> PathBuf {
     lock
 }
 
-/// Acquires an exclusive advisory lock on the database's lock file.
-///
-/// The lock keeps two concurrent processes from downloading the database at
-/// the same time. It is released when the returned [`std::fs::File`] drops.
 async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     let lock = lock_path(path);
     tokio::task::spawn_blocking(move || {
@@ -93,12 +83,6 @@ async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     .context("GeoLite2 lock task failed")?
 }
 
-/// Streams a downloaded database into a scratch file, validates it, and
-/// atomically renames it into place.
-///
-/// The body is bounded by `max_size` and `deadline`, and every progress update
-/// is reported through `progress`. On any failure the partial file is removed
-/// so a corrupt half-written database never shadows the real one.
 async fn write_database_chunks<S, E, P>(
     mmdb_path: &Path,
     chunks: S,
@@ -182,7 +166,6 @@ where
     result
 }
 
-/// Renders the GeoLite2 download progress on the terminal.
 #[cfg(feature = "progress_bar")]
 struct Progress {
     progress: AtomicUsize, // Bytes downloaded so far.
@@ -213,11 +196,6 @@ impl Drop for Progress {
     }
 }
 
-/// Retrieves the data directory path for the application.
-///
-/// # Returns
-///
-/// A `PathBuf` representing the path to the data directory.
 pub(crate) fn data_dir() -> anyhow::Result<PathBuf> {
     if let Some(base_dirs) = directories::BaseDirs::new() {
         let mut dir = base_dirs.data_dir().to_path_buf();
@@ -245,24 +223,18 @@ pub(crate) fn data_dir() -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Path of the cached GeoLite2 database under the platform data directory.
 fn database_path() -> anyhow::Result<PathBuf> {
     let mut mmdb_path = data_dir()?;
     mmdb_path.set_file_name("geolite2-city.mmdb");
     Ok(mmdb_path)
 }
 
-/// Reads the MaxMind build epoch from the cached database.
-///
-/// Returns `None` when the database is missing or cannot be opened as an MMDB
-/// database (corrupt or truncated).
 fn local_build_epoch(mmdb_path: &Path) -> Option<u64> {
     Reader::open_readfile(mmdb_path)
         .ok()
         .map(|reader| reader.metadata.build_epoch)
 }
 
-/// Path of the sidecar file recording which mirror revision was installed.
 fn sync_marker_path(mmdb_path: &Path) -> PathBuf {
     let file_name = mmdb_path
         .file_name()
@@ -273,17 +245,12 @@ fn sync_marker_path(mmdb_path: &Path) -> PathBuf {
     marker
 }
 
-/// Reads the ETag recorded after the last successful download.
 fn read_synced_etag(mmdb_path: &Path) -> Option<String> {
     let content = fs::read(sync_marker_path(mmdb_path)).ok()?;
     let etag = std::str::from_utf8(&content).ok()?.trim();
     (!etag.is_empty()).then(|| etag.to_owned())
 }
 
-/// Records the ETag of the database that was just installed.
-///
-/// The marker is written to a scratch file and renamed into place so a crash
-/// never leaves a torn ETag behind.
 async fn write_synced_etag(mmdb_path: &Path, etag: &str) -> anyhow::Result<()> {
     let marker = sync_marker_path(mmdb_path);
     let temporary = temporary_path(&marker);
@@ -295,11 +262,6 @@ async fn write_synced_etag(mmdb_path: &Path, etag: &str) -> anyhow::Result<()> {
         .with_context(|| format!("failed to install {}", marker.display()))
 }
 
-/// Fetches the database from the mirror, optionally asking for a `304 Not
-/// Modified` when `if_none_match` matches the locally installed revision.
-///
-/// Returns the response together with its `ETag` header value when the mirror
-/// supplies one. The request shares `deadline` with the body read.
 async fn fetch_database(
     if_none_match: Option<&str>,
     deadline: tokio::time::Instant,
@@ -335,8 +297,6 @@ async fn fetch_database(
     Ok((response, etag))
 }
 
-/// Streams a successful database response into `mmdb_path`, enforcing a
-/// deadline and the 128MB size cap.
 async fn install_response(
     response: hyper::Response<hyper::body::Incoming>,
     mmdb_path: &Path,
@@ -407,19 +367,13 @@ async fn install_response(
 /// Result of a GeoLite2 database sync against the mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncOutcome {
-    /// The local database is at least as fresh as the mirror; nothing was
-    /// downloaded.
+    /// The local database is up to date.
     UpToDate,
-    /// A newer (or the first) database was downloaded from the mirror.
+    /// A newer database was downloaded.
     Synced,
 }
 
-/// Ensures the local GeoLite2 database matches the mirror's latest revision.
-///
-/// Checks GitHub's mirror first via a conditional request: when the locally
-/// installed database is valid and its recorded ETag matches the mirror, the
-/// mirror answers `304 Not Modified` and nothing is downloaded. Otherwise the
-/// new body is streamed in and the ETag is recorded.
+/// Ensures the local GeoLite2 database matches the latest mirror revision.
 pub async fn sync_database() -> anyhow::Result<SyncOutcome> {
     let mmdb_path = database_path()?;
     let db_valid = local_build_epoch(&mmdb_path).is_some();
@@ -446,30 +400,19 @@ pub async fn sync_database() -> anyhow::Result<SyncOutcome> {
     Ok(SyncOutcome::Synced)
 }
 
-/// Downloads the GeoLite2 city database from the P3TERX mirror into
-/// `mmdb_path`, enforcing a 120s deadline and a 128MB size cap.
-///
-/// # Errors
-///
-/// Returns an error when the download fails, times out, exceeds the size cap,
-/// or produces a file that cannot be opened as an MMDB database.
+/// Downloads the GeoLite2 database from the mirror.
 pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
     let (response, _etag) = fetch_database(None, deadline).await?;
     install_response(response, mmdb_path, deadline).await
 }
 
-/// Geographically resolves proxy IP addresses against the GeoLite2 database.
+/// GeoLite2-based IP geolocation resolver.
 pub struct GeoLookup {
     reader: Reader<Vec<u8>>,
 }
 
 impl GeoLookup {
-    /// Creates a new instance of `GeoLookup`, downloading the GeoLite2 database if necessary.
-    ///
-    /// # Returns
-    ///
-    /// A result containing the initialized `GeoLookup` instance.
     pub async fn new() -> anyhow::Result<Self> {
         let mmdb_path = database_path()?;
 
@@ -502,10 +445,7 @@ impl GeoLookup {
         }
     }
 
-    /// Looks up the geographical data for `ip`.
-    ///
-    /// Returns a blank [`GeoData`] when the database has no record for the
-    /// address.
+    /// Looks up geographical data for an IP address.
     pub fn lookup(&self, ip: &Ipv4Addr) -> GeoData {
         let mut geodata = GeoData::default();
         if let Ok(lookup) = self.reader.lookup::<City>(std::net::IpAddr::V4(*ip)) {
@@ -516,8 +456,6 @@ impl GeoLookup {
         geodata
     }
 
-    /// Fills `geodata` with the country (or continent when no country is
-    /// reported) resolved for the address.
     fn extract_country_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(country) = &lookup.country {
             geodata.iso_code = country.iso_code.map(Box::from);
@@ -532,7 +470,6 @@ impl GeoLookup {
         }
     }
 
-    /// Fills `geodata` with the first subdivision's region identifiers.
     fn extract_region_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(subdivisions) = &lookup.subdivisions {
             if let Some(division) = subdivisions.first() {
@@ -544,7 +481,6 @@ impl GeoLookup {
         }
     }
 
-    /// Fills `geodata` with the resolved city name.
     fn extract_city_data(&self, lookup: &City, geodata: &mut GeoData) {
         if let Some(city) = &lookup.city {
             if let Some(city_names) = &city.names {

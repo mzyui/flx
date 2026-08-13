@@ -29,10 +29,6 @@ use crate::{
     resolver::my_ip,
 };
 
-/// Header tokens whose appearance in a judge's echoed environment is taken as
-/// evidence that a proxy forwards client- or proxy-internal metadata. Kept as
-/// a small sorted slice (not a `HashSet`) because classification only iterates
-/// it: a fixed-size contiguous array is cheaper than hashing 15 members.
 static ANON_INTEREST: &[&str] = &[
     "CLIENT-IP",
     "CLIENT_IP",
@@ -51,10 +47,6 @@ static ANON_INTEREST: &[&str] = &[
     "X_FORWARDED FORWARDED",
 ];
 
-/// Single-pass matcher over every anonymity-leak token, built once.
-///
-/// Aho-Corasick scans a judge body once for all 15 tokens instead of running a
-/// separate substring search per token.
 static ANON_MATCHER: LazyLock<AhoCorasick> =
     LazyLock::new(|| AhoCorasick::new(ANON_INTEREST).expect("static anonymity tokens are valid"));
 
@@ -67,11 +59,6 @@ fn end_to_end_runtime(elapsed: Duration) -> RuntimeStats {
     runtimes
 }
 
-/// Reads an HTTP body incrementally, enforcing `limit` *before* appending each
-/// chunk so a malicious/sloppy judge cannot make us buffer an unbounded amount
-/// of memory before the size check fires. Replaces the previous
-/// `response.collect().await?.to_bytes()` pattern which accumulated the whole
-/// body first and only then compared against the limit.
 pub(crate) async fn read_bounded_body(
     mut body: hyper::body::Incoming,
     limit: usize,
@@ -91,11 +78,6 @@ pub(crate) async fn read_bounded_body(
     Ok(Bytes::from(collected))
 }
 
-/// Classifies the anonymity level of a proxy from the judge response body.
-///
-/// `my_ip` is this host's public IP; if it appears in the echoed environment the
-/// proxy is `Transparent`. Presence of any header that typically leaks client or
-/// proxy metadata marks it `Anonymous`, otherwise `Elite`.
 pub fn classify_anonymity(body: &str, my_ip: &str) -> Anonymity {
     if body.contains(my_ip) {
         Anonymity::Transparent
@@ -114,10 +96,6 @@ pub struct ValidationTarget {
 }
 
 impl ValidationTarget {
-    /// Builds a target from a judge URL, minting a fresh request token for it.
-    ///
-    /// The token is bound to this target, so a response cannot be reused
-    /// against a different target (token-replay resistance).
     pub fn online(url: &str) -> anyhow::Result<Self> {
         let uri: hyper::Uri = url
             .parse()
@@ -144,12 +122,6 @@ impl ValidationTarget {
         })
     }
 
-    /// Sends the request token and checks that the judge echoes it back.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the judge is unreachable or times out, returns a
-    /// non-success status, or fails to echo the token.
     pub async fn verify_online(&self, timeout: Duration, insecure: bool) -> anyhow::Result<()> {
         use hyper_tls::HttpsConnector;
         use hyper_util::{
@@ -190,42 +162,21 @@ impl ValidationTarget {
     }
 }
 
-/// A verified pool of judges for a single protocol class (HTTP or tunnel).
-///
-/// Each judge is independently preflighted at startup; only those that echo the
-/// unique token within the deadline enter the pool. Preflight is streaming: the
-/// pool starts empty and judges are appended as soon as they pass, so
-/// validation can begin with the first verified judge instead of waiting for
-/// the slowest candidate. Live requests pick the next healthy judge
-/// round-robin, so a single dead endpoint degrades gracefully instead of
-/// failing every probe or silently swapping to an unverified one.
 pub struct JudgePool {
     inner: Mutex<PoolInner>,
     cursor: AtomicUsize,
     epoch: time::Instant,
 }
 
-/// The append-only judge list plus per-judge cooldown timestamps.
 struct PoolInner {
     judges: Vec<Arc<ValidationTarget>>,
     cooldown_until_ms: Vec<PaddedCooldown>,
 }
 
-/// A cooldown timestamp padded to its own cache line so judges probed by
-/// different workers never bounce one shared line when one of them is written
-/// during a failure while the others are being read.
 #[repr(align(64))]
 struct PaddedCooldown(AtomicU64);
 
 impl JudgePool {
-    /// Builds a pool from the candidate `urls`, preflighting each one.
-    ///
-    /// Judges that fail preflight are reported via `on_dropped` and excluded.
-    /// If no judge survives, this returns an error so the caller can fail fast
-    /// with a message telling the user to supply a working `--*judge-url`.
-    ///
-    /// Returns as soon as the first candidate passes; the remaining candidates
-    /// keep preflighting in the background and are appended when they pass.
     pub async fn build<F>(
         urls: &[String],
         timeout: Duration,
@@ -303,11 +254,6 @@ impl JudgePool {
         Ok(pool)
     }
 
-    /// Returns the next healthy judge using a round-robin cursor.
-    ///
-    /// Production probing goes through [`Self::candidates`] (which snapshots
-    /// the healthy judges once per proxy); this single-pick primitive is only
-    /// exercised by the round-robin/cooldown tests now.
     #[cfg(test)]
     pub fn next(&self) -> Arc<ValidationTarget> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
@@ -322,9 +268,6 @@ impl JudgePool {
         Arc::clone(&inner.judges[start % inner.judges.len()])
     }
 
-    /// Healthy judges to try for the next attempt: the round-robin rotation
-    /// minus any judges currently in cooldown. Falls back to a single judge
-    /// when all are cooling down.
     pub(crate) fn candidates(&self) -> Vec<Arc<ValidationTarget>> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let now_ms = self.epoch.elapsed().as_millis() as u64;
@@ -360,7 +303,6 @@ impl JudgePool {
         }
     }
 
-    /// Number of healthy judges currently in the pool.
     pub fn len(&self) -> usize {
         self.inner
             .lock()
@@ -369,12 +311,10 @@ impl JudgePool {
             .len()
     }
 
-    /// Returns `true` when the pool contains no healthy judges.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Creates an empty pool that preflight tasks append to as they pass.
     pub(crate) fn empty() -> Self {
         Self {
             inner: Mutex::new(PoolInner {
@@ -386,7 +326,6 @@ impl JudgePool {
         }
     }
 
-    /// Adds a verified judge to the pool.
     pub(crate) fn append(&self, target: Arc<ValidationTarget>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.judges.push(target);
@@ -395,8 +334,6 @@ impl JudgePool {
             .push(PaddedCooldown(AtomicU64::new(0)));
     }
 
-    /// Builds a pool from already-constructed targets (used by tests and the
-    /// validator's placeholder pools for unrequested protocol classes).
     pub(crate) fn from_targets(targets: Vec<Arc<ValidationTarget>>) -> Self {
         let cooldown_until_ms = (0..targets.len())
             .map(|_| PaddedCooldown(AtomicU64::new(0)))
@@ -412,13 +349,6 @@ impl JudgePool {
     }
 }
 
-/// Serializes a judge response for marker and anonymity matching: upper-cased
-/// headers followed by the bounded raw body.
-///
-/// Header names are upper-cased byte-by-byte into a reusable `Vec<u8>` and the
-/// body is appended directly, so no intermediate `String` is allocated per
-/// header or per response body (a lossy decode only happens later, when
-/// anonymity classification actually needs text).
 async fn to_raw_response(
     response: Response<Incoming>,
     deadline: time::Instant,
@@ -447,14 +377,6 @@ async fn to_raw_response(
     Ok(content)
 }
 
-/// Checks whether the proxy supports plain HTTP through the local judge.
-///
-/// # Errors
-///
-/// Returns an error only for non-recoverable problems (e.g. the public IP of
-/// this host could not be determined). Per-attempt failures such as connection
-/// refused, timeouts or malformed judge responses are logged and retried, and
-/// exhausting all attempts yields `Ok(None)` instead of an error.
 pub async fn support_http(
     proxy: &mut Proxy,
     timeout: Duration,
@@ -767,10 +689,6 @@ mod tests {
         assert_eq!(pool.len(), 2);
     }
 
-    /// Spawns a plain-HTTP judge that echoes the `X-Fluxy-Token` header.
-    ///
-    /// The header match is case-insensitive, mirroring `spawn_self_signed_judge`
-    /// (F-32), and is safe to rely on for the streaming-preflight tests.
     async fn spawn_plain_echo_judge() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

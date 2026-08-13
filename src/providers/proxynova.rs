@@ -5,10 +5,6 @@ use async_trait::async_trait;
 use super::models::{valid_sources, ScrapeMode, Source};
 use super::ProxyProvider;
 
-/// The api.proxynova.com JSON list.
-///
-/// The `ip` field is obfuscated as a JavaScript string expression; it is
-/// decoded by the parser rather than evaluated.
 pub struct ProxyNovaProvider;
 
 #[async_trait]

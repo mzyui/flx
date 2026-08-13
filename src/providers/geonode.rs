@@ -5,16 +5,9 @@ use async_trait::async_trait;
 use super::models::{valid_sources, ScrapeMode, Source};
 use super::ProxyProvider;
 
-/// The proxylist.geonode.com public JSON API.
-///
-/// Unlike the plaintext sources this endpoint reports the protocol per entry,
-/// and a single entry may advertise several. No API key is required.
 pub struct GeonodeProvider;
 
-/// Number of pages requested, ported from the `mzyui/proxy-list` engine
-/// (engine/src/providers/geonode.js).
 const PAGES: u32 = 3;
-/// Entries per page.
 const LIMIT: u32 = 500;
 
 #[async_trait]

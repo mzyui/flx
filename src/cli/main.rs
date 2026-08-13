@@ -21,18 +21,11 @@ mod argument;
 #[cfg(feature = "progress_bar")]
 mod progress;
 
-/// Coordinates writes to a shared terminal with a live status line.
-///
-/// A streamed result line and a pinned progress bar both target the same
-/// terminal when stdout and stderr are a TTY, so the bar must be hidden for
-/// the duration of each stdout write and redrawn below the new line afterwards.
-/// `NoopGuard` is used when no status line is active.
 pub trait OutputGuard {
     fn before_write(&self);
     fn after_write(&self);
 }
 
-/// A guard that does nothing, for runs without a status line.
 pub struct NoopGuard;
 
 impl OutputGuard for NoopGuard {
@@ -40,11 +33,6 @@ impl OutputGuard for NoopGuard {
     fn after_write(&self) {}
 }
 
-/// Dispatches between an active status line and no guard at all.
-///
-/// [`run_find`] only builds a [`progress::ValidationBar`] when the terminal and
-/// flags allow it; the guard lets `process_result` take a single reference
-/// whether or not the bar exists.
 #[cfg(feature = "progress_bar")]
 pub enum OutputGuardEither<B> {
     Bar(B),
@@ -68,10 +56,6 @@ impl<B: OutputGuard> OutputGuard for OutputGuardEither<B> {
     }
 }
 
-/// Terminal setup that keeps a Ctrl+C from echoing `^C` into the streamed
-/// output. The `^C` character is written by the tty driver (not by fluxy)
-/// when `ECHOCTL` is set; clearing the flag for the duration of the run keeps
-/// the JSON/stream output clean, and `Drop` restores the original settings.
 #[cfg(unix)]
 mod quiet_signal_echo {
     pub struct QuietSignalEcho {
@@ -80,8 +64,6 @@ mod quiet_signal_echo {
     }
 
     impl QuietSignalEcho {
-        /// Applies the guard to the first of stdin/stdout/stderr that refers
-        /// to a tty. Returns `None` for redirected runs, leaving them alone.
         pub fn install() -> Option<Self> {
             let fd = [0, 1, 2]
                 .into_iter()
@@ -124,14 +106,10 @@ mod quiet_signal_echo {
 
 use quiet_signal_echo::QuietSignalEcho;
 
-/// How the output loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunOutcome {
-    /// The stream ran to completion (or `--limit` was hit).
     Finished,
-    /// Ctrl+C interrupted the run; the document was still finalized.
     Cancelled,
-    /// No subcommand was supplied; the help text was printed.
     NoCommand,
 }
 
@@ -179,12 +157,6 @@ fn convert_protocols(types: &[String]) -> Vec<Protocol> {
         .collect()
 }
 
-/// Splits the positional `TYPES` tokens into singleton protocols (OR across
-/// entries) and AND groups. A token without `+` is a singleton; a token with
-/// `+` (e.g. `HTTP+HTTPS`) becomes a group whose every protocol must pass.
-///
-/// Duplicate protocols inside a group are collapsed so a repeated member can
-/// never double-probe or double-emit.
 fn split_type_groups(tokens: &[String]) -> (Vec<Protocol>, Vec<Vec<Protocol>>) {
     let mut types = Vec::new();
     let mut groups: Vec<Vec<Protocol>> = Vec::new();
@@ -216,12 +188,6 @@ fn split_type_groups(tokens: &[String]) -> (Vec<Protocol>, Vec<Vec<Protocol>>) {
     (types, groups)
 }
 
-/// Chooses the concrete output format for a run.
-///
-/// `default` prints plain text on a terminal and switches to `json-lines`
-/// whenever the result stream is not a terminal, so `flx find ... | jq` works
-/// without spelling `-f`. Writing to a file (`-o`) always keeps the configured
-/// format.
 fn effective_format(format: &str, has_output_file: bool, stdout_is_tty: bool) -> &str {
     if format == "default" && !has_output_file && !stdout_is_tty {
         "json-lines"
@@ -417,10 +383,6 @@ where
     }
 }
 
-/// Writes the closing part of the JSON document: `]` after the collected
-/// entries (on its own line) or a single-line `[]` when nothing was found.
-/// Runs even when the stream was interrupted or errored, so consumers never
-/// receive an unterminated array.
 async fn finalize_json_output(
     output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
     stdout: &mut std::io::StdoutLock<'static>,
@@ -430,7 +392,6 @@ async fn finalize_json_output(
     write_output(output_file, stdout, close).await
 }
 
-/// Writes `content` to the output file if present, otherwise to stdout.
 async fn write_output(
     output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
     stdout: &mut std::io::StdoutLock<'static>,
@@ -462,7 +423,6 @@ fn fetcher_config(options: &FetcherArgs) -> fluxy::fetcher::Config {
     }
 }
 
-/// Prints every provider and its sources to stderr for `--dry-run`.
 fn list_sources() {
     for provider in fluxy::all_providers() {
         let tier = match provider.tier() {
@@ -476,11 +436,8 @@ fn list_sources() {
     }
 }
 
-/// Owned, boxed, `Send` stream of proxies, erasing the concrete source so the
-/// three commands can hand it to `process_result` uniformly.
 type BoxStream = std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>>;
 
-/// Reads `ip:port` lines from `path` and yields them as a stream.
 async fn file_source(path: &std::path::Path) -> anyhow::Result<BoxStream> {
     let path = path.to_owned();
     let proxies = tokio::task::spawn_blocking(move || {
@@ -623,13 +580,6 @@ where
     process_result(validated_proxies, find.output, cancel, &guard).await
 }
 
-/// Ensures the GeoLite2 database is fresh.
-///
-/// Checks the P3TERX mirror on GitHub with a conditional request keyed on the
-/// ETag of the last downloaded revision, re-fetching only when the mirror's
-/// content changed. A missing or corrupt local copy is always replaced. The
-/// process exits 0 whether or not a download happened; failures are reported
-/// as errors.
 async fn run_geo_update() -> anyhow::Result<RunOutcome> {
     match fluxy::sync_database()
         .await
@@ -662,10 +612,6 @@ fn validator_config(
     }
 }
 
-/// Writes a single CSV row for `proxy` into `buf`.
-///
-/// Fields are comma-separated; any field containing a comma, double-quote, or
-/// newline is wrapped in double-quotes and inner quotes are escaped by doubling.
 fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
     let ip = proxy.ip.to_string();
     let port = proxy.port.to_string();
@@ -696,8 +642,6 @@ fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
     buf.push(b'\n');
 }
 
-/// Writes `field` into `buf`, quoting if it contains a comma, double-quote, or
-/// newline.
 fn csv_quote(buf: &mut Vec<u8>, field: &str) {
     if field.contains([',', '"', '\n', '\r']) {
         buf.push(b'"');
@@ -723,7 +667,6 @@ mod tests {
     use fluxy::proxy::models::Anonymity;
     use futures_util::stream;
 
-    /// Parses a `flx grab <args>` invocation and returns its fetch args.
     fn fetch_from(args: &[&str]) -> FetchArgs {
         let mut full = vec!["flx", "grab"];
         full.extend_from_slice(args);
@@ -733,7 +676,6 @@ mod tests {
         }
     }
 
-    /// Parses an invocation naming the `find` subcommand and returns its args.
     fn find_from(args: &[&str]) -> FindArgs {
         let mut full = vec!["flx", "find"];
         full.extend_from_slice(args);
@@ -886,8 +828,6 @@ mod tests {
         );
     }
 
-    /// Builds a minimal `OutputOptions` wired to a temp output file, returns
-    /// the path.
     fn output_options(format: &str, limit: usize) -> (OutputOptions, std::path::PathBuf) {
         let out = std::env::temp_dir().join(format!(
             "fluxy_json_test_{}_{}.json",
@@ -991,8 +931,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Parses a `json-lines`-format string produced by `process_result` into a
-    /// `Vec<serde_json::Value>`.
     fn parse_json_lines(content: &str) -> Vec<serde_json::Value> {
         content
             .lines()

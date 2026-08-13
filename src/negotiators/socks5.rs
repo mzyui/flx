@@ -11,13 +11,9 @@ use tokio::{
 use super::NegotiatorTrait;
 use crate::proxy::models::RuntimeStats;
 
-/// Negotiator for SOCKS5 proxies.
 pub struct Socks5Negotiator;
 
 impl Socks5Negotiator {
-    /// Builds the SOCKS5 CONNECT request into a stack buffer. The domain
-    /// branch enforces a 255-byte hostname (RFC 1928), so the packet can never
-    /// exceed the buffer.
     fn build_connect_request<'a>(
         buf: &'a mut [u8],
         host: &str,

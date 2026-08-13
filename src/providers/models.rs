@@ -9,54 +9,31 @@ use hyper::Uri;
 
 use crate::proxy::models::{Anonymity, Protocol};
 
-/// How the body returned by a source must be parsed into proxies.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScrapeMode {
-    /// One `ip:port` per line, optionally followed by extra fields.
     Plaintext,
-    /// GeoNode JSON API (`{"data":[{ip,port,protocols,...}]}`).
     GeonodeJson,
-    /// ProxyNova JSON API, whose `ip` field is a JS string expression.
     ProxyNovaJson,
-    /// HTML `<table>` markup shared by the free-proxy-list family of sites.
     HtmlTable,
-    /// Free-form HTML containing `ip:port#CC` pairs.
     RegexPairs,
-    /// proxy-list.org rows carrying a base64-encoded `ip:port` blob.
     Base64Rows,
 }
 
-/// Priority tier of a provider within [`crate::providers::all_providers`].
-///
-/// The fetcher runs every [`ProviderTier::Primary`] provider first and only
-/// then the [`ProviderTier::Fallback`] ones, so ordering is deterministic
-/// instead of depending on how the async scheduler happens to hand out
-/// semaphore permits.
+/// Priority tier of a proxy provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProviderTier {
-    /// Live websites and APIs that publish their own lists.
     Primary,
-    /// Aggregated mirrors, used after the primary sources have been exhausted.
     Fallback,
 }
 
-/// A single fetchable proxy list.
 pub struct Source {
-    /// URL of the proxy list.
     pub url: Uri,
-    /// Default protocol types assigned to proxies that do not specify one,
-    /// shared across every proxy from this source.
     pub default_types: Arc<[Protocol]>,
-    /// Overall budget for fetching this source.
     pub timeout: Duration,
-    /// How the response body is parsed into proxies.
     pub mode: ScrapeMode,
 }
 
 /// Default protocol set assigned to sources that advertise none.
-///
-/// Built once and shared via `Arc::clone` instead of allocating a fresh
-/// `Vec<Protocol>` + `Arc` per source (audit A.11).
 static COMMON_SOURCE_PROTOCOLS: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| {
     Arc::from([
         Protocol::Http(Anonymity::Unknown),
@@ -70,16 +47,6 @@ static COMMON_SOURCE_PROTOCOLS: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| {
 });
 
 impl Source {
-    /// Creates a source from a URL and the protocol types it advertises.
-    ///
-    /// When `types` is empty, the source reflects that no specific protocol is
-    /// known and the full common set (`HTTP`, `HTTPS`, `SOCKS4`, `SOCKS5`,
-    /// `CONNECT:25`, `CONNECT:80`, `CONNECT:443`) is used, subject to
-    /// verification.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `url` is not a valid URI.
     pub fn new(url: &str, types: Vec<Protocol>) -> anyhow::Result<Self> {
         let default_types = if types.is_empty() {
             Arc::clone(&COMMON_SOURCE_PROTOCOLS)
@@ -102,36 +69,22 @@ impl Source {
     }
 
     /// Overrides the per-request timeout.
-    ///
-    /// HTML scrapes and paginated APIs are much slower than raw text lists.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
     /// Creates a `Source` for a single well-known protocol.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `url` is not a valid URI.
     pub fn typed(url: &str, protocol: Protocol) -> anyhow::Result<Self> {
         Self::new(url, vec![protocol])
     }
 
     /// Creates a `Source` with default common protocols.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `url` is not a valid URI.
     pub fn all(url: &str) -> anyhow::Result<Self> {
         Self::new(url, vec![])
     }
 
     /// Creates a `Source` with default types for HTTP protocols.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `url` is not a valid URI.
     pub fn http(url: &str) -> anyhow::Result<Self> {
         Self::new(
             url,
@@ -146,19 +99,12 @@ impl Source {
     }
 
     /// Creates a `Source` with default types for SOCKS protocols.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `url` is not a valid URI.
     pub fn socks(url: &str) -> anyhow::Result<Self> {
         Self::new(url, vec![Protocol::Socks4, Protocol::Socks5])
     }
 }
 
-/// Keeps only the sources whose URL parsed successfully, logging the rest.
-///
-/// Providers build their source list from static strings, so a malformed URL is
-/// a bug rather than a user error — but it must never abort the whole run.
+/// Keeps only the sources whose URL parsed successfully.
 pub fn valid_sources(sources: Vec<anyhow::Result<Source>>) -> Vec<Source> {
     sources
         .into_iter()

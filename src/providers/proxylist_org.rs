@@ -5,11 +5,8 @@ use async_trait::async_trait;
 use super::models::{valid_sources, ScrapeMode, Source};
 use super::ProxyProvider;
 
-/// proxy-list.org, whose rows carry a base64-encoded `ip:port` blob.
 pub struct ProxyListOrgProvider;
 
-/// Pages requested per run, ported from the `mzyui/proxy-list` engine
-/// (engine/src/providers/proxy-list-org.js).
 const MAX_PAGES: u32 = 10;
 
 #[async_trait]

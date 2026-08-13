@@ -1,11 +1,4 @@
-//! High-level library entry point.
-//!
-//! [`Fluxy`] is a small builder facade over the lower-level pieces
-//! ([`ProxySource`], [`ProxyFetcher`], [`ProxyValidator`]) that covers the
-//! common workflows: fetch from the built-in providers, optionally validate,
-//! and collect the survivors into a `Vec` or a stream.
-//!
-//! See the crate-level documentation for a full example.
+//! High-level [`Fluxy`] builder facade.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -16,25 +9,16 @@ use crate::{
     FetcherConfig, ProxySource, ProxyValidator, ValidationProgress, ValidatorConfig,
 };
 
-/// Owned, boxed, `Send` stream of proxies. The concrete source type
-/// (`ProxyFetcher` or a file-backed iterator) is erased so [`Fluxy::stream`]
-/// can hand callers a single uniform stream.
+/// Uniform proxy stream type.
 type BoxStream = std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>>;
 
 /// Where the proxies come from.
 enum SourceKind {
-    /// The built-in provider set (see [`crate::all_providers`]).
     Fetcher,
-    /// A plaintext `ip:port` file, opened eagerly in [`Fluxy::from_file`].
     File(ProxySource),
 }
 
-/// Builder facade for fetching and optionally validating proxies.
-///
-/// The builder combines a [`FetcherConfig`] (how the built-in providers are
-/// scraped) and a [`ValidatorConfig`] (how candidates are checked). Validation
-/// runs whenever [`Fluxy::types`] has been called; otherwise the proxies are
-/// handed through unvalidated.
+/// Builder for fetching and optionally validating proxies.
 ///
 /// # Examples
 ///
@@ -91,12 +75,6 @@ impl Fluxy {
     }
 
     /// Starts a builder that reads `ip:port` lines from `path`.
-    ///
-    /// The file is opened immediately so a bad path fails fast.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `path` cannot be opened.
     pub fn from_file(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let source = ProxySource::from_file(path.into())?;
         Ok(Self {
@@ -105,153 +83,99 @@ impl Fluxy {
         })
     }
 
-    /// Protocols to validate (and match) against every candidate.
-    ///
-    /// When empty (the default) the pipeline skips validation and yields every
-    /// fetched proxy unchanged.
+    /// Protocols to validate against every candidate.
     pub fn types(mut self, types: impl Into<Vec<Protocol>>) -> Self {
         self.validator_config.types = types.into();
         self
     }
 
-    /// AND groups of protocols to validate. Every protocol inside a group must
-    /// pass for a proxy to be kept; a passing proxy is emitted once, listing
-    /// every passing protocol. Groups combine with OR across [`Fluxy::types`]
-    /// and each other.
-    ///
-    /// Unlike singleton types, group members are verified for every candidate
-    /// rather than trusting the source's label. When both `types` and `groups`
-    /// are empty the pipeline skips validation.
+    /// AND groups of protocols to validate.
     pub fn groups(mut self, groups: impl Into<Vec<Vec<Protocol>>>) -> Self {
         self.validator_config.groups = groups.into();
         self
     }
 
     /// Maximum number of proxies validated concurrently.
-    ///
-    /// Mirrors the CLI's `--max-connections`.
     pub fn concurrency(mut self, concurrency: usize) -> Self {
         self.validator_config.concurrency_limit = concurrency;
         self
     }
 
     /// Maximum number of provider sources fetched concurrently.
-    ///
-    /// Mirrors the CLI's `--fetch-concurrency`.
     pub fn fetch_concurrency(mut self, concurrency: usize) -> Self {
         self.fetcher_config.concurrency_limit = concurrency;
         self
     }
 
     /// Per-validation timeout in seconds.
-    ///
-    /// Mirrors the CLI's `--timeout`.
     pub fn timeout(mut self, seconds: u64) -> Self {
         self.validator_config.request_timeout = seconds;
         self
     }
 
-    /// Maximum validation attempts per advertised protocol before giving up.
-    ///
-    /// Mirrors the CLI's `--max-attempts`.
+    /// Maximum validation attempts per advertised protocol.
     pub fn max_attempts(mut self, attempts: usize) -> Self {
         self.validator_config.max_attempts = attempts;
         self
     }
 
     /// Disable TLS certificate validation for judge connections.
-    ///
-    /// Mirrors the CLI's `--insecure`; off by default. See
-    /// [`ValidatorConfig::insecure`] for the security implications.
     pub fn insecure(mut self, insecure: bool) -> Self {
         self.validator_config.insecure = insecure;
         self
     }
 
-    /// Annotate every fetched proxy with its country from the GeoLite2
-    /// database, downloading it on first use.
-    ///
-    /// Mirrors the CLI's `--with-geo`.
+    /// Annotate fetched proxies with GeoIP country data.
     pub fn with_geo(mut self) -> Self {
         self.fetcher_config.enable_geo_lookup = true;
         self
     }
 
     /// Filter fetched proxies by ISO country code.
-    ///
-    /// Implies GeoIP lookup. Mirrors the CLI's `--countries`.
     pub fn countries(mut self, countries: impl Into<Vec<String>>) -> Self {
         self.fetcher_config.enable_geo_lookup = true;
         self.fetcher_config.countries = Arc::from(countries.into());
         self
     }
 
-    /// Freshness window for the provider-source cache, in minutes.
-    ///
-    /// `0` disables the cache. Mirrors the CLI's `--cache-ttl`.
+    /// Freshness window for the source cache, in minutes.
     pub fn cache_ttl(mut self, minutes: u64) -> Self {
         self.fetcher_config.cache_ttl =
             (minutes > 0).then(|| Duration::from_secs(minutes.saturating_mul(60)));
         self
     }
 
-    /// Bypass the provider-source cache and refetch every source.
-    ///
-    /// Mirrors the CLI's `--refresh-cache`.
+    /// Bypass the source cache and refetch.
     pub fn refresh_cache(mut self) -> Self {
         self.fetcher_config.refresh_cache = true;
         self
     }
 
-    /// Custom online judges for plain HTTP validation.
-    ///
-    /// Mirrors the CLI's `--http-judge-urls`.
+    /// Custom HTTP judges for plain HTTP validation.
     pub fn http_judges(mut self, urls: impl Into<Vec<String>>) -> Self {
         self.validator_config.http_judge_urls = urls.into();
         self
     }
 
-    /// Custom online judges for HTTPS, CONNECT and SOCKS tunnels.
-    ///
-    /// Mirrors the CLI's `--https-judge-urls`.
+    /// Custom online judges for HTTPS and tunnel validation.
     pub fn https_judges(mut self, urls: impl Into<Vec<String>>) -> Self {
         self.validator_config.https_judge_urls = urls.into();
         self
     }
 
-    /// Stop after at most `limit` proxies. `0` (the default) means unlimited.
-    ///
-    /// The limit bounds the *output* of the pipeline, matching the CLI's
-    /// `-l/--limit`: when validation is enabled the pipeline keeps validating
-    /// candidates until `limit` proxies pass, instead of capping the number of
-    /// candidates before the check.
+    /// Stop after at most `limit` validated proxies.
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
     }
 
-    /// Runs the configured pipeline and yields validated proxies as a stream.
-    ///
-    /// Prefer [`Fluxy::collect`] when the pool fits in memory. Streams are
-    /// useful for large pools that should not be buffered.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the fetcher or validator cannot start.
+    /// Runs the pipeline and yields validated proxies as a stream.
     pub async fn stream(self) -> anyhow::Result<BoxStream> {
         let (stream, _progress) = self.stream_with_progress().await?;
         Ok(stream)
     }
 
-    /// Runs the pipeline like [`Fluxy::stream`] and exposes the live validation
-    /// counters alongside the stream.
-    ///
-    /// Use the returned [`ValidationProgress`] to drive a progress bar while
-    /// consuming `stream`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the fetcher or validator cannot start.
+    /// Runs the pipeline with live validation counters.
     pub async fn stream_with_progress(self) -> anyhow::Result<(BoxStream, ValidationProgress)> {
         let Fluxy {
             source,
@@ -288,11 +212,7 @@ impl Fluxy {
         Ok((output, progress))
     }
 
-    /// Runs the configured pipeline and collects the validated proxies.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the fetcher or validator cannot start.
+    /// Runs the pipeline and collects validated proxies.
     pub async fn collect(self) -> anyhow::Result<Vec<Proxy>> {
         let stream = self.stream().await?;
         Ok(stream.collect::<Vec<_>>().await)

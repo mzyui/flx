@@ -28,21 +28,12 @@ use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
 pub(crate) const VALIDATOR_CHANNEL_MIN: usize = 64;
 pub(crate) const VALIDATOR_CHANNEL_MAX: usize = 4_096;
 
-/// Sizes the bounded result channel from the validator's concurrency.
-///
-/// The buffer is proportional to the worker count so it never becomes a
-/// bottleneck, but is clamped to stay within reason regardless of how large
-/// `concurrency_limit` gets.
 fn validator_channel_capacity(concurrency_limit: usize) -> usize {
     concurrency_limit
         .saturating_mul(4)
         .clamp(VALIDATOR_CHANNEL_MIN, VALIDATOR_CHANNEL_MAX)
 }
 
-/// Reports a judge that failed preflight and was excluded from the pool.
-///
-/// A plain `fn` (not a closure) so it can be moved into the background preflight
-/// tasks spawned by [`checker::JudgePool::build`].
 fn report_dropped(url: &str, reason: &str) {
     #[cfg(feature = "log")]
     log::warn!("warning: judge `{url}` failed preflight and was dropped: {reason}");
@@ -50,14 +41,7 @@ fn report_dropped(url: &str, reason: &str) {
     let _ = (url, reason);
 }
 
-/// Shared, cloneable snapshot of the validation counters.
-///
-/// `total` counts the work units scheduled (one per advertised singleton job
-/// plus one per AND group), `done` counts units that finished probing
-/// regardless of the outcome, and `passed` counts units whose probe produced a
-/// validated proxy. A plain `ip:port` file line maps to one unit per matching
-/// advertised protocol, so for the common single-type run `done` tracks the
-/// proxies actually probed. Pollable from any thread via [`Arc`] atomics.
+/// Validation progress counters.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationProgress {
     total: Arc<AtomicUsize>,
@@ -66,28 +50,22 @@ pub struct ValidationProgress {
 }
 
 impl ValidationProgress {
-    /// Work units scheduled for validation so far.
     pub fn total(&self) -> usize {
         self.total.load(Ordering::Relaxed)
     }
 
-    /// Work units that finished probing, whether they passed or failed.
     pub fn done(&self) -> usize {
         self.done.load(Ordering::Relaxed)
     }
 
-    /// Work units whose probe produced a validated proxy.
     pub fn passed(&self) -> usize {
         self.passed.load(Ordering::Relaxed)
     }
 
-    /// Scheduled units still being probed.
     pub fn remaining(&self) -> usize {
         self.total().saturating_sub(self.done())
     }
 
-    /// Fraction of scheduled units that finished, `0.0` before any are
-    /// scheduled.
     pub fn fraction(&self) -> f64 {
         let total = self.total();
         if total == 0 {
@@ -98,11 +76,7 @@ impl ValidationProgress {
     }
 }
 
-/// Validates a stream of proxies and yields the ones that pass.
-///
-/// Consume it with [`ProxyValidator::get_one`] or as a [`Stream`]
-/// ([`futures_util::StreamExt`]). [`ProxyValidator::progress`] exposes the
-/// live counters.
+/// Validates proxy candidates against online judges.
 pub struct ProxyValidator {
     receiver: mpsc::Receiver<Proxy>,
     progress: ValidationProgress,
@@ -118,25 +92,18 @@ struct JudgeTargets {
     tunnel: Arc<checker::JudgePool>,
 }
 
-/// Per-job validation parameters shared by every `do_work` task.
 struct WorkParams {
     max_attempts: usize,
     request_timeout: u64,
     insecure: bool,
 }
 
-/// Identifies one AND-group validation for one proxy instance.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct GroupKey {
-    /// Uniquely identifies the `Arc<Proxy>` instance (each candidate is
-    /// wrapped once, so the address is unique for the lifetime of the jobs).
     proxy: usize,
     group_idx: usize,
 }
 
-/// Outcome of one protocol inside an AND group. `None` means the probe failed,
-/// was inconclusive, or errored out; the group drops as soon as any slot is
-/// missing when all of its members have reported.
 struct GroupWorkResult {
     key: GroupKey,
     slot: usize,
@@ -144,15 +111,11 @@ struct GroupWorkResult {
     proxy: Option<Proxy>,
 }
 
-/// Accumulates the per-slot outcomes of one AND group.
 struct GroupState {
     remaining: usize,
     results: Vec<Option<Proxy>>,
 }
 
-/// Shared match structure for protocol pairs. The closure `on_http_https`
-/// supplies the anonymity-matching rule that differs between the two callers
-/// (advertised vs. result).
 fn protocol_matches<F>(a: &Protocol, b: &Protocol, on_http_https: F) -> bool
 where
     F: FnOnce(&Anonymity, &Anonymity) -> bool,
@@ -165,26 +128,18 @@ where
     }
 }
 
-/// Whether a protocol advertised by a source is eligible for a specific user
-/// request. Unknown anonymity is unspecified metadata; CONNECT ports are
-/// capabilities and must match exactly.
 fn advertised_matches_request(advertised: &Protocol, requested: &Protocol) -> bool {
     protocol_matches(advertised, requested, |left, right| {
         matches!(left, Anonymity::Unknown) || matches!(right, Anonymity::Unknown) || left == right
     })
 }
 
-/// Whether the protocol proven by the judge satisfies the user's request.
-/// Unknown requests accept any measured anonymity; concrete predicates and
-/// CONNECT ports must match exactly.
 fn result_satisfies_request(result: &Protocol, requested: &Protocol) -> bool {
     protocol_matches(result, requested, |actual, required| {
         matches!(required, Anonymity::Unknown) || actual == required
     })
 }
 
-/// Runs a single protocol check against the judge pools and returns the
-/// measured [`ProxyType`] when it passes and satisfies `requested`.
 async fn run_probe(
     proxy: &mut Proxy,
     timeout: Duration,
@@ -230,8 +185,6 @@ async fn run_probe(
     }
 }
 
-/// Runs a single validation job that emits its proxy directly. Used for the
-/// singleton `Config::types` list (OR semantics, gated by advertised types).
 async fn do_work(
     proxy: Arc<Proxy>,
     sender: mpsc::Sender<Proxy>,
@@ -261,7 +214,6 @@ async fn do_work(
     Ok(())
 }
 
-/// One protocol of an AND group, bound to its proxy instance.
 struct GroupMemberJob {
     proxy: Arc<Proxy>,
     protocol: Protocol,
@@ -270,9 +222,6 @@ struct GroupMemberJob {
     group_len: usize,
 }
 
-/// Runs one protocol of an AND group and reports the outcome to the group
-/// aggregator. Unlike singleton jobs, group members are always probed: the
-/// "supports both" claim is verified, never taken from the source label.
 async fn do_group_work(
     member: GroupMemberJob,
     group_tx: mpsc::Sender<GroupWorkResult>,
@@ -318,9 +267,6 @@ async fn do_group_work(
     Ok(())
 }
 
-/// Merges the passing records of a finished AND group into a single proxy
-/// whose `proxy_types` lists every passing protocol (in slot order). Returns
-/// `None` when any member failed to pass.
 fn group_finish(state: GroupState) -> Option<Proxy> {
     let slots: Vec<Proxy> = if state.results.iter().all(Option::is_some) {
         state.results.into_iter().flatten().collect()
@@ -345,10 +291,6 @@ fn group_finish(state: GroupState) -> Option<Proxy> {
     Some(merged)
 }
 
-/// Correlates the per-protocol probes of each proxy+group and only forwards to
-/// the public channel once every slot reported. Any missing/failed slot drops
-/// the whole group. Runs concurrently so multi-type results stream out as they
-/// complete.
 async fn aggregate_groups(
     mut group_rx: mpsc::Receiver<GroupWorkResult>,
     aggregate_sender: mpsc::Sender<Proxy>,
@@ -377,15 +319,7 @@ async fn aggregate_groups(
 }
 
 impl ProxyValidator {
-    /// Validates every proxy yielded by `proxy_source`.
-    ///
-    /// The source is an async [`Stream`]; use [`futures_util::stream::iter`] to
-    /// feed a plain iterator into it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the configuration is invalid or a requested judge
-    /// pool ends up empty after preflight.
+    /// Validates every proxy yielded by the source stream.
     pub async fn validate<S>(proxy_source: S, config: Config) -> anyhow::Result<Self>
     where
         S: Stream<Item = Proxy> + Send + 'static,
@@ -722,15 +656,10 @@ impl ProxyValidator {
         })
     }
 
-    /// Returns a clone of the live validation counters.
-    ///
-    /// The handle shares the same atomics the validator's tasks update, so
-    /// consumers can poll progress from any thread while the stream runs.
     pub fn progress(&self) -> ValidationProgress {
         self.progress.clone()
     }
 
-    /// Awaits the next validated proxy, or `None` once validation finished.
     pub async fn get_one(&mut self) -> Option<Proxy> {
         self.receiver.recv().await
     }

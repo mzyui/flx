@@ -12,26 +12,17 @@ use crate::{error::ProtocolParseError, error::ProxyParseError, geolookup::models
 
 // ── RuntimeStats ──────────────────────────────────────────────────────
 
-/// Online running statistics for response-time tracking.
-///
-/// Stores count, total, min and max so the average can be computed at any
-/// point without keeping every individual sample in memory. All durations are
-/// measured in seconds; a freshly defaulted record has `count` of 0 and `min`,
-/// `max`, and `total` of `0.0`.
+/// Running statistics for response-time tracking.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeStats {
-    /// Number of timing samples recorded so far.
     pub count: u32,
-    /// Sum of all recorded durations, in seconds.
     pub total: f64,
-    /// Minimum recorded duration, in seconds (`0.0` before the first sample).
     pub min: f64,
-    /// Maximum recorded duration, in seconds (`0.0` before the first sample).
     pub max: f64,
 }
 
 impl RuntimeStats {
-    /// Records a single timing sample (in seconds).
+    /// Records a timing sample.
     pub fn record(&mut self, secs: f64) {
         self.count += 1;
         self.total += secs;
@@ -43,7 +34,7 @@ impl RuntimeStats {
         }
     }
 
-    /// Average response time in seconds, or 0.0 when no samples exist.
+    /// Average response time in seconds.
     pub fn avg(&self) -> f64 {
         if self.count == 0 {
             0.0
@@ -55,29 +46,18 @@ impl RuntimeStats {
 
 // ── Anonymity ─────────────────────────────────────────────────────────
 
-/// Represents the level of anonymity of a proxy.
-///
-/// The level is derived from a heuristic scan of the judge response body (see
-/// `validator::checker::classify_anonymity`): it reflects which leaks were
-/// *detected* on the last check, not an absolute guarantee.
+/// Anonymity level of a proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Anonymity {
-    /// Elite anonymity: no known IP or leaking header indicators were detected
-    /// in the judge response.
     Elite,
-    /// Transparent anonymity: the original IP address was visible in the judge
-    /// response.
     Transparent,
-    /// Anonymous anonymity: the IP is hidden, but headers that typically leak
-    /// client or proxy metadata were detected.
     Anonymous,
-    /// Anonymity is unknown.
     Unknown,
 }
 
 // ── Protocol ─────────────────────────────────────────────────────────
 
-/// Represents different protocols that a proxy can support.
+/// Protocol that a proxy supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Protocol {
     Http(Anonymity),
@@ -112,8 +92,6 @@ impl Display for Protocol {
 impl FromStr for Protocol {
     type Err = ProtocolParseError;
 
-    /// Parses a protocol token such as `HTTP`, `HTTP:Elite`, `HTTPS`,
-    /// `HTTPS:Anonymous`, `SOCKS5` or `CONNECT:8080`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut parts = s.split(':');
         let head = parts.next().unwrap_or_default();
@@ -144,21 +122,17 @@ impl FromStr for Protocol {
 
 // ── ProxyType ─────────────────────────────────────────────────────────
 
-/// Represents a type of proxy with its protocol and checked status.
+/// A proxy type with protocol and checked status.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyType {
-    /// The protocol of the proxy.
     pub protocol: Protocol,
-    /// Indicates if the proxy has been checked
     #[serde(skip)]
     pub checked: bool,
-    /// Unix timestamp in seconds when this proxy type was checked, falling
-    /// back to `0.0` when the system clock precedes the Unix epoch.
     pub checked_on: f64,
 }
 
 impl ProxyType {
-    /// Creates a new `ProxyType` with the specified protocol.
+    /// Creates a new ProxyType with the specified protocol.
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
@@ -166,10 +140,7 @@ impl ProxyType {
             checked_on: 0.0,
         }
     }
-    /// Creates a new `ProxyType` with the specified protocol. marked as checked
-    ///
-    /// If the system clock is set before the unix epoch the timestamp falls
-    /// back to `0.0` rather than panicking.
+    /// Creates a checked ProxyType with the current timestamp.
     pub fn checked(protocol: Protocol) -> Self {
         Self {
             protocol,
@@ -191,9 +162,6 @@ where
     serializer.serialize_f64(runtimes.avg())
 }
 
-/// Serializes the validated types under the `type` key: `null` when unset, a
-/// single object when exactly one protocol passed, and an array for AND-group
-/// matches (e.g. `HTTP+HTTPS`).
 fn serialize_types<S>(types: &[ProxyType], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -207,17 +175,12 @@ where
 
 // ── Proxy ─────────────────────────────────────────────────────────────
 
-/// An `ip:port` proxy endpoint enriched with geo data and validation results.
+/// A validated proxy endpoint with metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct Proxy {
-    /// IP address of the proxy.
     pub ip: Ipv4Addr,
-    /// Port number of the proxy.
     pub port: u16,
-    /// Geographical data associated with the proxy.
     pub geo: Arc<GeoData>,
-    /// Running response-time statistics (replaces an unbounded list of
-    /// per-sample durations).
     #[serde(
         rename = "average_response_time",
         serialize_with = "serialize_runtimes"
@@ -227,22 +190,13 @@ pub struct Proxy {
     pub expected_types: Arc<[Protocol]>,
     #[serde(rename = "type", serialize_with = "serialize_types")]
     pub proxy_types: Vec<ProxyType>,
-    /// Precomputed `ip:port` text, cached to avoid re-formatting on every hot-path call.
     #[serde(skip)]
     pub(crate) text: Arc<str>,
 }
 
-/// Empty geo record shared by every proxy built without a geo lookup.
-///
-/// `Proxy::new` used to allocate a fresh `Arc<GeoData>` per proxy even when
-/// geo lookup is disabled (the default), leaving one heap allocation per
-/// proxy in the hottest path after A.5. Geo data is only ever replaced (e.g.
-/// in `accept_proxy`), never mutated in place, so a single shared default is
-/// safe and allocation-free for the common case (re-audit N6).
 static DEFAULT_GEO: LazyLock<Arc<GeoData>> = LazyLock::new(|| Arc::new(GeoData::default()));
 
 impl Proxy {
-    /// Builds a proxy, precomputing its `ip:port` text representation.
     pub fn new(ip: Ipv4Addr, port: u16) -> Self {
         let mut buf = [0u8; 32];
         let text = crate::write_to_buffer(&mut buf, format_args!("{ip}:{port}"));
@@ -257,14 +211,12 @@ impl Proxy {
         }
     }
 
-    /// Builds a proxy and assigns the protocols advertised by its source.
     pub fn with_expected_types(ip: Ipv4Addr, port: u16, expected_types: Arc<[Protocol]>) -> Self {
         let mut proxy = Self::new(ip, port);
         proxy.expected_types = expected_types;
         proxy
     }
 
-    /// Creates the minimal mutable state needed by one validation job.
     pub(crate) fn validation_probe(&self) -> Self {
         Self {
             ip: self.ip,
@@ -285,12 +237,12 @@ impl Default for Proxy {
 }
 
 impl Proxy {
-    /// Average proxy response time in seconds; `0.0` when no samples exist.
+    /// Average response time in seconds.
     pub fn avg_response_time(&self) -> f64 {
         self.runtimes.avg()
     }
 
-    /// Returns the proxy in `<ip>:<port>` format (precomputed, zero-allocation).
+    /// Returns the proxy in ip:port format.
     pub fn as_text(&self) -> &str {
         &self.text
     }
@@ -345,12 +297,7 @@ impl Display for Proxy {
 impl FromStr for Proxy {
     type Err = ProxyParseError;
 
-    /// Parses a proxy from text such as `"1.2.3.4:8080"`,
-    /// `"http://1.2.3.4:8080"` or `"socks5://1.2.3.4:1080"`.
-    ///
-    /// When a scheme prefix is present it is mapped to a single-element
-    /// `expected_types` list via [`crate::providers::parsers::protocol_from_str`];
-    /// plain `ip:port` lines leave `expected_types` empty.
+    /// Parses a proxy from text like "1.2.3.4:8080" or "http://1.2.3.4:8080".
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
 

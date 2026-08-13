@@ -5,11 +5,8 @@ use async_trait::async_trait;
 use super::models::{valid_sources, ScrapeMode, Source};
 use super::ProxyProvider;
 
-/// The freeproxy.world paginated HTML table.
 pub struct FreeProxyWorldProvider;
 
-/// Pages requested per run, ported from the `mzyui/proxy-list` engine
-/// (engine/src/providers/freeproxy-world.js).
 const MAX_PAGES: u32 = 15;
 
 #[async_trait]

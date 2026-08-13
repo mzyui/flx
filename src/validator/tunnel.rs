@@ -23,10 +23,6 @@ use crate::resolver::my_ip;
 const MAX_PROXY_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_JUDGE_RESPONSE_BYTES: usize = 576 * 1024;
 
-/// Renders `host:port` (bracketing IPv6 hosts) into `buf`, borrowing the stack
-/// buffer on success so the common case is allocation-free.
-///
-/// Pathologically overlong hosts fall back to an owned `String`.
 fn authority_for<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, str> {
     let args = if host.contains(':') {
         format_args!("[{host}]:{port}")
@@ -36,8 +32,6 @@ fn authority_for<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, str> {
     crate::write_to_buffer(buf, args)
 }
 
-/// Renders a small handshake request line into a stack buffer when it fits,
-/// falling back to an owned `String` for pathologically overlong inputs.
 fn write_request<'a>(buf: &'a mut [u8], args: std::fmt::Arguments<'_>) -> Cow<'a, str> {
     crate::write_to_buffer(buf, args)
 }
@@ -47,22 +41,16 @@ struct JudgeTarget {
     scheme: String,
     host: String,
     port: u16,
-    /// Cached `host:port` (bracketed for IPv6), computed once at construction
-    /// instead of `format!`-ed on every probe (re-audit B.28).
     authority: String,
     path_and_query: String,
     response_marker: String,
     request_token: String,
 }
 
-/// How far a tunnel probe got before it finished or failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationStatus {
-    /// TCP connection to the proxy succeeded.
     TcpReachable,
-    /// The protocol handshake (CONNECT/SOCKS) completed.
     HandshakePassed,
-    /// A request was carried end-to-end and the judge echoed the token.
     EndToEndPassed,
 }
 
@@ -113,8 +101,6 @@ impl JudgeTarget {
     }
 }
 
-/// Validates a tunnel protocol by completing its handshake to the local judge
-/// and carrying an HTTP request and response through the tunnel.
 pub(super) async fn support_tunnel(
     proxy: &mut Proxy,
     timeout: Duration,
@@ -376,8 +362,6 @@ async fn read_discard(stream: &mut BufReader<TcpStream>, length: usize) -> anyho
     Ok(())
 }
 
-/// Carries the probe request over the tunnel and a TLS leg to the HTTPS judge,
-/// then verifies the bound token was echoed.
 async fn verify_tls_judge(
     stream: TcpStream,
     target: &JudgeTarget,
@@ -504,8 +488,6 @@ mod tests {
 
     const JUDGE_URL: &str = "http://127.0.0.1:9/fluxy-test-token";
 
-    /// Builds a single-judge pool backed by `target` for tests that only need
-    /// one endpoint (the judge is local and already serves a known response).
     fn pool_with(target: ValidationTarget) -> JudgePool {
         JudgePool::from_targets(Vec::from([std::sync::Arc::new(target)]))
     }

@@ -44,17 +44,6 @@ pub use proxyscrape::ProxyscrapeProvider;
 pub use models::ProviderTier;
 use models::ScrapeMode;
 
-/// Builds one instance of every provider fluxy knows about.
-///
-/// Mirrors the provider registry of the reference `mzyui/proxy-list` engine
-/// (engine/src/providers/index.js). `proxyscan` is intentionally absent from
-/// that registry: its download endpoint has historically returned HTTP 404 for
-/// every protocol and it is disabled upstream as well.
-///
-/// Ordering matters: website providers come first because they publish fresh,
-/// self-maintained lists, while [`GithubRepoProvider`] is deliberately last —
-/// its lists aggregate copies of other sources and serve as a fallback when
-/// the primary providers are unreachable or empty.
 pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
     vec![
         // Primary: live websites / APIs.
@@ -71,37 +60,16 @@ pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
     ]
 }
 
-/// Contract for fetching proxies from a family of sources.
 #[async_trait]
 pub trait ProxyProvider {
-    /// A short, stable identifier used in logs and diagnostics.
     fn name(&self) -> &'static str;
 
-    /// Priority tier of this provider.
-    ///
-    /// Defaults to [`ProviderTier::Primary`]; aggregated mirrors override it
-    /// with [`ProviderTier::Fallback`] so the fetcher can run them last.
     fn tier(&self) -> ProviderTier {
         ProviderTier::Primary
     }
 
-    /// Returns a list of sources from which proxies can be fetched.
-    ///
-    /// # Returns
-    ///
-    /// A vector of `Source` objects representing the proxy sources.
     fn sources(&self) -> Vec<Source>;
 
-    /// Fetches a source's response body, following redirects up to
-    /// `MAX_REDIRECTS` and buffering the UTF-8 content across all frames.
-    ///
-    /// The request and every frame share a single `timeout` budget, so a stalled
-    /// body cannot pin a semaphore permit forever.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the URL is invalid, a redirect loop is detected,
-    /// the body exceeds `MAX_SOURCE_BODY_BYTES`, or the deadline is exceeded.
     async fn fetch(
         &self,
         client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
@@ -189,11 +157,6 @@ pub trait ProxyProvider {
         Ok(Cow::Owned(content))
     }
 
-    /// Scrapes proxies from a response body, using the source's `default_types`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the parsing task fails.
     async fn scrape(
         &self,
         html: Cow<'static, str>,
@@ -204,12 +167,6 @@ pub trait ProxyProvider {
             .await
     }
 
-    /// Parses a response body according to `mode` and forwards every proxy.
-    ///
-    /// When a row carries its own protocol it replaces `default_types` for that
-    /// proxy, otherwise the source defaults apply. The parser runs on a
-    /// blocking thread (`spawn_blocking`) so CPU-bound scraping never starves
-    /// the async runtime.
     async fn scrape_with(
         &self,
         body: Cow<'static, str>,

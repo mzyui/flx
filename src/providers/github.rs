@@ -6,18 +6,8 @@ use super::models::{valid_sources, ProviderTier, Source};
 use super::ProxyProvider;
 use crate::proxy::models::{Anonymity, Protocol};
 
-/// A provider for fetching proxy lists from GitHub repositories.
-///
-/// Historically the highest-yield provider in the reference `mzyui/proxy-list`
-/// engine, contributing roughly 97% of unique proxies there. That figure is not
-/// computed here and depends on external source availability and timing.
 pub struct GithubRepoProvider;
 
-/// `(path after raw.githubusercontent.com, protocol)` for every tracked list.
-///
-/// Ported from `mzyui/proxy-list` (engine/src/providers/github-raw.js). Sources
-/// that contributed 0% unique entries there (clarketm/proxy-list, iplocate's
-/// combined all-proxies.txt) are deliberately excluded here too.
 static SOURCES: [(&str, Protocol); 31] = [
     (
         "TheSpeedX/PROXY-List/master/http.txt",
@@ -136,8 +126,6 @@ impl ProxyProvider for GithubRepoProvider {
         "github-raw"
     }
 
-    /// These lists are aggregated mirrors of the other providers, so they run
-    /// only after every primary source has been exhausted.
     fn tier(&self) -> ProviderTier {
         ProviderTier::Fallback
     }

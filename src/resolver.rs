@@ -18,9 +18,6 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::sync::OnceCell;
 use tokio::time;
 
-/// HTTPS endpoints used when DNS-based discovery is unavailable.
-///
-/// Each must answer with the caller's IP address as plain text and nothing else.
 static HTTP_IP_ENDPOINTS: [&str; 3] = [
     "https://api.ipify.org",
     "https://ifconfig.me/ip",
@@ -30,20 +27,14 @@ static HTTP_IP_ENDPOINTS: [&str; 3] = [
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IP_BODY_BYTES: usize = 64;
 
-/// Freshness window for the on-disk public-IP cache.
-///
-/// The host's public address rarely changes, so reusing it across runs skips
-/// the per-run DNS/HTTPS discovery (up to 5s on filtered networks).
 const PUBLIC_IP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Path of the cached public IP under the platform data dir.
 fn public_ip_cache_path() -> Option<PathBuf> {
     let mut path = crate::geolookup::data_dir().ok()?;
     path.push("public-ip");
     Some(path)
 }
 
-/// Reads a fresh, parseable public IP from the on-disk cache, if any.
 async fn load_cached_public_ip(path: &Path) -> Option<String> {
     let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
     let age = SystemTime::now().duration_since(modified).ok()?;
@@ -59,7 +50,6 @@ async fn load_cached_public_ip(path: &Path) -> Option<String> {
     }
 }
 
-/// Best-effort store of the resolved public IP. Atomic via temp-file + rename.
 async fn store_public_ip(path: &Path, ip: &str) {
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -77,9 +67,6 @@ async fn store_public_ip(path: &Path, ip: &str) {
     }
 }
 
-/// Validates and normalizes a public-IP response body.
-///
-/// Rejects bodies that are too large, not UTF-8, or not a parseable [`IpAddr`].
 fn parse_ip_body(body: &[u8]) -> anyhow::Result<String> {
     if body.len() > MAX_IP_BODY_BYTES {
         anyhow::bail!("public-IP response exceeds {MAX_IP_BODY_BYTES} bytes");
@@ -92,10 +79,6 @@ fn parse_ip_body(body: &[u8]) -> anyhow::Result<String> {
     Ok(ip.to_string())
 }
 
-/// Fetches one HTTPS IP-echo endpoint and validates its body.
-///
-/// Applies a shared absolute `deadline` so a stalled peer cannot run past the
-/// overall lookup budget.
 async fn fetch_ip_endpoint(
     client: Client<
         HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
@@ -130,15 +113,8 @@ async fn fetch_ip_endpoint(
     parse_ip_body(&bytes).with_context(|| format!("invalid response from {endpoint}"))
 }
 
-/// Set once the OpenDNS lookup fails, so a known-broken DNS path is not
-/// retried on every subsequent `my_ip()` call.
-///
-/// `my_ip` is called once per accepted HTTPS proxy; the public IP is constant
-/// for the process lifetime, so re-attempting a deterministic DNS failure per
-/// proxy only burns part of each per-validation deadline (and spams logs).
 static DNS_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 
-/// Resolves our public IP over DNS using OpenDNS.
 async fn my_ip_via_dns() -> anyhow::Result<String> {
     if DNS_UNAVAILABLE.load(Ordering::Relaxed) {
         anyhow::bail!("OpenDNS lookup previously failed; DNS discovery disabled");
@@ -166,14 +142,8 @@ async fn my_ip_via_dns() -> anyhow::Result<String> {
     Ok(ip.to_string())
 }
 
-/// Lazily-built resolver for `my_ip_via_dns`, constructed once per process.
-///
-/// Building a `TokioAsyncResolver` is comparatively heavy, so it must not be
-/// recreated on every DNS lookup (`my_ip` is called once per accepted HTTPS
-/// proxy).
 static DNS_RESOLVER: OnceCell<TokioAsyncResolver> = OnceCell::const_new();
 
-/// Builds the cached DNS resolver targeting OpenDNS's A-record-only server.
 fn build_dns_resolver() -> TokioAsyncResolver {
     // `myip.opendns.com` only publishes an A record; the default strategy also
     // queries AAAA and would fail the whole lookup with "no record found".
@@ -196,10 +166,6 @@ fn build_dns_resolver() -> TokioAsyncResolver {
     )
 }
 
-/// Resolves our public IP over HTTPS.
-///
-/// Used when outbound UDP:53 is filtered, which is common on container hosts
-/// and corporate networks.
 async fn my_ip_via_https() -> anyhow::Result<String> {
     let client =
         Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new());
@@ -218,16 +184,6 @@ async fn my_ip_via_https() -> anyhow::Result<String> {
     anyhow::bail!("all HTTPS IP endpoints failed: {}", errors.join("; "))
 }
 
-/// Determines the public IP address of the current host.
-///
-/// Tries OpenDNS first, then falls back to HTTPS echo services when DNS is
-/// unavailable (e.g. outbound UDP:53 is blocked). A failed DNS lookup is
-/// remembered for the rest of the process so subsequent calls skip straight to
-/// HTTPS instead of repeating the doomed DNS attempt.
-///
-/// # Errors
-///
-/// Returns an error only when every discovery method fails.
 pub async fn my_ip() -> anyhow::Result<String> {
     // Cache the first successful resolution for the lifetime of the process.
     // Failures are not stored, so a transient outage can be retried. Replaces
@@ -236,7 +192,6 @@ pub async fn my_ip() -> anyhow::Result<String> {
     CACHE.get_or_try_init(resolve_public_ip).await.cloned()
 }
 
-/// Performs the actual public-IP discovery, uncached.
 async fn resolve_public_ip() -> anyhow::Result<String> {
     let start_time = Instant::now();
 

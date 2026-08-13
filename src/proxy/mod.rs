@@ -1,4 +1,4 @@
-//! Proxy model types and the low-level HTTP/TLS client used to reach them.
+//! Proxy model types and HTTP/TLS client.
 
 pub mod client;
 pub mod models;
