@@ -18,55 +18,6 @@ use std::sync::Arc;
 use tokio::{io::AsyncWriteExt, runtime};
 
 mod argument;
-#[cfg(feature = "progress_bar")]
-mod progress;
-
-/// Coordinates writes to a shared terminal with a live status line.
-///
-/// A streamed result line and a pinned progress bar both target the same
-/// terminal when stdout and stderr are a TTY, so the bar must be hidden for
-/// the duration of each stdout write and redrawn below the new line afterwards.
-/// `NoopGuard` is used when no status line is active.
-pub trait OutputGuard {
-    fn before_write(&self);
-    fn after_write(&self);
-}
-
-/// A guard that does nothing, for runs without a status line.
-pub struct NoopGuard;
-
-impl OutputGuard for NoopGuard {
-    fn before_write(&self) {}
-    fn after_write(&self) {}
-}
-
-/// Dispatches between an active status line and no guard at all.
-///
-/// [`run_find`] only builds a [`progress::ValidationBar`] when the terminal and
-/// flags allow it; the guard lets `process_result` take a single reference
-/// whether or not the bar exists.
-#[cfg(feature = "progress_bar")]
-pub enum OutputGuardEither<B> {
-    Bar(B),
-    Noop(NoopGuard),
-}
-
-#[cfg(feature = "progress_bar")]
-impl<B: OutputGuard> OutputGuard for OutputGuardEither<B> {
-    fn before_write(&self) {
-        match self {
-            OutputGuardEither::Bar(bar) => bar.before_write(),
-            OutputGuardEither::Noop(noop) => noop.before_write(),
-        }
-    }
-
-    fn after_write(&self) {
-        match self {
-            OutputGuardEither::Bar(bar) => bar.after_write(),
-            OutputGuardEither::Noop(noop) => noop.after_write(),
-        }
-    }
-}
 
 /// Terminal setup that keeps a Ctrl+C from echoing `^C` into the streamed
 /// output. The `^C` character is written by the tty driver (not by fluxy)
@@ -234,7 +185,6 @@ async fn process_result<S, C>(
     source: S,
     options: OutputOptions,
     cancel: C,
-    guard: &dyn OutputGuard,
 ) -> anyhow::Result<RunOutcome>
 where
     S: Stream<Item = Proxy>,
@@ -293,11 +243,9 @@ where
                 );
             }
         } else {
-            guard.before_write();
             stdout
                 .write_all(&buf)
                 .expect("failed to write CSV header to stdout");
-            guard.after_write();
         }
         buf.clear();
     }
@@ -366,13 +314,11 @@ where
                         break;
                     }
                 } else {
-                    guard.before_write();
                     // `print!` panics on a broken pipe; keep that behaviour by
                     // panicking here too.
                     stdout
                         .write_all(&buf)
                         .expect("failed to write proxy to stdout");
-                    guard.after_write();
                 }
 
                 found_proxy = true;
@@ -387,7 +333,6 @@ where
         // Finalizing is best-effort: an interrupted or failing run must still
         // yield valid JSON, but a failure here is only interesting when nothing
         // else already went wrong.
-        guard.before_write();
         if write_error.is_none() {
             write_error = finalize_json_output(&mut output_file, &mut stdout, found_proxy)
                 .await
@@ -395,7 +340,6 @@ where
         } else {
             let _ = finalize_json_output(&mut output_file, &mut stdout, found_proxy).await;
         }
-        guard.after_write();
     }
     if let Some(file) = output_file.as_mut() {
         let _ = file.flush().await;
@@ -551,7 +495,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     let outcome = runtime.block_on(async move {
         match command {
             Command::Grab(grab) => run_grab(grab, cancel).await,
-            Command::Find(find) => run_find(find, cli.quiet, cli.no_color, cancel).await,
+            Command::Find(find) => run_find(find, cancel).await,
             Command::GeoUpdate => run_geo_update().await,
         }
     });
@@ -570,15 +514,10 @@ where
     let source = ProxySource::from_fetcher(fetcher_config(&grab.fetcher))
         .await
         .context("failed to start proxy fetcher")?;
-    process_result(source, grab.output, cancel, &NoopGuard).await
+    process_result(source, grab.output, cancel).await
 }
 
-async fn run_find<C>(
-    find: FindArgs,
-    quiet: bool,
-    no_color: bool,
-    cancel: C,
-) -> anyhow::Result<RunOutcome>
+async fn run_find<C>(find: FindArgs, cancel: C) -> anyhow::Result<RunOutcome>
 where
     C: Future<Output = ()>,
 {
@@ -606,21 +545,7 @@ where
         ProxyValidator::validate(source, validator_config(&find.validator, protocols, groups))
             .await
             .context("failed to start proxy validator")?;
-
-    // The status line (stderr) repaints on a background thread and erases
-    // itself on drop. It also hides around each stdout write so streamed
-    // results never overwrite the line it is drawn on.
-    #[cfg(feature = "progress_bar")]
-    let guard: OutputGuardEither<progress::ValidationBar> =
-        match progress::ValidationBar::new(validated_proxies.progress(), quiet, no_color) {
-            Some(bar) => OutputGuardEither::Bar(bar),
-            None => OutputGuardEither::Noop(NoopGuard),
-        };
-    #[cfg(not(feature = "progress_bar"))]
-    let guard = NoopGuard;
-    #[cfg(not(feature = "progress_bar"))]
-    let _ = (quiet, no_color);
-    process_result(validated_proxies, find.output, cancel, &guard).await
+    process_result(validated_proxies, find.output, cancel).await
 }
 
 /// Ensures the GeoLite2 database is fresh.
@@ -1006,7 +931,7 @@ mod tests {
         let (options, path) = output_options("json-lines", limit);
         rt.block_on(async {
             let s = stream::iter(proxies.iter().cloned());
-            process_result(s, options, std::future::pending::<()>(), &NoopGuard)
+            process_result(s, options, std::future::pending::<()>())
                 .await
                 .unwrap();
         });
@@ -1020,7 +945,7 @@ mod tests {
         let (options, path) = output_options("csv", limit);
         rt.block_on(async {
             let s = stream::iter(proxies.iter().cloned());
-            process_result(s, options, std::future::pending::<()>(), &NoopGuard)
+            process_result(s, options, std::future::pending::<()>())
                 .await
                 .unwrap();
         });
@@ -1035,7 +960,7 @@ mod tests {
         rt.block_on(async {
             let s = stream::iter(proxies.iter().cloned());
             // Tests never cancel: use a future that stays pending.
-            process_result(s, options, std::future::pending::<()>(), &NoopGuard)
+            process_result(s, options, std::future::pending::<()>())
                 .await
                 .unwrap();
         });
