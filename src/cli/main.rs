@@ -56,6 +56,26 @@ impl<B: OutputGuard> OutputGuard for OutputGuardEither<B> {
     }
 }
 
+/// Whether stdout is a pipe (FIFO) rather than a terminal or a regular file.
+///
+/// A piped stdout means a downstream process writes to the shared terminal (or
+/// `2>&1` routes our own stderr into the pipe), so a stderr summary would mix
+/// with that output. Regular-file redirects (`> out`) leave the terminal free
+/// and are safe to keep the summary.
+#[cfg(unix)]
+fn stdout_is_pipe() -> bool {
+    use std::os::unix::io::AsRawFd as _;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // fstat cannot fail on the already-open stdout descriptor.
+    (unsafe { libc::fstat(std::io::stdout().as_raw_fd(), &mut stat) } == 0)
+        && stat.st_mode & libc::S_IFMT == libc::S_IFIFO
+}
+
+#[cfg(not(unix))]
+fn stdout_is_pipe() -> bool {
+    !std::io::stdout().is_terminal()
+}
+
 #[cfg(unix)]
 mod quiet_signal_echo {
     pub struct QuietSignalEcho {
@@ -530,7 +550,7 @@ where
     let accepted = source.accepted_handle();
     let started = std::time::Instant::now();
     let outcome = process_result(source, grab.output, cancel, &NoopGuard).await;
-    if !quiet {
+    if !quiet && !stdout_is_pipe() {
         let gathered = accepted.load(std::sync::atomic::Ordering::Relaxed);
         let elapsed = started.elapsed();
         let rate = if elapsed.is_zero() {
@@ -596,7 +616,7 @@ where
     // Erase the status line before the summary so the two never share a row.
     #[cfg(feature = "progress_bar")]
     drop(guard);
-    if !quiet {
+    if !quiet && !stdout_is_pipe() {
         let passed = progress.passed();
         let failed = progress.done().saturating_sub(passed);
         let checked = progress.total();
