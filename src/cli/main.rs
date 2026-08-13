@@ -4,6 +4,8 @@ use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
     CommandFactory, Parser,
 };
+#[cfg(feature = "progress_bar")]
+use colored::Colorize;
 #[cfg(feature = "log")]
 use fluxy::initialize_logging;
 use fluxy::{
@@ -74,6 +76,62 @@ fn stdout_is_pipe() -> bool {
 #[cfg(not(unix))]
 fn stdout_is_pipe() -> bool {
     !std::io::stdout().is_terminal()
+}
+
+/// Formats the end-of-run stats line for `find`, colored under the
+/// `progress_bar` feature and plain otherwise.
+#[cfg(feature = "progress_bar")]
+fn format_validation_stats(
+    valid: usize,
+    failed: usize,
+    checked: usize,
+    elapsed: std::time::Duration,
+    rate: f64,
+    dst: Option<&str>,
+) -> String {
+    let v = format!("{valid} valid").green().bold();
+    let f = format!("{failed} failed").red().bold();
+    let c = format!("{checked} checked").bright_white();
+    let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
+    format!("\n{v} · {f} · {c} in {elapsed:?} ({rate:.1}/s){suffix}")
+}
+
+#[cfg(not(feature = "progress_bar"))]
+fn format_validation_stats(
+    valid: usize,
+    failed: usize,
+    checked: usize,
+    elapsed: std::time::Duration,
+    rate: f64,
+    dst: Option<&str>,
+) -> String {
+    let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
+    format!("\n{valid} valid · {failed} failed · {checked} checked in {elapsed:?} ({rate:.1}/s){suffix}")
+}
+
+/// Formats the end-of-run line for `grab`, colored under the `progress_bar`
+/// feature and plain otherwise.
+#[cfg(feature = "progress_bar")]
+fn format_gathered_stats(
+    gathered: usize,
+    elapsed: std::time::Duration,
+    rate: f64,
+    dst: Option<&str>,
+) -> String {
+    let n = format!("{gathered} proxies").green().bold();
+    let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
+    format!("\nGathered {n} in {elapsed:?} ({rate:.1}/s){suffix}")
+}
+
+#[cfg(not(feature = "progress_bar"))]
+fn format_gathered_stats(
+    gathered: usize,
+    elapsed: std::time::Duration,
+    rate: f64,
+    dst: Option<&str>,
+) -> String {
+    let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
+    format!("\nGathered {gathered} proxies in {elapsed:?} ({rate:.1}/s){suffix}")
 }
 
 #[cfg(unix)]
@@ -512,6 +570,11 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         return Ok(RunOutcome::NoCommand);
     };
 
+    // `colored` decides by the stdout TTY, but the bar and summary paint on
+    // stderr; force the color choice from `--no-color` for the whole run.
+    #[cfg(feature = "progress_bar")]
+    colored::control::set_override(!cli.no_color);
+
     let runtime = runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -549,6 +612,11 @@ where
         .context("failed to start proxy fetcher")?;
     let accepted = source.accepted_handle();
     let started = std::time::Instant::now();
+    let dst: Option<String> = grab
+        .output
+        .output_file
+        .as_deref()
+        .map(|p| p.to_string_lossy().into_owned());
     let outcome = process_result(source, grab.output, cancel, &NoopGuard).await;
     if !quiet && !stdout_is_pipe() {
         let gathered = accepted.load(std::sync::atomic::Ordering::Relaxed);
@@ -558,7 +626,10 @@ where
         } else {
             gathered as f64 / elapsed.as_secs_f64()
         };
-        eprintln!("\nGathered {gathered} proxies in {elapsed:?} ({rate:.1}/s)");
+        eprintln!(
+            "{}",
+            format_gathered_stats(gathered, elapsed, rate, dst.as_deref())
+        );
     }
     outcome
 }
@@ -612,6 +683,11 @@ where
     let guard = NoopGuard;
     #[cfg(not(feature = "progress_bar"))]
     let _ = no_color;
+    let dst: Option<String> = find
+        .output
+        .output_file
+        .as_deref()
+        .map(|p| p.to_string_lossy().into_owned());
     let outcome = process_result(validated_proxies, find.output, cancel, &guard).await;
     // Erase the status line before the summary so the two never share a row.
     #[cfg(feature = "progress_bar")]
@@ -627,7 +703,8 @@ where
             checked as f64 / elapsed.as_secs_f64()
         };
         eprintln!(
-            "\n{passed} valid · {failed} failed · {checked} checked in {elapsed:?} ({rate:.1}/s)"
+            "{}",
+            format_validation_stats(passed, failed, checked, elapsed, rate, dst.as_deref())
         );
     }
     outcome

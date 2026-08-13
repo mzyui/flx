@@ -81,9 +81,8 @@ impl ValidationBar {
         ) {
             return None;
         }
-        // `colored` decides by the stdout TTY, but the bar paints on stderr, so
-        // force the color choice from `--no-color` for the rest of the run.
-        colored::control::set_override(use_color(no_color));
+        // The global `colored` override is set once in `run_application`, so
+        // the bar respects `--no-color` like the end-of-run summary.
         let status = StatusLine::new(Frame::new(progress, use_color(no_color)));
         Some(Self { _status: status })
     }
