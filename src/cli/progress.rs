@@ -42,55 +42,29 @@ impl Display for Frame {
         let done = self.progress.done();
         let total = self.progress.total();
         let passed = self.progress.passed();
+        let failed = done.saturating_sub(passed);
         let elapsed = self.started.elapsed().as_secs_f64();
 
-        let fraction = if total == 0 {
-            0.0
-        } else {
-            done as f64 / total as f64
-        };
         let rate = if elapsed > 0.0 {
             done as f64 / elapsed
         } else {
             0.0
         };
-        let eta = if rate > 0.0 && done < total {
-            Some((total - done) as f64 / rate)
-        } else {
-            None
-        };
 
         if self.color {
             let ok = format!("{passed} ok").green();
+            let fail = format!("{failed} fail").red();
             write!(
                 f,
-                "{} {done}/{total} {:.0}%  {ok} ({rate:.0}/s)  {}",
+                "{} {done}/{total}  {ok} · {fail} ({rate:.0}/s)",
                 "Validating".cyan().bold(),
-                fraction * 100.0,
-                format_eta(eta),
             )
         } else {
             write!(
                 f,
-                "Validating {done}/{total} {:.0}%  {passed} ok ({rate:.0}/s)  {}",
-                fraction * 100.0,
-                format_eta(eta),
+                "Validating {done}/{total}  {passed} ok · {failed} fail ({rate:.0}/s)",
             )
         }
-    }
-}
-
-fn format_eta(secs: Option<f64>) -> String {
-    match secs {
-        Some(secs) => {
-            let secs = secs.max(0.0) as u64;
-            if secs >= 60 {
-                format!("ETA {}m {:02}s", secs / 60, secs % 60)
-            } else {
-                format!("ETA {secs}s")
-            }
-        }
-        None => "ETA --".to_owned(),
     }
 }
 
@@ -161,7 +135,7 @@ impl OutputGuard for ValidationBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_eta, show_progress, use_color, Frame};
+    use super::{show_progress, use_color, Frame};
     use fluxy::ValidationProgress;
 
     #[test]
@@ -183,9 +157,11 @@ mod tests {
         let rendered = frame.to_string();
 
         assert!(rendered.starts_with("Validating "));
-        assert!(rendered.contains(" 0/0 0%"));
-        assert!(rendered.contains("0 ok"));
-        assert!(rendered.contains("ETA --"));
+        assert!(rendered.contains(" 0/0 "));
+        assert!(rendered.contains("0 ok · 0 fail"));
+        assert!(rendered.contains("0/s"));
+        assert!(!rendered.contains('%'));
+        assert!(!rendered.contains("ETA"));
         assert!(!rendered.contains('▐') && !rendered.contains('▌'));
     }
 
@@ -199,12 +175,5 @@ mod tests {
 
         assert!(!plain.contains('\x1b'));
         assert!(colored.contains('\x1b'));
-    }
-
-    #[test]
-    fn eta_renders_minutes_and_seconds() {
-        assert_eq!(format_eta(None), "ETA --");
-        assert_eq!(format_eta(Some(42.0)), "ETA 42s");
-        assert_eq!(format_eta(Some(130.0)), "ETA 2m 10s");
     }
 }
