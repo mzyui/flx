@@ -448,45 +448,38 @@ impl GeoLookup {
     /// Looks up geographical data for an IP address.
     pub fn lookup(&self, ip: &Ipv4Addr) -> GeoData {
         let mut geodata = GeoData::default();
-        if let Ok(lookup) = self.reader.lookup::<City>(std::net::IpAddr::V4(*ip)) {
-            self.extract_country_data(&lookup, &mut geodata);
-            self.extract_region_data(&lookup, &mut geodata);
-            self.extract_city_data(&lookup, &mut geodata);
+        let Ok(result) = self.reader.lookup(std::net::IpAddr::V4(*ip)) else {
+            return geodata;
+        };
+        if let Ok(Some(city)) = result.decode::<City>() {
+            self.extract_country_data(&city, &mut geodata);
+            self.extract_region_data(&city, &mut geodata);
+            self.extract_city_data(&city, &mut geodata);
         }
         geodata
     }
 
     fn extract_country_data(&self, lookup: &City, geodata: &mut GeoData) {
-        if let Some(country) = &lookup.country {
+        let country = &lookup.country;
+        if !country.is_empty() {
             geodata.iso_code = country.iso_code.map(Box::from);
-            if let Some(country_names) = &country.names {
-                geodata.name = country_names.get("en").map(|name| Box::from(*name));
-            }
-        } else if let Some(continent) = &lookup.continent {
+            geodata.name = country.names.english.map(Box::from);
+        } else {
+            let continent = &lookup.continent;
             geodata.iso_code = continent.code.map(Box::from);
-            if let Some(continent_names) = &continent.names {
-                geodata.name = continent_names.get("en").map(|name| Box::from(*name));
-            }
+            geodata.name = continent.names.english.map(Box::from);
         }
     }
 
     fn extract_region_data(&self, lookup: &City, geodata: &mut GeoData) {
-        if let Some(subdivisions) = &lookup.subdivisions {
-            if let Some(division) = subdivisions.first() {
-                geodata.region_iso_code = division.iso_code.map(Box::from);
-                if let Some(division_names) = &division.names {
-                    geodata.region_name = division_names.get("en").map(|name| Box::from(*name));
-                }
-            }
+        if let Some(division) = lookup.subdivisions.first() {
+            geodata.region_iso_code = division.iso_code.map(Box::from);
+            geodata.region_name = division.names.english.map(Box::from);
         }
     }
 
     fn extract_city_data(&self, lookup: &City, geodata: &mut GeoData) {
-        if let Some(city) = &lookup.city {
-            if let Some(city_names) = &city.names {
-                geodata.city_name = city_names.get("en").map(|name| Box::from(*name));
-            }
-        }
+        geodata.city_name = lookup.city.names.english.map(Box::from);
     }
 }
 
