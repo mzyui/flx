@@ -37,7 +37,6 @@ use std::{
     borrow::Cow,
     fs::File,
     io::{BufRead, BufReader, Cursor, Lines, Write as _},
-    net::Ipv4Addr,
     path::PathBuf,
     sync::{Arc, LazyLock},
 };
@@ -78,7 +77,8 @@ pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// File-backed proxy source (ip:port per line).
+/// File-backed proxy source. Scheme-prefixed lines pin their own protocol;
+/// bare `ip:port` lines inherit the file's default protocol set.
 pub struct ProxySource {
     lines: Lines<BufReader<File>>,
     default_proxy_types: Arc<[Protocol]>,
@@ -147,19 +147,95 @@ impl Iterator for ProxySource {
                     continue;
                 }
             };
-            let mut parts = line.split(':');
-            if let Some(Ok(ip_address)) = parts.next().map(|part| part.parse::<Ipv4Addr>()) {
-                if let Some(Ok(port_number)) = parts.next().map(|part| part.parse::<u16>()) {
-                    let proxy = Proxy::with_expected_types(
-                        ip_address,
-                        port_number,
-                        Arc::clone(&self.default_proxy_types),
-                    );
-
-                    return Some(proxy);
-                }
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
+            let mut proxy = match line.parse::<Proxy>() {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    #[cfg(feature = "log")]
+                    log::warn!("skipped unparseable proxy file line '{line}': {error}");
+                    #[cfg(not(feature = "log"))]
+                    let _ = error;
+                    continue;
+                }
+            };
+            // A scheme prefixed line pins its protocol (`http://...` → HTTP);
+            // a bare `ip:port` line carries no scheme, so it inherits the
+            // file-wide default protocol set.
+            if proxy.expected_types.is_empty() {
+                proxy.expected_types = Arc::clone(&self.default_proxy_types);
+            }
+            return Some(proxy);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProxySource, FILE_DEFAULT_PROTOCOLS};
+    use crate::proxy::models::{Anonymity, Protocol, Proxy};
+
+    fn proxy_source(content: &str) -> (ProxySource, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "fluxy_proxy_source_test_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, content).unwrap();
+        let source = ProxySource::from_file(path.clone()).unwrap();
+        (source, path)
+    }
+
+    #[test]
+    fn bare_lines_inherit_file_default_protocols() {
+        let (source, path) = proxy_source("1.2.3.4:8080\n5.6.7.8:3128\n\n1.2.3.4:80:Country\n");
+        let proxies: Vec<Proxy> = source.collect();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(proxies.len(), 3);
+        for proxy in &proxies {
+            assert_eq!(
+                proxy.expected_types, *FILE_DEFAULT_PROTOCOLS,
+                "bare lines must inherit the file default protocol set"
+            );
+        }
+    }
+
+    #[test]
+    fn scheme_lines_pin_their_own_protocol() {
+        let (source, path) = proxy_source(
+            "http://1.2.3.4:8080\nhttps://5.6.7.8:3128\nsocks4://9.10.11.12:1080\nsocks5://13.14.15.16:1080\n",
+        );
+        let proxies: Vec<Proxy> = source.collect();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(proxies.len(), 4);
+        assert_eq!(
+            proxies[0].expected_types.as_ref(),
+            &[Protocol::Http(Anonymity::Unknown)]
+        );
+        assert_eq!(
+            proxies[1].expected_types.as_ref(),
+            &[Protocol::Https(Anonymity::Unknown)]
+        );
+        assert_eq!(proxies[2].expected_types.as_ref(), &[Protocol::Socks4]);
+        assert_eq!(proxies[3].expected_types.as_ref(), &[Protocol::Socks5]);
+    }
+
+    #[test]
+    fn mixed_lines_keep_each_lines_semantics() {
+        let (source, path) = proxy_source("socks5://1.2.3.4:1080\n5.6.7.8:8080\ngarbage\n");
+        let proxies: Vec<Proxy> = source.collect();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].expected_types.as_ref(), &[Protocol::Socks5]);
+        assert_eq!(proxies[1].expected_types, *FILE_DEFAULT_PROTOCOLS);
     }
 }
