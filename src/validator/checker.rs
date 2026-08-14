@@ -416,10 +416,8 @@ pub async fn support_http(
                 Err(_e) => {
                     #[cfg(feature = "log")]
                     log::trace!("{}: local judge unreachable: {:#}", proxy, _e);
-                    // A judge that cannot be reached once is likely still down;
-                    // cool it down so the round-robin (and every other proxy)
-                    // stops wasting an attempt and a TCP connect on it. Mirrors
-                    // the tunnel path (re-audit N2).
+                    // Cool the judge down so the round-robin stops wasting attempts on a
+                    // judge that just failed.
                     pool.report_failure(&target);
                     continue;
                 }
@@ -583,9 +581,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_returns_once_first_judge_passes() {
-        // Regression for B.49: a judge that accepts but never responds must not
-        // hold up startup — `build` returns as soon as the first candidate
-        // passes, and the straggler is left preflighting in the background.
+        // Regression test: `build` returns as soon as the first candidate passes,
+        // leaving a hanging judge preflighting in the background.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hanging_url = format!("http://{}/judge", listener.local_addr().unwrap());
         let _server = tokio::spawn(async move {
@@ -727,10 +724,8 @@ mod tests {
         format!("http://{address}/azenv.php")
     }
 
-    // Self-signed certificate + key for the F-32 end-to-end preflight test.
-    // Stored as fixtures (generated for CN=127.0.0.1 / SAN IP:127.0.0.1) and
-    // embedded at compile time. NOT a CA-signed cert, so a strict TLS client
-    // must reject it unless `--insecure` is honoured.
+    // Self-signed fixtures (CN=127.0.0.1, SAN IP:127.0.0.1) that a strict TLS
+    // client must reject unless `--insecure` is honoured.
     const SELF_SIGNED_CERT_PEM: &str = include_str!("../../tests/fixtures/self_signed_cert.pem");
     const SELF_SIGNED_KEY_PEM: &str = include_str!("../../tests/fixtures/self_signed_key.pem");
 
@@ -790,8 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn self_signed_judge_passes_preflight_with_insecure() {
-        // Regression for F-32: `--insecure` must let a self-signed judge pass
-        // preflight (it echoes the token over a TLS connection we trust).
+        // Regression test: `--insecure` must let a self-signed judge pass preflight.
         let url = spawn_self_signed_judge(true).await;
         let target = ValidationTarget::online(&url).unwrap();
         let err = target
@@ -809,8 +803,8 @@ mod tests {
 
     #[tokio::test]
     async fn self_signed_judge_is_rejected_without_insecure() {
-        // Regression for F-32: without `--insecure` the self-signed cert must
-        // be rejected during preflight.
+        // Regression test: without `--insecure` the self-signed cert must be
+        // rejected during preflight.
         let url = spawn_self_signed_judge(true).await;
         let result = JudgePool::build(
             &[url],
@@ -827,10 +821,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_online_rejects_judge_without_token_echo() {
-        // Regression for F-30 (token replay resistance): a judge that serves a
-        // 200 but does NOT echo the per-target token must be rejected. This is
-        // the property that stops a MITM from replaying a previous judge
-        // response, since the token is bound to the `ValidationTarget`.
+        // Regression test: a judge serving 200 without echoing the per-target
+        // token must be rejected (token replay resistance).
         let url = spawn_self_signed_judge(false).await;
         let target = ValidationTarget::online(&url).unwrap();
         let err = target

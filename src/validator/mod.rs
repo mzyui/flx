@@ -819,10 +819,8 @@ mod tests {
 
     #[tokio::test]
     async fn validator_drop_closes_channel_without_panic() {
-        // Regression for F-25: dropping a `ProxyValidator` must close the
-        // receiver and abort the manager task synchronously (a `Drop` cannot
-        // `.await`/join), leaving no dangling channel. We only assert it does
-        // not panic and that no proxy is delivered afterwards.
+        // Regression test: dropping a `ProxyValidator` closes the receiver and
+        // aborts the manager task synchronously without panicking.
         let config = Config {
             types: vec![Protocol::Socks5],
             ..Config::default()

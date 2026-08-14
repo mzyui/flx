@@ -109,10 +109,8 @@ impl ProxyFetcher {
         if config.concurrency_limit == 0 {
             anyhow::bail!("config.concurrency_limit must be greater than zero");
         }
-        // F-34: a country filter is meaningless without GeoIP lookup. Reject
-        // the combination up front instead of silently skipping every proxy
-        // because `accept_proxy` only applies the filter after a successful
-        // geo lookup (which never happens when GeoIP is disabled).
+        // A country filter is meaningless without GeoIP lookup, so reject the
+        // combination up front instead of silently dropping every proxy.
         if !config.countries.is_empty() && !config.enable_geo_lookup {
             anyhow::bail!(
                 "country filter requires enable_geo_lookup=true (GeoIP lookup is currently disabled)"
@@ -370,7 +368,7 @@ async fn do_work(
                     .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
                 // Only a real network fetch is worth persisting: a cache hit
                 // that re-wrote the same body to disk every run was pure
-                // write-amplification (re-audit N1).
+                // write-amplification.
                 fetch_cache.store(&url, body.as_ref()).await;
                 body
             }
@@ -651,10 +649,8 @@ mod tests {
 
     #[test]
     fn protocol_hash_preserves_protocol_set_equality() {
-        // Regression for A.4: the dedup key is now a `u64` hash of the
-        // advertised protocol set. Identical sets must hash identically (so
-        // duplicates are still caught) and distinct sets must not collide
-        // (so different protocols on the same endpoint stay distinct).
+        // Regression test: the dedup key is a `u64` hash of the advertised
+        // protocol set, so identical sets collide and distinct sets stay distinct.
         let http = Arc::from([Protocol::Http(Anonymity::Unknown)]);
         let socks5 = Arc::from([Protocol::Socks5]);
         let both = Arc::from([Protocol::Socks5, Protocol::Http(Anonymity::Unknown)]);
@@ -670,9 +666,8 @@ mod tests {
 
     #[test]
     fn dedup_table_is_bounded_and_evicts_oldest() {
-        // Regression for A.3: the dedup table has a fixed capacity and drops
-        // the oldest entry instead of growing without bound. Once evicted, an
-        // endpoint can be accepted again (the memory/semantic trade-off).
+        // Regression test: the dedup table has a fixed capacity and drops the
+        // oldest entry, so an evicted endpoint can be accepted again.
         let mut table = DedupTable::with_capacity(2);
         let base = Ipv4Addr::new(192, 0, 2, 1);
         let key = |offset: u16| (base, offset, 7u64);
@@ -739,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn gather_rejects_country_filter_without_geo_lookup() {
-        // Regression for F-34: requesting a country filter while GeoIP lookup
+        // Regression test: requesting a country filter while GeoIP lookup
         // is disabled must fail fast instead of silently dropping every proxy.
         let config = Config {
             countries: Arc::from(vec!["ID".to_owned()]),
@@ -754,29 +749,27 @@ mod tests {
 
     #[tokio::test]
     async fn gather_allows_country_filter_with_geo_lookup() {
-        // Happy path: country filter is accepted when GeoIP lookup is on.
-        // We don't actually need a working MaxMind DB here — the config check
-        // happens before `GeoLookup::new()`, so a missing DB would surface a
-        // different, acceptable error. We only assert the F-34 guard does not
-        // trip when the combination is valid.
+        // Happy path: with GeoIP on, the config check passes before
+        // `GeoLookup::new()`, so a missing DB surfaces a different error and
+        // never the guard error.
         let config = Config {
             countries: Arc::from(vec!["ID".to_owned()]),
             enable_geo_lookup: true,
             ..Config::default()
         };
-        // Expect either success or a geo-DB error, but NOT the F-34 guard error.
+        // Expect either success or a geo-DB error, but NOT the guard error.
         match ProxyFetcher::gather(config).await {
             Ok(_) => {}
             Err(e) => assert!(
                 !format!("{:#}", e).contains("enable_geo_lookup"),
-                "F-34 guard should not fire when geo lookup is enabled: {e:#}"
+                "country-filter guard should not fire when geo lookup is enabled: {e:#}"
             ),
         }
     }
 
     #[tokio::test]
     async fn finish_phase_returns_true_when_primary_completes() {
-        // Regression for F-14: when the primary phase finishes within the
+        // Regression test: when the primary phase finishes within the
         // timeout (no stall), `finish_phase` must report success so the
         // coordinator proceeds to the fallback phase with a stable primary
         // counter rather than aborting healthy tasks.

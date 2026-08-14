@@ -117,7 +117,7 @@ pub(super) async fn support_tunnel(
     let needs_anonymity = matches!(protocol, Protocol::Https(_));
 
     // Build every judge's fixed fields once per proxy instead of re-parsing
-    // each judge URL (six `String` allocations) on every attempt (B.33/B.34).
+    // each judge URL (six `String` allocations) on every attempt.
     let mut candidates = Vec::new();
     for validation_target in pool.candidates() {
         let target = JudgeTarget::from_validation_target(&validation_target)?;
@@ -175,7 +175,7 @@ pub(super) async fn support_tunnel(
                 );
                 // Put the failing judge on cooldown so subsequent attempts
                 // (and other proxies) round-robin away from it, mirroring the
-                // HTTP path's `report_failure` behaviour (F-33).
+                // HTTP path's `report_failure` behaviour.
                 pool.report_failure(validation_target);
                 cooling_down.insert(validation_target.url.clone());
             }
@@ -208,9 +208,8 @@ async fn probe_once(
         .context("tunnel validation timed out before TCP connect")?;
     let mut stream = BufReader::new(proxy.connect_timeout(remaining).await?.inner);
 
-    // CONNECT tunnels target the requested port rather than the judge's own,
-    // so only that variant pays for a rendered authority string; every other
-    // protocol reuses the one cached on the `JudgeTarget` (B.28).
+    // Only CONNECT tunnels render an authority string; other protocols reuse
+    // the one cached on the `JudgeTarget`.
     let mut authority_buf = [0u8; 64];
     let authority = match protocol {
         Protocol::Connect(port) => authority_for(&mut authority_buf, &target.host, *port),
@@ -351,8 +350,8 @@ async fn negotiate_socks5(
 }
 
 async fn read_discard(stream: &mut BufReader<TcpStream>, length: usize) -> anyhow::Result<()> {
-    // ATYP-bound addresses are at most 255 bytes (domain names); a stack
-    // buffer avoids a heap allocation per SOCKS handshake (re-audit B.32).
+    // ATYP-bound addresses are at most 255 bytes, so a stack buffer avoids a
+    // heap allocation per SOCKS handshake.
     let mut bytes = [0u8; 256];
     if length > bytes.len() {
         anyhow::bail!("SOCKS reply address exceeds 256 bytes");
@@ -394,9 +393,8 @@ async fn verify_tls_judge(
     if body.len() > MAX_JUDGE_RESPONSE_BYTES {
         anyhow::bail!("TLS judge response exceeds validation limit");
     }
-    // The marker is pure ASCII and the lossy string preserves ASCII runs, so a
-    // token echoed in the raw bytes is found by this O(n) sub-string scan
-    // (Two-Way), replacing the previous per-window byte comparison (B.24).
+    // The token is pure ASCII, so a lossy string scan finds it with one O(n)
+    // sub-string search.
     let body = String::from_utf8_lossy(&body);
     if !body.contains(&target.response_marker) {
         anyhow::bail!("response did not originate from the TLS judge");
@@ -754,8 +752,8 @@ mod tests {
 
     #[test]
     fn failed_judge_is_skipped_while_on_cooldown() {
-        // Regression for F-33: `report_failure` must put a judge on cooldown
-        // so `next()` round-robins away from it.
+        // Regression test: `report_failure` must cool the judge down so `next()`
+        // round-robins away from it.
         let targets: Vec<_> = (0..2)
             .map(|i| {
                 std::sync::Arc::new(
@@ -772,9 +770,8 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_error_path_reports_failure_without_panic() {
-        // Regression for F-33: when a tunnel probe fails, `support_tunnel`
-        // must call `report_failure` on the error path without panicking and
-        // the judge must remain in the pool (only cooled down, not dropped).
+        // Regression test: a failed tunnel probe must call `report_failure`
+        // without panicking and keep the judge in the pool.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         // Accept then drop immediately => no CONNECT/HTTP response => probe fails.

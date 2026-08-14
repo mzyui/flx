@@ -410,9 +410,8 @@ mod tests {
 
     #[test]
     fn typo_qualifier_falls_back_to_unknown_wildcard() {
-        // Regression for F-28: a misspelled anonymity qualifier (e.g.
-        // `HTTP:Elit` or `HTTPS:Anonimous`) must not invent a concrete
-        // anonymity; it falls back to `Unknown` so matching stays a wildcard.
+        // Regression test: a misspelled anonymity qualifier falls back to
+        // `Unknown` instead of inventing a concrete anonymity.
         assert_eq!(
             "HTTP:Elit".parse::<Protocol>().unwrap(),
             Protocol::Http(Anonymity::Unknown)
@@ -435,9 +434,7 @@ mod tests {
 
     #[test]
     fn geo_is_serialized_into_json_output() {
-        // Regression for F-35: `Proxy.geo` must appear in `as_json()` output
-        // (README documents the `geo` field). Previously `#[serde(skip)]`
-        // omitted it.
+        // Regression test: `Proxy.geo` must appear in `as_json()` output.
         let mut proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 40), 8080);
         proxy.geo = Arc::new(crate::geolookup::models::GeoData {
             iso_code: Some("ID".into()),
