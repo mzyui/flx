@@ -25,7 +25,7 @@ clap = { version = "4.5.22", optional = true, features = ["derive"] }
 clap_complete = { version = "4.5", optional = true }
 clap_mangen = { version = "0.2", optional = true }
 directories = "5.0.1"
-maxminddb = "0.24.0"
+maxminddb = "0.27.0"
 serde = { version = "1.0.215", features = ["derive", "rc"] }
 serde_json = "1.0.133"
 
