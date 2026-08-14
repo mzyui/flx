@@ -119,7 +119,7 @@ mod tests {
     fn temp_cache(ttl: Duration, refresh: bool) -> (Cache, PathBuf) {
         let mut dir = std::env::temp_dir();
         let unique = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        dir.push(format!("fluxy_cache_test_{}_{unique}", std::process::id()));
+        dir.push(format!("flx_cache_test_{}_{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.clone();
@@ -209,7 +209,7 @@ mod tests {
         use std::time::SystemTime;
 
         let dir = std::env::temp_dir().join(format!(
-            "fluxy_cache_tmp_test_{}_{}",
+            "flx_cache_tmp_test_{}_{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));

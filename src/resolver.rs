@@ -260,7 +260,7 @@ mod tests {
         let unique = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "fluxy_public_ip_test_{}_{unique}",
+            "flx_public_ip_test_{}_{unique}",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

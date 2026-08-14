@@ -7,8 +7,8 @@ use clap::{
 #[cfg(feature = "progress_bar")]
 use colored::Colorize;
 #[cfg(feature = "log")]
-use fluxy::initialize_logging;
-use fluxy::{
+use flx::initialize_logging;
+use flx::{
     proxy::models::{Anonymity, Protocol, Proxy},
     ProxySource, ProxyValidator,
 };
@@ -487,8 +487,8 @@ async fn write_output(
     Ok(())
 }
 
-fn fetcher_config(options: &FetcherArgs) -> fluxy::fetcher::Config {
-    fluxy::fetcher::Config {
+fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
+    flx::fetcher::Config {
         concurrency_limit: options.fetch_concurrency as usize,
         enable_geo_lookup: options.with_geo || !options.countries.is_empty(),
         countries: Arc::from(options.countries.as_slice()),
@@ -501,10 +501,10 @@ fn fetcher_config(options: &FetcherArgs) -> fluxy::fetcher::Config {
 }
 
 fn list_sources() {
-    for provider in fluxy::all_providers() {
+    for provider in flx::all_providers() {
         let tier = match provider.tier() {
-            fluxy::ProviderTier::Primary => "primary",
-            fluxy::ProviderTier::Fallback => "fallback",
+            flx::ProviderTier::Primary => "primary",
+            flx::ProviderTier::Fallback => "fallback",
         };
         eprintln!("{} ({tier}):", provider.name());
         for source in provider.sources() {
@@ -710,14 +710,14 @@ where
 }
 
 async fn run_geo_update() -> anyhow::Result<RunOutcome> {
-    match fluxy::sync_database()
+    match flx::sync_database()
         .await
         .context("failed to sync the GeoLite2 database")?
     {
-        fluxy::SyncOutcome::Synced => {
+        flx::SyncOutcome::Synced => {
             println!("GeoLite2 database synced from the P3TERX mirror");
         }
-        fluxy::SyncOutcome::UpToDate => {
+        flx::SyncOutcome::UpToDate => {
             println!("GeoLite2 database is up to date");
         }
     }
@@ -728,8 +728,8 @@ fn validator_config(
     options: &ValidatorArgs,
     protocols: Vec<Protocol>,
     groups: Vec<Vec<Protocol>>,
-) -> fluxy::validator::Config {
-    fluxy::validator::Config {
+) -> flx::validator::Config {
+    flx::validator::Config {
         types: protocols,
         groups,
         concurrency_limit: options.max_connections as usize,
@@ -793,7 +793,7 @@ fn csv_quote(buf: &mut Vec<u8>, field: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxy::proxy::models::Anonymity;
+    use flx::proxy::models::Anonymity;
     use futures_util::stream;
 
     fn fetch_from(args: &[&str]) -> FetchArgs {
@@ -959,7 +959,7 @@ mod tests {
 
     fn output_options(format: &str, limit: usize) -> (OutputOptions, std::path::PathBuf) {
         let out = std::env::temp_dir().join(format!(
-            "fluxy_json_test_{}_{}.json",
+            "flx_json_test_{}_{}.json",
             std::process::id(),
             uuidish()
         ));

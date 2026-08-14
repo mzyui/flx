@@ -1,4 +1,4 @@
-//! High-level [`Fluxy`] builder facade.
+//! High-level [`Flx`] builder facade.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -25,10 +25,10 @@ enum SourceKind {
 /// Fetch from the built-in providers and validate them as HTTP proxies:
 ///
 /// ```no_run
-/// use fluxy::{Anonymity, Fluxy, Protocol};
+/// use flx::{Anonymity, Flx, Protocol};
 ///
 /// # async fn example() -> anyhow::Result<()> {
-/// let proxies = Fluxy::fetch()
+/// let proxies = Flx::fetch()
 ///     .types([Protocol::Http(Anonymity::Elite)])
 ///     .limit(20)
 ///     .collect()
@@ -40,24 +40,24 @@ enum SourceKind {
 /// Validate an existing `ip:port` file:
 ///
 /// ```no_run
-/// use fluxy::{Fluxy, Protocol};
+/// use flx::{Flx, Protocol};
 ///
 /// # async fn example() -> anyhow::Result<()> {
-/// let proxies = Fluxy::from_file("proxies.txt")?
+/// let proxies = Flx::from_file("proxies.txt")?
 ///     .types([Protocol::Socks5])
 ///     .collect()
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Fluxy {
+pub struct Flx {
     source: SourceKind,
     fetcher_config: FetcherConfig,
     validator_config: ValidatorConfig,
     limit: usize,
 }
 
-impl Default for Fluxy {
+impl Default for Flx {
     fn default() -> Self {
         Self {
             source: SourceKind::Fetcher,
@@ -68,7 +68,7 @@ impl Default for Fluxy {
     }
 }
 
-impl Fluxy {
+impl Flx {
     /// Starts a builder that scrapes the built-in provider set.
     pub fn fetch() -> Self {
         Self::default()
@@ -177,7 +177,7 @@ impl Fluxy {
 
     /// Runs the pipeline with live validation counters.
     pub async fn stream_with_progress(self) -> anyhow::Result<(BoxStream, ValidationProgress)> {
-        let Fluxy {
+        let Flx {
             source,
             fetcher_config,
             validator_config,
@@ -221,91 +221,91 @@ impl Fluxy {
 
 #[cfg(test)]
 mod tests {
-    use super::Fluxy;
+    use super::Flx;
     use crate::proxy::models::{Anonymity, Protocol};
     use futures_util::StreamExt;
 
     #[test]
     fn fetch_defaults_to_no_validation() {
-        assert!(Fluxy::fetch().validator_config.types.is_empty());
+        assert!(Flx::fetch().validator_config.types.is_empty());
     }
 
     #[test]
     fn types_land_in_validator_config() {
-        let fluxy = Fluxy::fetch().types([Protocol::Http(Anonymity::Elite)]);
+        let flx = Flx::fetch().types([Protocol::Http(Anonymity::Elite)]);
         assert_eq!(
-            fluxy.validator_config.types,
+            flx.validator_config.types,
             vec![Protocol::Http(Anonymity::Elite)]
         );
     }
 
     #[test]
     fn groups_land_in_validator_config() {
-        let fluxy = Fluxy::fetch().groups(vec![vec![
+        let flx = Flx::fetch().groups(vec![vec![
             Protocol::Http(Anonymity::Unknown),
             Protocol::Https(Anonymity::Unknown),
         ]]);
         assert_eq!(
-            fluxy.validator_config.groups,
+            flx.validator_config.groups,
             vec![vec![
                 Protocol::Http(Anonymity::Unknown),
                 Protocol::Https(Anonymity::Unknown)
             ]]
         );
-        assert!(fluxy.validator_config.types.is_empty());
+        assert!(flx.validator_config.types.is_empty());
     }
 
     #[test]
     fn concurrency_touches_only_the_validator() {
-        let fluxy = Fluxy::fetch().concurrency(99);
-        assert_eq!(fluxy.validator_config.concurrency_limit, 99);
-        assert_eq!(fluxy.fetcher_config.concurrency_limit, 25);
+        let flx = Flx::fetch().concurrency(99);
+        assert_eq!(flx.validator_config.concurrency_limit, 99);
+        assert_eq!(flx.fetcher_config.concurrency_limit, 25);
     }
 
     #[test]
     fn fetch_concurrency_touches_only_the_fetcher() {
-        let fluxy = Fluxy::fetch().fetch_concurrency(42);
-        assert_eq!(fluxy.fetcher_config.concurrency_limit, 42);
-        assert_eq!(fluxy.validator_config.concurrency_limit, 500);
+        let flx = Flx::fetch().fetch_concurrency(42);
+        assert_eq!(flx.fetcher_config.concurrency_limit, 42);
+        assert_eq!(flx.validator_config.concurrency_limit, 500);
     }
 
     #[test]
     fn facade_defaults_match_cli_defaults() {
-        let fluxy = Fluxy::fetch();
+        let flx = Flx::fetch();
         assert_eq!(
-            fluxy.fetcher_config.concurrency_limit,
+            flx.fetcher_config.concurrency_limit,
             crate::fetcher::DEFAULT_CONCURRENCY_LIMIT
         );
         assert_eq!(
-            fluxy.validator_config.concurrency_limit,
+            flx.validator_config.concurrency_limit,
             crate::validator::DEFAULT_CONCURRENCY_LIMIT
         );
         assert_eq!(
-            fluxy.fetcher_config.cache_ttl,
+            flx.fetcher_config.cache_ttl,
             Some(std::time::Duration::from_secs(15 * 60))
         );
     }
 
     #[test]
     fn countries_imply_geo_lookup() {
-        let fluxy = Fluxy::fetch().countries(["ID".to_owned()]);
-        assert!(fluxy.fetcher_config.enable_geo_lookup);
-        assert_eq!(fluxy.fetcher_config.countries.as_ref(), ["ID".to_owned()]);
+        let flx = Flx::fetch().countries(["ID".to_owned()]);
+        assert!(flx.fetcher_config.enable_geo_lookup);
+        assert_eq!(flx.fetcher_config.countries.as_ref(), ["ID".to_owned()]);
     }
 
     #[test]
     fn with_geo_enables_lookup_without_filtering() {
-        let fluxy = Fluxy::fetch().with_geo();
-        assert!(fluxy.fetcher_config.enable_geo_lookup);
-        assert!(fluxy.fetcher_config.countries.is_empty());
+        let flx = Flx::fetch().with_geo();
+        assert!(flx.fetcher_config.enable_geo_lookup);
+        assert!(flx.fetcher_config.countries.is_empty());
     }
 
     #[test]
     fn cache_ttl_zero_disables_cache() {
-        let disabled = Fluxy::fetch().cache_ttl(0);
+        let disabled = Flx::fetch().cache_ttl(0);
         assert!(disabled.fetcher_config.cache_ttl.is_none());
 
-        let enabled = Fluxy::fetch().cache_ttl(10);
+        let enabled = Flx::fetch().cache_ttl(10);
         assert_eq!(
             enabled.fetcher_config.cache_ttl,
             Some(std::time::Duration::from_secs(600))
@@ -314,13 +314,13 @@ mod tests {
 
     #[test]
     fn limit_is_stored() {
-        assert_eq!(Fluxy::fetch().limit(5).limit, 5);
+        assert_eq!(Flx::fetch().limit(5).limit, 5);
     }
 
     #[tokio::test]
     async fn from_file_collects_proxies_without_validation() {
         let path = std::env::temp_dir().join(format!(
-            "fluxy_lib_test_{}_{}.txt",
+            "flx_lib_test_{}_{}.txt",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -329,7 +329,7 @@ mod tests {
         ));
         std::fs::write(&path, "192.0.2.1:8080\n192.0.2.2:3128\ngarbage\n").unwrap();
 
-        let proxies = Fluxy::from_file(&path).unwrap().collect().await.unwrap();
+        let proxies = Flx::from_file(&path).unwrap().collect().await.unwrap();
 
         let _ = std::fs::remove_file(&path);
         assert_eq!(proxies.len(), 2);
@@ -340,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn from_file_limit_truncates_the_output() {
         let path = std::env::temp_dir().join(format!(
-            "fluxy_lib_test_limit_{}_{}.txt",
+            "flx_lib_test_limit_{}_{}.txt",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -349,7 +349,7 @@ mod tests {
         ));
         std::fs::write(&path, "192.0.2.1:8080\n192.0.2.2:3128\n192.0.2.3:80\n").unwrap();
 
-        let proxies = Fluxy::from_file(&path)
+        let proxies = Flx::from_file(&path)
             .unwrap()
             .limit(2)
             .collect()
@@ -365,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn stream_with_progress_without_validation_returns_zeroed_counters() {
         let path = std::env::temp_dir().join(format!(
-            "fluxy_lib_test_progress_{}_{}.txt",
+            "flx_lib_test_progress_{}_{}.txt",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -374,7 +374,7 @@ mod tests {
         ));
         std::fs::write(&path, "192.0.2.1:8080\n").unwrap();
 
-        let (mut stream, progress) = Fluxy::from_file(&path)
+        let (mut stream, progress) = Flx::from_file(&path)
             .unwrap()
             .stream_with_progress()
             .await

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use fluxy::providers::parsers::visit_plaintext;
+use flx::providers::parsers::visit_plaintext;
 
 fn large_plaintext_body() -> String {
     let mut body = String::with_capacity(5 * 1024 * 1024);

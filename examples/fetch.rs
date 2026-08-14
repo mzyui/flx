@@ -1,6 +1,6 @@
 //! Fetch proxies and print them as ip:port.
 
-use fluxy::Fluxy;
+use flx::Flx;
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     let long = format!("--{name}");
@@ -29,14 +29,14 @@ async fn main() -> anyhow::Result<()> {
             "trace" => log::LevelFilter::Trace,
             _ => log::LevelFilter::Off,
         };
-        fluxy::initialize_logging(level)?;
+        flx::initialize_logging(level)?;
     }
 
     let limit = flag(&args, "limit")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10);
 
-    let proxies = Fluxy::fetch().limit(limit).collect().await?;
+    let proxies = Flx::fetch().limit(limit).collect().await?;
     for proxy in &proxies {
         println!("{}", proxy.as_text());
     }

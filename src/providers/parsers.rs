@@ -15,7 +15,7 @@ use serde::{
 use crate::proxy::models::{Anonymity, Protocol};
 
 pub type ParsedProxy = (Ipv4Addr, u16, Option<Protocol>);
-const VISITOR_STOPPED: &str = "fluxy parser visitor stopped";
+const VISITOR_STOPPED: &str = "flx parser visitor stopped";
 
 struct JsonDataSeed<'a, T, F> {
     visit: &'a mut F,

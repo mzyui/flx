@@ -89,7 +89,7 @@ impl TypedValueParser for TypesValueParser {
 #[derive(Parser, Debug)]
 #[command(
     name = "flx",
-    after_help = "Suggestions and bug reports are greatly appreciated:\nhttps://github.com/zevtyardt/fluxy/issues",
+    after_help = "Suggestions and bug reports are greatly appreciated:\nhttps://github.com/zevtyardt/flx/issues",
     styles=get_styles()
 )]
 pub struct Cli {
@@ -186,7 +186,7 @@ pub struct FetcherArgs {
     #[arg(
         long,
         help_heading = "Advanced",
-        default_value_t = fluxy::fetcher::DEFAULT_CONCURRENCY_LIMIT as u64,
+        default_value_t = flx::fetcher::DEFAULT_CONCURRENCY_LIMIT as u64,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub fetch_concurrency: u64,
@@ -196,7 +196,7 @@ pub struct FetcherArgs {
     #[arg(
         long,
         help_heading = "Advanced",
-        default_value_t = fluxy::fetcher::DEFAULT_CACHE_TTL_MINUTES,
+        default_value_t = flx::fetcher::DEFAULT_CACHE_TTL_MINUTES,
         value_parser = clap::value_parser!(u64)
     )]
     pub cache_ttl: u64,
@@ -236,7 +236,7 @@ pub struct ValidatorArgs {
         short,
         long,
         help_heading = "Advanced",
-        default_value_t = fluxy::validator::DEFAULT_CONCURRENCY_LIMIT as u64,
+        default_value_t = flx::validator::DEFAULT_CONCURRENCY_LIMIT as u64,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub max_connections: u64,

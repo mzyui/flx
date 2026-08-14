@@ -520,7 +520,7 @@ mod tests {
 
     fn test_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "fluxy_geoip_{name}_{}_{}.mmdb",
+            "flx_geoip_{name}_{}_{}.mmdb",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ))

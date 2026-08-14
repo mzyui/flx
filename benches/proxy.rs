@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use fluxy::proxy::models::Proxy;
-use fluxy::validator::checker::classify_anonymity;
+use flx::proxy::models::Proxy;
+use flx::validator::checker::classify_anonymity;
 use std::net::Ipv4Addr;
 
 fn bench_classify_anonymity(c: &mut Criterion) {

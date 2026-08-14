@@ -6,7 +6,7 @@ use std::{
 };
 
 use colored::Colorize;
-use fluxy::ValidationProgress;
+use flx::ValidationProgress;
 use status_line::StatusLine;
 
 use crate::OutputGuard;
@@ -111,7 +111,7 @@ impl OutputGuard for ValidationBar {
 #[cfg(test)]
 mod tests {
     use super::{show_progress, use_color, Frame};
-    use fluxy::ValidationProgress;
+    use flx::ValidationProgress;
 
     #[test]
     fn progress_is_hidden_when_quiet_or_not_a_terminal() {

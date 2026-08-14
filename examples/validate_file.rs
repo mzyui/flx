@@ -1,6 +1,6 @@
 //! Validate an ip:port file and print the survivors.
 
-use fluxy::{Fluxy, Protocol};
+use flx::{Flx, Protocol};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
         .parse::<Protocol>()
         .expect("invalid protocol; try HTTP, HTTPS, SOCKS4, SOCKS5");
 
-    let proxies = Fluxy::from_file(path)?.types([protocol]).collect().await?;
+    let proxies = Flx::from_file(path)?.types([protocol]).collect().await?;
     for proxy in &proxies {
         println!("{proxy}");
     }

@@ -1,6 +1,6 @@
 //! Fetch proxies, validate them as HTTP, and print the survivors.
 
-use fluxy::{Anonymity, Fluxy, Protocol};
+use flx::{Anonymity, Flx, Protocol};
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     let long = format!("--{name}");
@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
             "trace" => log::LevelFilter::Trace,
             _ => log::LevelFilter::Off,
         };
-        fluxy::initialize_logging(level)?;
+        flx::initialize_logging(level)?;
     }
 
     let limit = flag(&args, "limit")
@@ -37,14 +37,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(20);
     let country = flag(&args, "country");
 
-    let mut fluxy = Fluxy::fetch()
+    let mut flx = Flx::fetch()
         .types([Protocol::Http(Anonymity::Unknown)])
         .limit(limit);
     if let Some(country) = country {
-        fluxy = fluxy.countries([country]);
+        flx = flx.countries([country]);
     }
 
-    let proxies = fluxy.collect().await?;
+    let proxies = flx.collect().await?;
     for proxy in &proxies {
         println!("{proxy}");
     }

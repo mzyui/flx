@@ -3,11 +3,11 @@
 //! # Example
 //!
 //! ```no_run
-//! use fluxy::{Anonymity, Fluxy, Protocol};
+//! use flx::{Anonymity, Flx, Protocol};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let proxies = Fluxy::fetch()
+//!     let proxies = Flx::fetch()
 //!         .types([Protocol::Http(Anonymity::Elite)])
 //!         .limit(20)
 //!         .collect()
@@ -43,7 +43,7 @@ use std::{
 
 // ── Root re-exports ───────────────────────────────────────────────────
 
-pub use api::Fluxy;
+pub use api::Flx;
 pub use error::{ProtocolParseError, ProxyParseError};
 pub use fetcher::{Config as FetcherConfig, ProxyFetcher};
 pub use geolookup::models::GeoData;
@@ -59,9 +59,9 @@ pub use validator::{
 /// Convenience glob for common types.
 pub mod prelude {
     pub use crate::{
-        all_providers, sync_database, Anonymity, FetcherConfig, Fluxy, GeoData, GeoLookup,
-        Protocol, Proxy, ProxyFetcher, ProxyParseError, ProxySource, ProxyType, ProxyValidator,
-        RuntimeStats, ScrapeMode, Source, SyncOutcome, ValidationProgress, ValidatorConfig,
+        all_providers, sync_database, Anonymity, FetcherConfig, Flx, GeoData, GeoLookup, Protocol,
+        Proxy, ProxyFetcher, ProxyParseError, ProxySource, ProxyType, ProxyValidator, RuntimeStats,
+        ScrapeMode, Source, SyncOutcome, ValidationProgress, ValidatorConfig,
     };
 }
 
@@ -180,7 +180,7 @@ mod tests {
 
     fn proxy_source(content: &str) -> (ProxySource, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
-            "fluxy_proxy_source_test_{}_{}.txt",
+            "flx_proxy_source_test_{}_{}.txt",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
