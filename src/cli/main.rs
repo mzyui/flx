@@ -814,6 +814,12 @@ async fn run_find(
     )
     .await
     .context("failed to start proxy validator")?;
+    if !quiet {
+        let health = pass1.judge_health();
+        if !health.failed.is_empty() {
+            eprintln!("{}", format_judge_health(health));
+        }
+    }
     let progress1 = pass1.progress();
     let started = std::time::Instant::now();
     let dst: Option<String> = find
@@ -899,6 +905,28 @@ async fn run_find(
         quiet,
     );
     outcome1
+}
+
+fn format_judge_health(report: &flx::JudgeHealthReport) -> String {
+    let mut reasons: Vec<&str> = report
+        .failed
+        .iter()
+        .map(|(_, reason)| reason.as_str())
+        .collect();
+    reasons.sort_unstable();
+    reasons.dedup();
+    let suffix = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", reasons.join("; "))
+    };
+    format!(
+        "{}/{} judges healthy; {} failed{}",
+        report.healthy,
+        report.candidates,
+        report.failed.len(),
+        suffix
+    )
 }
 
 fn report_validation_summary(
@@ -1842,6 +1870,22 @@ mod tests {
         assert_eq!(args.output.order, "desc");
         assert!(Cli::try_parse_from(["flx", "find", "--sort", "bogus"]).is_err());
         assert!(Cli::try_parse_from(["flx", "find", "--order", "sideways"]).is_err());
+    }
+
+    #[test]
+    fn format_judge_health_renders_compact_summary() {
+        let report = flx::JudgeHealthReport {
+            candidates: 4,
+            healthy: 1,
+            failed: vec![
+                ("http://a".to_owned(), "timeout".to_owned()),
+                ("http://b".to_owned(), "timeout".to_owned()),
+            ],
+        };
+        assert_eq!(
+            format_judge_health(&report),
+            "1/4 judges healthy; 2 failed (timeout)"
+        );
     }
 
     #[test]

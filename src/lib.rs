@@ -53,15 +53,17 @@ pub use providers::models::{ProviderTier, ScrapeMode, Source};
 pub use providers::ProxyProvider;
 pub use proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
 pub use validator::{
-    Config as ValidatorConfig, ProxyValidator, ValidationProgress, ValidationStatus,
+    Config as ValidatorConfig, JudgeHealthReport, ProxyValidator, ValidationProgress,
+    ValidationStatus,
 };
 
 /// Convenience glob for common types.
 pub mod prelude {
     pub use crate::{
-        all_providers, sync_database, Anonymity, FetcherConfig, Flx, GeoData, GeoLookup, Protocol,
-        Proxy, ProxyFetcher, ProxyParseError, ProxySource, ProxyType, ProxyValidator, RuntimeStats,
-        ScrapeMode, Source, SyncOutcome, ValidationProgress, ValidatorConfig,
+        all_providers, sync_database, Anonymity, FetcherConfig, Flx, GeoData, GeoLookup,
+        JudgeHealthReport, Protocol, Proxy, ProxyFetcher, ProxyParseError, ProxySource, ProxyType,
+        ProxyValidator, RuntimeStats, ScrapeMode, Source, SyncOutcome, ValidationProgress,
+        ValidatorConfig,
     };
 }
 

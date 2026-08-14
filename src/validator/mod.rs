@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
     time::Duration,
@@ -39,6 +39,22 @@ fn report_dropped(url: &str, reason: &str) {
     log::warn!("warning: judge `{url}` failed preflight and was dropped: {reason}");
     #[cfg(not(feature = "log"))]
     let _ = (url, reason);
+}
+
+/// Snapshot of judge preflight results at validator startup.
+#[derive(Debug, Clone, Default)]
+pub struct JudgeHealthReport {
+    pub candidates: usize,
+    pub healthy: usize,
+    pub failed: Vec<(String, String)>,
+}
+
+impl JudgeHealthReport {
+    fn merge(&mut self, other: &JudgeHealthReport) {
+        self.candidates += other.candidates;
+        self.healthy += other.healthy;
+        self.failed.extend(other.failed.iter().cloned());
+    }
 }
 
 /// Validation progress counters.
@@ -80,6 +96,7 @@ impl ValidationProgress {
 pub struct ProxyValidator {
     receiver: mpsc::Receiver<Proxy>,
     progress: ValidationProgress,
+    judge_health: JudgeHealthReport,
     #[cfg(feature = "log")]
     timer: Instant,
     task_handle: JoinHandle<()>,
@@ -319,12 +336,13 @@ async fn aggregate_groups(
 }
 
 // Builds a judge pool, retrying the whole preflight once after a short delay
-// so a transient network blip cannot abort the run.
+// so a transient network blip cannot abort the run. Returns the pool plus a
+// snapshot of which candidate judges passed or failed preflight.
 async fn preflight_pool(
     urls: &[String],
     timeout: Duration,
     insecure: bool,
-) -> anyhow::Result<Arc<checker::JudgePool>> {
+) -> anyhow::Result<(Arc<checker::JudgePool>, JudgeHealthReport)> {
     const PREFLIGHT_RETRIES: usize = 1;
     const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
     let mut last_error: Option<anyhow::Error> = None;
@@ -332,12 +350,47 @@ async fn preflight_pool(
         if attempt > 0 {
             tokio::time::sleep(PREFLIGHT_RETRY_DELAY).await;
         }
-        match checker::JudgePool::build(urls, timeout, insecure, report_dropped).await {
-            Ok(pool) => return Ok(pool),
+        let failed: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let failed_cb = Arc::clone(&failed);
+        match checker::JudgePool::build(urls, timeout, insecure, move |url, reason| {
+            report_dropped(url, reason);
+            failed_cb
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((url.to_owned(), reason.to_owned()));
+        })
+        .await
+        {
+            Ok(pool) => {
+                let candidates = unique_count(urls);
+                // `build` returns as soon as the first judge passes, so the
+                // remaining preflights settle in the background; snapshot the
+                // report only once every candidate has resolved.
+                let deadline = tokio::time::Instant::now() + timeout + Duration::from_secs(1);
+                loop {
+                    let failed_len = failed.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    if pool.len() + failed_len >= candidates
+                        || tokio::time::Instant::now() >= deadline
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                let report = JudgeHealthReport {
+                    candidates,
+                    healthy: pool.len(),
+                    failed: failed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                };
+                return Ok((pool, report));
+            }
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.expect("preflight_pool always runs at least one attempt"))
+}
+
+fn unique_count(urls: &[String]) -> usize {
+    urls.iter().collect::<std::collections::HashSet<_>>().len()
 }
 
 impl ProxyValidator {
@@ -425,37 +478,52 @@ impl ProxyValidator {
 
         let http_preflight = async {
             if !need_http {
-                return Ok::<Option<Arc<checker::JudgePool>>, anyhow::Error>(None);
+                return Ok::<Option<(Arc<checker::JudgePool>, JudgeHealthReport)>, anyhow::Error>(
+                    None,
+                );
             }
-            let pool = preflight_pool(&config.http_judge_urls, preflight_timeout, insecure)
-                .await
-                .context("HTTP online judge pool is empty after preflight")?;
-            Ok::<_, anyhow::Error>(Some(pool))
+            let (pool, report) =
+                preflight_pool(&config.http_judge_urls, preflight_timeout, insecure)
+                    .await
+                    .context("HTTP online judge pool is empty after preflight")?;
+            Ok::<_, anyhow::Error>(Some((pool, report)))
         };
         let tunnel_preflight = async {
             if !need_tunnel {
-                return Ok::<Option<Arc<checker::JudgePool>>, anyhow::Error>(None);
+                return Ok::<Option<(Arc<checker::JudgePool>, JudgeHealthReport)>, anyhow::Error>(
+                    None,
+                );
             }
-            let pool = preflight_pool(&config.https_judge_urls, preflight_timeout, insecure)
-                .await
-                .context("HTTPS online judge pool is empty after preflight")?;
-            Ok::<_, anyhow::Error>(Some(pool))
+            let (pool, report) =
+                preflight_pool(&config.https_judge_urls, preflight_timeout, insecure)
+                    .await
+                    .context("HTTPS online judge pool is empty after preflight")?;
+            Ok::<_, anyhow::Error>(Some((pool, report)))
         };
         let (http_target, tunnel_target) = tokio::join!(http_preflight, tunnel_preflight);
         let http_target = http_target?;
         let tunnel_target = tunnel_target?;
+        let mut judge_health = JudgeHealthReport::default();
+        if let Some((_, report)) = http_target.as_ref() {
+            judge_health.merge(report);
+        }
+        if let Some((_, report)) = tunnel_target.as_ref() {
+            judge_health.merge(report);
+        }
         #[cfg(feature = "log")]
-        if let Some(pool) = http_target.as_ref() {
+        if let Some((pool, _)) = http_target.as_ref() {
             log::info!("using {} healthy HTTP judge(s)", pool.len());
         }
         #[cfg(feature = "log")]
-        if let Some(pool) = tunnel_target.as_ref() {
+        if let Some((pool, _)) = tunnel_target.as_ref() {
             log::info!("using {} healthy HTTPS judge(s)", pool.len());
         }
         let targets = JudgeTargets {
             http: http_target
+                .map(|(pool, _)| pool)
                 .unwrap_or_else(|| Arc::new(checker::JudgePool::from_targets(Vec::new()))),
             tunnel: tunnel_target
+                .map(|(pool, _)| pool)
                 .unwrap_or_else(|| Arc::new(checker::JudgePool::from_targets(Vec::new()))),
         };
 
@@ -709,11 +777,17 @@ impl ProxyValidator {
         Ok(Self {
             receiver,
             progress,
+            judge_health,
             #[cfg(feature = "log")]
             timer: Instant::now(),
             task_handle: manager,
             group_task: group_aggregator,
         })
+    }
+
+    /// Judge preflight results collected while the validator started.
+    pub fn judge_health(&self) -> &JudgeHealthReport {
+        &self.judge_health
     }
 
     pub fn progress(&self) -> ValidationProgress {
@@ -927,6 +1001,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn judge_health_reports_preflight_failures() {
+        let good = spawn_echo_judge().await;
+        let bad = spawn_no_echo_judge().await;
+        let config = Config {
+            types: vec![Protocol::Http(Anonymity::Unknown)],
+            http_judge_urls: vec![good, bad],
+            https_judge_urls: vec![],
+            ..Config::default()
+        };
+        let validator =
+            ProxyValidator::validate(futures_util::stream::iter(Vec::<Proxy>::new()), config)
+                .await
+                .unwrap();
+
+        let report = validator.judge_health();
+        assert_eq!(report.candidates, 2);
+        assert_eq!(report.healthy, 1);
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].1.contains("did not echo"));
+    }
+
+    #[tokio::test]
     async fn judge_preflight_retries_after_transient_failure() {
         // Offline-safe: the judge drops the first connection and echoes the
         // token on the second, so preflight must retry once to pass.
@@ -1032,6 +1128,29 @@ mod tests {
             }
             if let Ok((stream, _)) = listener.accept().await {
                 serve_echo_judge(stream).await;
+            }
+        });
+        format!("http://{address}/azenv.php")
+    }
+
+    // Spawns a judge that answers 200 without echoing the request token, so
+    // its preflight fails with a "did not echo" reason.
+    async fn spawn_no_echo_judge() -> String {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nno echo",
+                    )
+                    .await;
             }
         });
         format!("http://{address}/azenv.php")
