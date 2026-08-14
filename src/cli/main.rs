@@ -91,7 +91,8 @@ fn format_validation_stats(
     let v = format!("{valid} valid").green();
     let f = format!("{failed} failed").red();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
-    format!("\n{v} · {f} · {checked} checked in {elapsed:?} ({rate:.1}/s){suffix}")
+    let lead = if dst.is_some() { "" } else { "\n" };
+    format!("{lead}{v} · {f} · {checked} checked in {elapsed:?} ({rate:.1}/s){suffix}")
 }
 
 #[cfg(not(feature = "progress_bar"))]
@@ -104,7 +105,8 @@ fn format_validation_stats(
     dst: Option<&str>,
 ) -> String {
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
-    format!("\n{valid} valid · {failed} failed · {checked} checked in {elapsed:?} ({rate:.1}/s){suffix}")
+    let lead = if dst.is_some() { "" } else { "\n" };
+    format!("{lead}{valid} valid · {failed} failed · {checked} checked in {elapsed:?} ({rate:.1}/s){suffix}")
 }
 
 /// Formats the end-of-run line for `grab`, colored under the `progress_bar`
@@ -118,7 +120,8 @@ fn format_gathered_stats(
 ) -> String {
     let n = format!("{gathered} proxies").green();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
-    format!("\nGathered {n} in {elapsed:?} ({rate:.1}/s){suffix}")
+    let lead = if dst.is_some() { "" } else { "\n" };
+    format!("{lead}Gathered {n} in {elapsed:?} ({rate:.1}/s){suffix}")
 }
 
 #[cfg(not(feature = "progress_bar"))]
@@ -129,7 +132,8 @@ fn format_gathered_stats(
     dst: Option<&str>,
 ) -> String {
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
-    format!("\nGathered {gathered} proxies in {elapsed:?} ({rate:.1}/s){suffix}")
+    let lead = if dst.is_some() { "" } else { "\n" };
+    format!("{lead}Gathered {gathered} proxies in {elapsed:?} ({rate:.1}/s){suffix}")
 }
 
 #[cfg(unix)]
