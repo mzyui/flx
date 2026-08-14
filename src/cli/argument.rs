@@ -254,6 +254,10 @@ pub struct FetcherArgs {
     #[arg(long)]
     pub source_url: Vec<String>,
 
+    /// Serve providers only from the local cache; skip anything uncached.
+    #[arg(long, default_value_t = false)]
+    pub offline: bool,
+
     /// List the providers and sources that would be fetched, then exit.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,

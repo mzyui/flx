@@ -51,7 +51,7 @@ impl Cache {
         Ok(Self::new_at(dir, ttl, refresh))
     }
 
-    fn new_at(dir: PathBuf, ttl: Duration, refresh: bool) -> Self {
+    pub(crate) fn new_at(dir: PathBuf, ttl: Duration, refresh: bool) -> Self {
         Self { dir, ttl, refresh }
     }
 

@@ -151,6 +151,12 @@ impl Flx {
         self
     }
 
+    /// Serve providers only from the local cache, skipping uncached sources.
+    pub fn offline(mut self) -> Self {
+        self.fetcher_config.offline = true;
+        self
+    }
+
     /// Custom HTTP judges for plain HTTP validation.
     pub fn http_judges(mut self, urls: impl Into<Vec<String>>) -> Self {
         self.validator_config.http_judge_urls = urls.into();
@@ -321,6 +327,12 @@ mod tests {
     #[test]
     fn limit_is_stored() {
         assert_eq!(Flx::fetch().limit(5).limit, 5);
+    }
+
+    #[test]
+    fn offline_mode_is_stored() {
+        assert!(!Flx::fetch().fetcher_config.offline);
+        assert!(Flx::fetch().offline().fetcher_config.offline);
     }
 
     #[tokio::test]

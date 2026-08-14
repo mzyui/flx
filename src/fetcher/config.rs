@@ -12,6 +12,7 @@ pub struct Config {
     pub providers: Arc<[String]>,
     pub excluded_providers: Arc<[String]>,
     pub custom_sources: Arc<[String]>,
+    pub offline: bool,
 }
 
 impl Config {
@@ -43,6 +44,7 @@ impl Default for Config {
             providers: Arc::from(Vec::new()),
             excluded_providers: Arc::from(Vec::new()),
             custom_sources: Arc::from(Vec::new()),
+            offline: false,
         }
     }
 }

@@ -188,6 +188,7 @@ impl ProxyFetcher {
         );
         let concurrency_limit = config.concurrency_limit;
         let fallback_threshold = config.fallback_threshold;
+        let offline = config.offline;
 
         // The local body cache is optional and best-effort: if the cache dir
         // cannot be prepared the run simply proceeds without caching.
@@ -234,6 +235,7 @@ impl ProxyFetcher {
                     sender.clone(),
                     stop_rx_primary,
                     fetch_cache.clone(),
+                    offline,
                 );
 
                 let mut primary_aborted = false;
@@ -303,6 +305,7 @@ impl ProxyFetcher {
                     sender,
                     stop_rx_fallback,
                     fetch_cache,
+                    offline,
                 );
                 while fallback_handles.join_next().await.is_some() {}
             }
@@ -345,6 +348,7 @@ fn spawn_phase(
     tx: mpsc::Sender<Proxy>,
     stop_rx: watch::Receiver<bool>,
     fetch_cache: Option<Arc<cache::Cache>>,
+    offline: bool,
 ) -> JoinSet<()> {
     let mut handles = JoinSet::new();
     for (source, provider) in tasks {
@@ -356,8 +360,19 @@ fn spawn_phase(
 
         handles.spawn(async move {
             let url = source.url.to_string();
-            if let Err(e) =
-                do_work(provider, client, source, tx, permit, stop_rx, fetch_cache).await
+            if let Err(e) = do_work(
+                provider,
+                client,
+                source,
+                tx,
+                permit,
+                stop_rx,
+                FetchSettings {
+                    fetch_cache,
+                    offline,
+                },
+            )
+            .await
             {
                 #[cfg(feature = "log")]
                 log::error!("{}: {}", url, e);
@@ -368,6 +383,12 @@ fn spawn_phase(
     handles
 }
 
+/// Fetch behaviour shared by every source task.
+struct FetchSettings {
+    fetch_cache: Option<Arc<cache::Cache>>,
+    offline: bool,
+}
+
 async fn do_work(
     provider: Arc<dyn ProxyProvider + Send + Sync>,
     client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
@@ -375,21 +396,26 @@ async fn do_work(
     tx: mpsc::Sender<Proxy>,
     sem: Arc<Semaphore>,
     stop_rx: watch::Receiver<bool>,
-    fetch_cache: Option<Arc<cache::Cache>>,
+    settings: FetchSettings,
 ) -> anyhow::Result<()> {
     if *stop_rx.borrow() {
         return Ok(());
     }
     let url = source.url.to_string();
 
-    let html = if let Some(fetch_cache) = fetch_cache.as_ref() {
-        match fetch_cache.load(&url).await {
+    let html = match settings.fetch_cache.as_ref() {
+        Some(fetch_cache) => match fetch_cache.load(&url).await {
             Some(body) => {
                 #[cfg(feature = "log")]
                 log::debug!("using cached body for {url}");
                 Cow::Owned(body)
             }
             None => {
+                if settings.offline {
+                    #[cfg(feature = "log")]
+                    log::warn!("offline: no cached body for {url}; skipping");
+                    return Ok(());
+                }
                 let _permit = sem
                     .acquire()
                     .await
@@ -404,16 +430,22 @@ async fn do_work(
                 fetch_cache.store(&url, body.as_ref()).await;
                 body
             }
+        },
+        None => {
+            if settings.offline {
+                #[cfg(feature = "log")]
+                log::warn!("offline: cache disabled; skipping {url}");
+                return Ok(());
+            }
+            let _permit = sem
+                .acquire()
+                .await
+                .context("fetcher semaphore closed during shutdown")?;
+            provider
+                .fetch(client, &url, source.timeout)
+                .await
+                .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
         }
-    } else {
-        let _permit = sem
-            .acquire()
-            .await
-            .context("fetcher semaphore closed during shutdown")?;
-        provider
-            .fetch(client, &url, source.timeout)
-            .await
-            .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
     };
 
     if *stop_rx.borrow() {
@@ -591,10 +623,19 @@ impl Drop for ProxyFetcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_proxy, finish_phase, protocol_hash, DedupTable, ProxyFetcher};
-    use crate::fetcher::Config;
+    use super::{accept_proxy, do_work, finish_phase, protocol_hash, DedupTable, ProxyFetcher};
+    use crate::fetcher::{cache::Cache, Config};
     use crate::geolookup::models::GeoData;
+    use crate::providers::models::Source;
+    use crate::providers::ProxyProvider;
     use crate::proxy::models::{Anonymity, Protocol, Proxy};
+    use http_body_util::Empty;
+    use hyper::body::Bytes;
+    use hyper_tls::HttpsConnector;
+    use hyper_util::{
+        client::legacy::{connect::HttpConnector, Client},
+        rt::TokioExecutor,
+    };
     use std::{
         net::Ipv4Addr,
         sync::{
@@ -605,6 +646,42 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
+
+    struct OfflineTestProvider;
+
+    #[async_trait::async_trait]
+    impl ProxyProvider for OfflineTestProvider {
+        fn name(&self) -> &'static str {
+            "offline-test"
+        }
+
+        fn sources(&self) -> Vec<Source> {
+            Vec::new()
+        }
+    }
+
+    fn test_client() -> Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>> {
+        Arc::new(
+            Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new()),
+        )
+    }
+
+    fn temp_cache_dir() -> (crate::fetcher::cache::Cache, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "flx_offline_test_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_backup = dir.clone();
+        (
+            Cache::new_at(dir, Duration::from_secs(60), false),
+            dir_backup,
+        )
+    }
 
     #[test]
     fn duplicate_endpoint_is_rejected_before_geo_lookup() {
@@ -858,6 +935,86 @@ mod tests {
         assert_eq!(proxies.len(), 2);
         assert_eq!(proxies[0].as_text(), "1.2.3.4:8080");
         assert_eq!(proxies[1].as_text(), "5.6.7.8:3128");
+    }
+
+    #[tokio::test]
+    async fn do_work_offline_skips_source_on_cache_miss() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/list");
+        let (cache, dir) = temp_cache_dir();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (_, stop_rx) = tokio::sync::watch::channel(false);
+        let semaphore = Arc::new(Semaphore::new(1));
+        let source = Arc::new(Source::all(&url).unwrap());
+
+        do_work(
+            Arc::new(OfflineTestProvider),
+            test_client(),
+            source,
+            tx.clone(),
+            semaphore,
+            stop_rx,
+            super::FetchSettings {
+                fetch_cache: Some(Arc::new(cache)),
+                offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "offline mode must not open a network connection on a cache miss"
+        );
+        assert!(rx.recv().await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn do_work_offline_serves_warm_cache_without_network() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/list");
+        let (cache, dir) = temp_cache_dir();
+        cache.store(&url, "1.2.3.4:8080\n5.6.7.8:3128\n").await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (_, stop_rx) = tokio::sync::watch::channel(false);
+        let semaphore = Arc::new(Semaphore::new(1));
+        let source = Arc::new(Source::all(&url).unwrap());
+
+        do_work(
+            Arc::new(OfflineTestProvider),
+            test_client(),
+            source,
+            tx.clone(),
+            semaphore,
+            stop_rx,
+            super::FetchSettings {
+                fetch_cache: Some(Arc::new(cache)),
+                offline: true,
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "offline mode must serve the cached body without opening a connection"
+        );
+        let mut proxies = Vec::new();
+        while let Some(proxy) = rx.recv().await {
+            proxies.push(proxy);
+        }
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].as_text(), "1.2.3.4:8080");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -629,6 +629,7 @@ fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
         providers: Arc::from(options.provider.as_slice()),
         excluded_providers: Arc::from(options.exclude_provider.as_slice()),
         custom_sources: Arc::from(options.source_url.as_slice()),
+        offline: options.offline,
         ..Default::default()
     }
 }
@@ -1161,6 +1162,12 @@ mod tests {
                 "http://127.0.0.1:9999/b.txt".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn offline_flag_lands_in_fetcher_config() {
+        assert!(fetch_from(&["--offline"]).fetcher.offline);
+        assert!(!fetch_from(&[]).fetcher.offline);
     }
 
     #[test]
