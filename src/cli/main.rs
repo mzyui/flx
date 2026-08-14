@@ -317,6 +317,22 @@ fn proxy_anonymity_rank(proxy: &Proxy) -> u8 {
         .unwrap_or_else(|| Anonymity::Unknown.rank())
 }
 
+/// Sorts proxies by the requested field, honoring `--order`.
+fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
+    match sort {
+        "avg-response" => proxies.sort_by(|a, b| {
+            a.avg_response_time()
+                .partial_cmp(&b.avg_response_time())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        "country" => proxies.sort_by(|a, b| a.geo.iso_code.cmp(&b.geo.iso_code)),
+        _ => proxies.sort_by_key(proxy_anonymity_rank),
+    }
+    if order == Some("desc") {
+        proxies.reverse();
+    }
+}
+
 /// Post-validation filters applied before a proxy is rendered.
 struct ProxyFilter {
     min_anonymity_rank: Option<u8>,
@@ -365,7 +381,7 @@ async fn process_result<S>(
     finalize: FinalizeOpts,
 ) -> anyhow::Result<RunOutcome>
 where
-    S: Stream<Item = Proxy>,
+    S: Stream<Item = Proxy> + Send + 'static,
 {
     let format = effective_format(
         &options.format,
@@ -390,6 +406,13 @@ where
     let mut found_proxy = false;
     let mut cancelled = false;
     let filter = Arc::new(ProxyFilter::from_options(&options));
+    let source: BoxStream = if let Some(sort) = options.sort.as_deref() {
+        let mut proxies: Vec<Proxy> = source.collect().await;
+        sort_proxies(&mut proxies, sort, Some(options.order.as_str()));
+        Box::pin(futures_util::stream::iter(proxies))
+    } else {
+        Box::pin(source)
+    };
     let mut source = std::pin::pin!(source
         .filter_map(move |proxy| {
             let filter = Arc::clone(&filter);
@@ -1272,6 +1295,8 @@ mod tests {
                 min_anonymity: None,
                 min_response_time: None,
                 max_response_time: None,
+                sort: None,
+                order: "asc".to_owned(),
             },
             out,
         )
@@ -1376,7 +1401,7 @@ mod tests {
         let rt = runtime::Builder::new_current_thread().build().unwrap();
         let (options, path) = output_options("json-lines", limit);
         rt.block_on(async {
-            let s = stream::iter(proxies.iter().cloned());
+            let s = stream::iter(proxies.to_vec());
             process_result(
                 s,
                 options,
@@ -1396,7 +1421,7 @@ mod tests {
         let rt = runtime::Builder::new_current_thread().build().unwrap();
         let (options, path) = output_options("csv", limit);
         rt.block_on(async {
-            let s = stream::iter(proxies.iter().cloned());
+            let s = stream::iter(proxies.to_vec());
             process_result(
                 s,
                 options,
@@ -1416,7 +1441,7 @@ mod tests {
         let rt = runtime::Builder::new_current_thread().build().unwrap();
         let (options, path) = output_options("json", limit);
         rt.block_on(async {
-            let s = stream::iter(proxies.iter().cloned());
+            let s = stream::iter(proxies.to_vec());
             // Tests never cancel: use a notify that never fires.
             process_result(
                 s,
@@ -1659,7 +1684,7 @@ mod tests {
         };
         let rt = runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(async {
-            let s = stream::iter(proxies.iter().cloned());
+            let s = stream::iter(proxies.to_vec());
             process_result(
                 s,
                 options,
@@ -1721,6 +1746,95 @@ mod tests {
 
         let kept = run_filtered(&[proxy], Some("elite"), None, None);
         assert_eq!(kept.len(), 1, "types without anonymity pass any threshold");
+    }
+
+    fn run_sorted(proxies: &[Proxy], sort: &str, order: &str) -> Vec<serde_json::Value> {
+        let (options, path) = output_options("json-lines", 0);
+        let options = OutputOptions {
+            sort: Some(sort.to_owned()),
+            order: order.to_owned(),
+            ..options
+        };
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let s = stream::iter(proxies.to_vec());
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        parse_json_lines(&content)
+    }
+
+    fn proxy_country(ip: u8, country: &str) -> Proxy {
+        let mut proxy = Proxy::new(std::net::Ipv4Addr::new(10, 1, 0, ip), 8080);
+        proxy.geo = Arc::new(flx::GeoData {
+            iso_code: Some(country.to_owned().into()),
+            ..flx::GeoData::default()
+        });
+        proxy
+    }
+
+    #[test]
+    fn process_result_sorts_by_response_time() {
+        let proxies = [
+            validated_proxy(1, "HTTP:Anonymous", 0.9),
+            validated_proxy(2, "HTTP:Anonymous", 0.1),
+            validated_proxy(3, "HTTP:Anonymous", 0.5),
+        ];
+        let asc = run_sorted(&proxies, "avg-response", "asc");
+        assert!(asc[0]["average_response_time"].as_f64().unwrap() < 0.5);
+        assert!(asc[2]["average_response_time"].as_f64().unwrap() > 0.5);
+
+        let desc = run_sorted(&proxies, "avg-response", "desc");
+        assert!(desc[0]["average_response_time"].as_f64().unwrap() > 0.5);
+        assert!(desc[2]["average_response_time"].as_f64().unwrap() < 0.5);
+    }
+
+    #[test]
+    fn process_result_sorts_by_anonymity_rank() {
+        let proxies = [
+            validated_proxy(1, "HTTP:Anonymous", 0.2),
+            validated_proxy(2, "HTTP:Transparent", 0.2),
+            validated_proxy(3, "HTTP:Elite", 0.2),
+        ];
+        let asc = run_sorted(&proxies, "anonymity", "asc");
+        assert!(asc[0]["type"]["protocol"]["Http"].as_str().unwrap() == "Transparent");
+        assert!(asc[2]["type"]["protocol"]["Http"].as_str().unwrap() == "Elite");
+    }
+
+    #[test]
+    fn process_result_sorts_by_country() {
+        let proxies = [
+            proxy_country(1, "US"),
+            proxy_country(2, "ID"),
+            proxy_country(3, "DE"),
+        ];
+        let asc = run_sorted(&proxies, "country", "asc");
+        assert!(asc[0]["geo"]["iso_code"].as_str().unwrap() == "DE");
+        assert!(asc[2]["geo"]["iso_code"].as_str().unwrap() == "US");
+
+        let desc = run_sorted(&proxies, "country", "desc");
+        assert!(
+            asc[0]["geo"]["iso_code"].as_str().unwrap()
+                != desc[0]["geo"]["iso_code"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn sort_and_order_flags_are_accepted() {
+        let args = find_from(&["--sort", "country", "--order", "desc"]);
+        assert_eq!(args.output.sort.as_deref(), Some("country"));
+        assert_eq!(args.output.order, "desc");
+        assert!(Cli::try_parse_from(["flx", "find", "--sort", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["flx", "find", "--order", "sideways"]).is_err());
     }
 
     #[test]

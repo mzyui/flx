@@ -185,6 +185,22 @@ pub struct OutputOptions {
     /// Drop proxies faster than this many seconds.
     #[arg(long)]
     pub min_response_time: Option<f64>,
+
+    /// Sort the output by this field; buffers the whole result set.
+    #[arg(long, value_parser([
+        PossibleValue::new("avg-response"),
+        PossibleValue::new("country"),
+        PossibleValue::new("anonymity"),
+    ]))]
+    pub sort: Option<String>,
+
+    /// Sort direction; only meaningful together with `--sort`.
+    #[arg(
+        long,
+        default_value = "asc",
+        value_parser([PossibleValue::new("asc"), PossibleValue::new("desc")])
+    )]
+    pub order: String,
 }
 
 /// Options controlling how proxies are scraped from the built-in providers.
