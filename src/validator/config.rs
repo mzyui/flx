@@ -22,6 +22,8 @@ pub struct Config {
     pub http_judge_urls: Vec<String>,
     pub https_judge_urls: Vec<String>,
     pub insecure: bool,
+    /// Probe requested types that the proxy's advertised set does not cover.
+    pub probe_missed_types: bool,
 }
 
 pub const DEFAULT_CONCURRENCY_LIMIT: usize = 500;
@@ -43,6 +45,7 @@ impl Default for Config {
                 .map(|u| u.to_string())
                 .collect(),
             insecure: false,
+            probe_missed_types: false,
         }
     }
 }
@@ -68,5 +71,10 @@ mod tests {
     #[test]
     fn default_groups_are_empty() {
         assert!(Config::default().groups.is_empty());
+    }
+
+    #[test]
+    fn default_probe_missed_types_is_disabled() {
+        assert!(!Config::default().probe_missed_types);
     }
 }

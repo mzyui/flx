@@ -13,7 +13,6 @@ use flx::{
     ProxySource, ProxyValidator,
 };
 use futures_util::{Stream, StreamExt};
-use std::future::Future;
 use std::io::IsTerminal as _;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -273,15 +272,33 @@ fn effective_format(format: &str, has_output_file: bool, stdout_is_tty: bool) ->
     }
 }
 
-async fn process_result<S, C>(
+// Controls document finalization when `process_result` chains one output
+// pass after another. Empty JSON is only suppressed on the first pass, and
+// the CSV header is only emitted once.
+#[derive(Clone, Copy)]
+struct FinalizeOpts {
+    suppress_empty_json: bool,
+    emit_csv_header: bool,
+}
+
+impl Default for FinalizeOpts {
+    fn default() -> Self {
+        Self {
+            suppress_empty_json: false,
+            emit_csv_header: true,
+        }
+    }
+}
+
+async fn process_result<S>(
     source: S,
     options: OutputOptions,
-    cancel: C,
+    cancel: Arc<tokio::sync::Notify>,
     guard: &dyn OutputGuard,
+    finalize: FinalizeOpts,
 ) -> anyhow::Result<RunOutcome>
 where
     S: Stream<Item = Proxy>,
-    C: Future<Output = ()>,
 {
     let format = effective_format(
         &options.format,
@@ -319,7 +336,6 @@ where
 
     // When `cancel` resolves (Ctrl+C in the real binary), the run finalizes a
     // valid JSON document instead of leaving an unterminated array behind.
-    let mut cancel = std::pin::pin!(cancel);
 
     // Collects the write error, if any, so the document can still be closed
     // before the error is reported to the caller.
@@ -327,7 +343,7 @@ where
 
     // Emit the CSV header once before the stream starts so the output is
     // always valid even when the stream is empty.
-    if _csv {
+    if _csv && finalize.emit_csv_header {
         buf.extend_from_slice(b"ip,port,type,response_time,country\n");
         if let Some(ref mut file) = output_file {
             if let Err(error) = file.write_all(&buf).await {
@@ -347,7 +363,7 @@ where
 
     loop {
         tokio::select! {
-            _ = &mut cancel => {
+            _ = cancel.notified() => {
                 cancelled = true;
                 break;
             }
@@ -432,11 +448,22 @@ where
         // else already went wrong.
         guard.before_write();
         if write_error.is_none() {
-            write_error = finalize_json_output(&mut output_file, &mut stdout, found_proxy)
-                .await
-                .err();
+            write_error = finalize_json_output(
+                &mut output_file,
+                &mut stdout,
+                found_proxy,
+                finalize.suppress_empty_json,
+            )
+            .await
+            .err();
         } else {
-            let _ = finalize_json_output(&mut output_file, &mut stdout, found_proxy).await;
+            let _ = finalize_json_output(
+                &mut output_file,
+                &mut stdout,
+                found_proxy,
+                finalize.suppress_empty_json,
+            )
+            .await;
         }
         guard.after_write();
     }
@@ -464,8 +491,15 @@ async fn finalize_json_output(
     output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
     stdout: &mut std::io::StdoutLock<'static>,
     found_proxy: bool,
+    suppress_empty_json: bool,
 ) -> anyhow::Result<()> {
-    let close = if found_proxy { "\n]\n" } else { "[]\n" };
+    let close = if found_proxy {
+        "\n]\n"
+    } else if suppress_empty_json {
+        ""
+    } else {
+        "[]\n"
+    };
     write_output(output_file, stdout, close).await
 }
 
@@ -582,12 +616,15 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     // Ctrl+C (SIGINT): resolved inside `process_result`, which finalizes a
     // valid JSON document before the process exits. The runtime is built
     // with `enable_all()` above, so the tokio signal driver is available
-    // here.
-    let cancel = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+    // here. An `Arc<Notify>` is shared so a fallback pass can keep listening.
+    let cancel = Arc::new(tokio::sync::Notify::new());
 
     let outcome = runtime.block_on(async move {
+        let notify = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            notify.notify_waiters();
+        });
         match command {
             Command::Grab(grab) => run_grab(grab, cli.quiet, cancel).await,
             Command::Find(find) => run_find(find, cli.quiet, cli.no_color, cancel).await,
@@ -598,10 +635,11 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     outcome
 }
 
-async fn run_grab<C>(grab: FetchArgs, quiet: bool, cancel: C) -> anyhow::Result<RunOutcome>
-where
-    C: Future<Output = ()>,
-{
+async fn run_grab(
+    grab: FetchArgs,
+    quiet: bool,
+    cancel: Arc<tokio::sync::Notify>,
+) -> anyhow::Result<RunOutcome> {
     if grab.fetcher.dry_run {
         list_sources();
         return Ok(RunOutcome::Finished);
@@ -616,7 +654,14 @@ where
         .output_file
         .as_deref()
         .map(|p| p.to_string_lossy().into_owned());
-    let outcome = process_result(source, grab.output, cancel, &NoopGuard).await;
+    let outcome = process_result(
+        source,
+        grab.output,
+        cancel,
+        &NoopGuard,
+        FinalizeOpts::default(),
+    )
+    .await;
     if !quiet && !stdout_is_pipe() {
         let gathered = accepted.load(std::sync::atomic::Ordering::Relaxed);
         let elapsed = started.elapsed();
@@ -633,15 +678,12 @@ where
     outcome
 }
 
-async fn run_find<C>(
+async fn run_find(
     find: FindArgs,
     quiet: bool,
     no_color: bool,
-    cancel: C,
-) -> anyhow::Result<RunOutcome>
-where
-    C: Future<Output = ()>,
-{
+    cancel: Arc<tokio::sync::Notify>,
+) -> anyhow::Result<RunOutcome> {
     if find.fetcher.dry_run {
         list_sources();
         return Ok(RunOutcome::Finished);
@@ -653,60 +695,182 @@ where
         protocols.push(Protocol::Http(Anonymity::Unknown));
     }
 
+    // Candidates are recorded while pass 1 streams so the fallback pass can
+    // re-validate the same set without re-fetching.
+    let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
     let source: BoxStream = match &find.file {
-        Some(file) => Box::pin(file_source(file).await?),
-        None => Box::pin(
+        Some(file) => Box::pin(tee_recorder(file_source(file).await?, recordings.clone())),
+        None => Box::pin(tee_recorder(
             ProxySource::from_fetcher(fetcher_config(&find.fetcher))
                 .await
                 .context("failed to start proxy fetcher")?,
-        ),
+            recordings.clone(),
+        )),
     };
 
-    let validated_proxies =
-        ProxyValidator::validate(source, validator_config(&find.validator, protocols, groups))
-            .await
-            .context("failed to start proxy validator")?;
-    let progress = validated_proxies.progress();
+    let pass1 = ProxyValidator::validate(
+        source,
+        validator_config(&find.validator, protocols.clone(), groups.clone(), false),
+    )
+    .await
+    .context("failed to start proxy validator")?;
+    let progress1 = pass1.progress();
     let started = std::time::Instant::now();
-
-    // The status line (stderr) repaints on a background thread and erases
-    // itself on drop. It also hides around each stdout write so streamed
-    // results never overwrite the line it is drawn on.
-    #[cfg(feature = "progress_bar")]
-    let guard: OutputGuardEither<progress::ValidationBar> =
-        match progress::ValidationBar::new(progress.clone(), quiet, no_color) {
-            Some(bar) => OutputGuardEither::Bar(bar),
-            None => OutputGuardEither::Noop(NoopGuard),
-        };
-    #[cfg(not(feature = "progress_bar"))]
-    let guard = NoopGuard;
-    #[cfg(not(feature = "progress_bar"))]
-    let _ = no_color;
     let dst: Option<String> = find
         .output
         .output_file
         .as_deref()
         .map(|p| p.to_string_lossy().into_owned());
-    let outcome = process_result(validated_proxies, find.output, cancel, &guard).await;
+
+    // The status line (stderr) repaints on a background thread and erases
+    // itself on drop. It also hides around each stdout write so streamed
+    // results never overwrite the line it is drawn on.
+    let guard1 = make_guard(progress1.clone(), quiet, no_color);
+    // An empty pass 1 leaves nothing on the wire so the fallback pass can
+    // open the document itself; group-only requests never fall back.
+    let outcome1 = process_result(
+        pass1,
+        find.output.clone(),
+        cancel.clone(),
+        &guard1,
+        FinalizeOpts {
+            suppress_empty_json: !protocols.is_empty(),
+            emit_csv_header: true,
+        },
+    )
+    .await;
     // Erase the status line before the summary so the two never share a row.
-    #[cfg(feature = "progress_bar")]
-    drop(guard);
-    if !quiet && !stdout_is_pipe() {
-        let passed = progress.passed();
-        let failed = progress.done().saturating_sub(passed);
-        let checked = progress.total();
-        let elapsed = started.elapsed();
-        let rate = if elapsed.is_zero() {
-            0.0
-        } else {
-            checked as f64 / elapsed.as_secs_f64()
-        };
-        eprintln!(
-            "{}",
-            format_validation_stats(passed, failed, checked, elapsed, rate, dst.as_deref())
-        );
+    drop(guard1);
+    if !matches!(outcome1, Ok(RunOutcome::Finished)) {
+        return outcome1;
     }
-    outcome
+
+    // Fall back to the requested types the advertised set did not cover when
+    // the gated pass came up empty or below the limit.
+    let limit = find.output.limit;
+    let p1_passed = progress1.passed();
+    let needs_fallback =
+        !protocols.is_empty() && (p1_passed == 0 || (limit > 0 && p1_passed < limit));
+
+    if needs_fallback {
+        let candidates = std::mem::take(&mut *recordings.lock().expect("recorder poisoned"));
+        let pass2 = ProxyValidator::validate(
+            futures_util::stream::iter(candidates),
+            validator_config(&find.validator, protocols, Vec::new(), true),
+        )
+        .await
+        .context("failed to start proxy validator")?;
+        let progress2 = pass2.progress();
+        let guard2 = make_guard(progress2.clone(), quiet, no_color);
+        let mut options2 = find.output.clone();
+        options2.limit = if limit > 0 { limit - p1_passed } else { 0 };
+        let outcome2 = process_result(
+            pass2,
+            options2,
+            cancel,
+            &guard2,
+            FinalizeOpts {
+                suppress_empty_json: false,
+                emit_csv_header: false,
+            },
+        )
+        .await;
+        drop(guard2);
+        if !matches!(outcome2, Ok(RunOutcome::Finished)) {
+            return outcome2;
+        }
+        report_validation_summary(
+            p1_passed + progress2.passed(),
+            progress1.done() + progress2.done(),
+            progress1.total() + progress2.total(),
+            started.elapsed(),
+            dst.as_deref(),
+            quiet,
+        );
+        return Ok(RunOutcome::Finished);
+    }
+
+    report_validation_summary(
+        progress1.passed(),
+        progress1.done(),
+        progress1.total(),
+        started.elapsed(),
+        dst.as_deref(),
+        quiet,
+    );
+    outcome1
+}
+
+fn report_validation_summary(
+    passed: usize,
+    done: usize,
+    checked: usize,
+    elapsed: std::time::Duration,
+    dst: Option<&str>,
+    quiet: bool,
+) {
+    if quiet || stdout_is_pipe() {
+        return;
+    }
+    let rate = if elapsed.is_zero() {
+        0.0
+    } else {
+        checked as f64 / elapsed.as_secs_f64()
+    };
+    eprintln!(
+        "{}",
+        format_validation_stats(
+            passed,
+            done.saturating_sub(passed),
+            checked,
+            elapsed,
+            rate,
+            dst
+        )
+    );
+}
+
+// Forwards every candidate while appending a copy to the recordings buffer,
+// so a fallback pass can replay the same set without re-fetching.
+fn tee_recorder<S>(
+    inner: S,
+    recordings: Arc<std::sync::Mutex<Vec<Proxy>>>,
+) -> impl Stream<Item = Proxy>
+where
+    S: Stream<Item = Proxy> + Unpin,
+{
+    futures_util::stream::unfold(inner, move |mut inner| {
+        let recordings = Arc::clone(&recordings);
+        async move {
+            match inner.next().await {
+                Some(proxy) => {
+                    recordings
+                        .lock()
+                        .expect("candidate recorder mutex poisoned")
+                        .push(proxy.clone());
+                    Some((proxy, inner))
+                }
+                None => None,
+            }
+        }
+    })
+}
+
+#[cfg(feature = "progress_bar")]
+fn make_guard(
+    progress: flx::ValidationProgress,
+    quiet: bool,
+    no_color: bool,
+) -> OutputGuardEither<progress::ValidationBar> {
+    match progress::ValidationBar::new(progress, quiet, no_color) {
+        Some(bar) => OutputGuardEither::Bar(bar),
+        None => OutputGuardEither::Noop(NoopGuard),
+    }
+}
+
+#[cfg(not(feature = "progress_bar"))]
+fn make_guard(_progress: flx::ValidationProgress, _quiet: bool, _no_color: bool) -> NoopGuard {
+    NoopGuard
 }
 
 async fn run_geo_update() -> anyhow::Result<RunOutcome> {
@@ -728,6 +892,7 @@ fn validator_config(
     options: &ValidatorArgs,
     protocols: Vec<Protocol>,
     groups: Vec<Vec<Protocol>>,
+    probe_missed_types: bool,
 ) -> flx::validator::Config {
     flx::validator::Config {
         types: protocols,
@@ -738,6 +903,7 @@ fn validator_config(
         http_judge_urls: options.http_judge_urls.clone(),
         https_judge_urls: options.https_judge_urls.clone(),
         insecure: options.insecure,
+        probe_missed_types,
     }
 }
 
@@ -1073,9 +1239,15 @@ mod tests {
         let (options, path) = output_options("json-lines", limit);
         rt.block_on(async {
             let s = stream::iter(proxies.iter().cloned());
-            process_result(s, options, std::future::pending::<()>(), &NoopGuard)
-                .await
-                .unwrap();
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
         });
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -1087,9 +1259,15 @@ mod tests {
         let (options, path) = output_options("csv", limit);
         rt.block_on(async {
             let s = stream::iter(proxies.iter().cloned());
-            process_result(s, options, std::future::pending::<()>(), &NoopGuard)
-                .await
-                .unwrap();
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
         });
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -1101,10 +1279,16 @@ mod tests {
         let (options, path) = output_options("json", limit);
         rt.block_on(async {
             let s = stream::iter(proxies.iter().cloned());
-            // Tests never cancel: use a future that stays pending.
-            process_result(s, options, std::future::pending::<()>(), &NoopGuard)
-                .await
-                .unwrap();
+            // Tests never cancel: use a notify that never fires.
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
         });
         let content = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -1117,6 +1301,50 @@ mod tests {
         assert_eq!(out, "[]\n", "empty source must produce valid []");
         // must parse as JSON
         serde_json::from_str::<serde_json::Value>(&out).unwrap();
+    }
+
+    #[test]
+    fn json_empty_is_suppressed_when_requested() {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("json", 0);
+        rt.block_on(async {
+            let s = stream::iter(Vec::<Proxy>::new());
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts {
+                    suppress_empty_json: true,
+                    emit_csv_header: true,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // The empty document is left to a later pass, so nothing is written.
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn tee_recorder_forwards_and_records_candidates() {
+        let proxies: Vec<Proxy> = (1u16..=3)
+            .map(|port| Proxy::new(std::net::Ipv4Addr::LOCALHOST, port))
+            .collect();
+        let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let forwarded = rt.block_on(async {
+            let s = tee_recorder(stream::iter(proxies.clone()), Arc::clone(&recordings));
+            s.collect::<Vec<_>>().await
+        });
+        let recorded = recordings.lock().unwrap();
+        assert_eq!(forwarded.len(), 3);
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(forwarded[0].ip, proxies[0].ip);
+        assert_eq!(forwarded[1].port, proxies[1].port);
+        assert_eq!(recorded[2].port, proxies[2].port);
     }
 
     #[test]

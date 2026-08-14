@@ -163,6 +163,12 @@ impl Flx {
         self
     }
 
+    /// Probe requested types that the proxy's advertised set does not cover.
+    pub fn probe_missed_types(mut self, enable: bool) -> Self {
+        self.validator_config.probe_missed_types = enable;
+        self
+    }
+
     /// Stop after at most `limit` validated proxies.
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;

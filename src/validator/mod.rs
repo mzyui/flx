@@ -412,6 +412,7 @@ impl ProxyValidator {
         let request_timeout = config.request_timeout;
         let concurrency_limit = config.concurrency_limit;
         let insecure = config.insecure;
+        let probe_missed = config.probe_missed_types;
         let preflight_timeout = Duration::from_secs(config.request_timeout);
         let need_http = expected
             .iter()
@@ -505,11 +506,22 @@ impl ProxyValidator {
             let jobs = proxy_source.flat_map(move |proxy: Proxy| {
                 let proxy = Arc::new(proxy);
                 let advertised = Arc::clone(&proxy.expected_types);
-                let has_singleton = advertised.iter().any(|advertised| {
-                    expected
-                        .iter()
-                        .any(|requested| advertised_matches_request(advertised, requested))
-                });
+                let has_singleton = if probe_missed {
+                    // Requested types the advertised set does not cover (or
+                    // every requested type when nothing is advertised).
+                    expected.iter().any(|requested| {
+                        advertised.is_empty()
+                            || !advertised
+                                .iter()
+                                .any(|adv| advertised_matches_request(adv, requested))
+                    })
+                } else {
+                    advertised.iter().any(|advertised| {
+                        expected
+                            .iter()
+                            .any(|requested| advertised_matches_request(advertised, requested))
+                    })
+                };
                 if has_singleton {
                     manager_total.fetch_add(1, Ordering::Relaxed);
                 }
@@ -523,47 +535,83 @@ impl ProxyValidator {
                 // lists are deduplicated so a duplicated entry can never yield
                 // a duplicate probe job.
                 let singleton: futures_util::stream::BoxStream<'static, Job> = if has_singleton {
-                    let state = (
-                        proxy.clone(),
-                        advertised,
-                        Arc::clone(&expected),
-                        0usize,
-                        0usize,
-                    );
-                    Box::pin(futures_util::stream::unfold(
-                        state,
-                        |(proxy, advertised, requested, mut adv_idx, mut req_idx)| async move {
-                            loop {
-                                if adv_idx >= advertised.len() {
-                                    return None;
-                                }
-                                let adv = &advertised[adv_idx];
-                                if advertised[..adv_idx].iter().any(|seen| seen == adv) {
-                                    adv_idx += 1;
-                                    req_idx = 0;
-                                    continue;
-                                }
-                                while req_idx < requested.len() {
+                    if probe_missed {
+                        Box::pin(futures_util::stream::unfold(
+                            (
+                                proxy.clone(),
+                                Arc::clone(&expected),
+                                Arc::clone(&advertised),
+                                0usize,
+                            ),
+                            |(proxy, requested, advertised, mut req_idx)| async move {
+                                loop {
+                                    if req_idx >= requested.len() {
+                                        return None;
+                                    }
                                     let req = &requested[req_idx];
-                                    let requested_is_new =
+                                    let is_new =
                                         !requested[..req_idx].iter().any(|seen| seen == req);
                                     req_idx += 1;
-                                    if requested_is_new && advertised_matches_request(adv, req) {
+                                    let covered = advertised
+                                        .iter()
+                                        .any(|adv| advertised_matches_request(adv, req));
+                                    if is_new && !covered {
                                         return Some((
                                             Job::Singleton {
                                                 proxy: Arc::clone(&proxy),
-                                                protocol: *adv,
+                                                protocol: *req,
                                                 requested: *req,
                                             },
-                                            (proxy, advertised, requested, adv_idx, req_idx),
+                                            (proxy, requested, advertised, req_idx),
                                         ));
                                     }
                                 }
-                                adv_idx += 1;
-                                req_idx = 0;
-                            }
-                        },
-                    ))
+                            },
+                        ))
+                    } else {
+                        let state = (
+                            proxy.clone(),
+                            advertised,
+                            Arc::clone(&expected),
+                            0usize,
+                            0usize,
+                        );
+                        Box::pin(futures_util::stream::unfold(
+                            state,
+                            |(proxy, advertised, requested, mut adv_idx, mut req_idx)| async move {
+                                loop {
+                                    if adv_idx >= advertised.len() {
+                                        return None;
+                                    }
+                                    let adv = &advertised[adv_idx];
+                                    if advertised[..adv_idx].iter().any(|seen| seen == adv) {
+                                        adv_idx += 1;
+                                        req_idx = 0;
+                                        continue;
+                                    }
+                                    while req_idx < requested.len() {
+                                        let req = &requested[req_idx];
+                                        let requested_is_new =
+                                            !requested[..req_idx].iter().any(|seen| seen == req);
+                                        req_idx += 1;
+                                        if requested_is_new && advertised_matches_request(adv, req)
+                                        {
+                                            return Some((
+                                                Job::Singleton {
+                                                    proxy: Arc::clone(&proxy),
+                                                    protocol: *adv,
+                                                    requested: *req,
+                                                },
+                                                (proxy, advertised, requested, adv_idx, req_idx),
+                                            ));
+                                        }
+                                    }
+                                    adv_idx += 1;
+                                    req_idx = 0;
+                                }
+                            },
+                        ))
+                    }
                 } else {
                     Box::pin(futures_util::stream::empty())
                 };
@@ -894,6 +942,66 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(validator.progress().total(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_missed_types_probes_only_unmatched_types() {
+        // Offline-safe: candidates advertise `Socks5` while `Http(Unknown)`
+        // is requested, so the missed HTTP probe runs on each candidate
+        // (closed local ports make every probe fail fast).
+        let judge = spawn_echo_judge().await;
+        let candidates = (1u16..=5)
+            .map(|port| {
+                Proxy::with_expected_types(
+                    std::net::Ipv4Addr::LOCALHOST,
+                    port,
+                    std::sync::Arc::from([Protocol::Socks5]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let config = Config {
+            types: vec![Protocol::Http(Anonymity::Unknown)],
+            http_judge_urls: vec![judge],
+            https_judge_urls: vec![],
+            probe_missed_types: true,
+            ..Config::default()
+        };
+        let mut validator =
+            ProxyValidator::validate(futures_util::stream::iter(candidates), config)
+                .await
+                .unwrap();
+        let progress = validator.progress();
+        while validator.get_one().await.is_some() {}
+        assert_eq!(progress.total(), 5);
+        assert_eq!(progress.done(), 5);
+        assert_eq!(progress.passed(), 0);
+    }
+
+    #[tokio::test]
+    async fn probe_missed_types_skips_already_covered_types() {
+        // Offline-safe: an advertised `Http` proxy is not probed again for a
+        // requested `Http` type when `probe_missed_types` is on.
+        let judge = spawn_echo_judge().await;
+        let candidate = Proxy::with_expected_types(
+            std::net::Ipv4Addr::LOCALHOST,
+            10_000,
+            std::sync::Arc::from([Protocol::Http(Anonymity::Unknown)]),
+        );
+        let config = Config {
+            types: vec![Protocol::Http(Anonymity::Unknown)],
+            http_judge_urls: vec![judge],
+            https_judge_urls: vec![],
+            probe_missed_types: true,
+            ..Config::default()
+        };
+        let mut validator =
+            ProxyValidator::validate(futures_util::stream::iter([candidate]), config)
+                .await
+                .unwrap();
+        let progress = validator.progress();
+        while validator.get_one().await.is_some() {}
+        assert_eq!(progress.total(), 0);
+        assert_eq!(progress.done(), 0);
     }
 
     /// Spawns a plain-HTTP judge that echoes the `X-Fluxy-Token` header, enough
