@@ -168,6 +168,23 @@ pub struct OutputOptions {
     /// File path to save the retrieved proxies; prints to the console otherwise.
     #[arg(short, long)]
     pub output_file: Option<std::path::PathBuf>,
+
+    /// Only keep proxies whose best anonymity is at least this level.
+    #[arg(long, value_parser([
+        PossibleValue::new("transparent"),
+        PossibleValue::new("anonymous"),
+        PossibleValue::new("elite"),
+        PossibleValue::new("unknown"),
+    ]))]
+    pub min_anonymity: Option<String>,
+
+    /// Drop proxies slower than this many seconds.
+    #[arg(long)]
+    pub max_response_time: Option<f64>,
+
+    /// Drop proxies faster than this many seconds.
+    #[arg(long)]
+    pub min_response_time: Option<f64>,
 }
 
 /// Options controlling how proxies are scraped from the built-in providers.

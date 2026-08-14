@@ -294,6 +294,69 @@ impl Default for FinalizeOpts {
     }
 }
 
+fn anonymity_rank_from_name(name: &str) -> u8 {
+    match name {
+        "transparent" => Anonymity::Transparent.rank(),
+        "anonymous" => Anonymity::Anonymous.rank(),
+        "elite" => Anonymity::Elite.rank(),
+        _ => Anonymity::Unknown.rank(),
+    }
+}
+
+/// Best anonymity rank across a proxy's validated types; types without an
+/// anonymity level (SOCKS, CONNECT) count as `Unknown`.
+fn proxy_anonymity_rank(proxy: &Proxy) -> u8 {
+    proxy
+        .proxy_types
+        .iter()
+        .filter_map(|proxy_type| match proxy_type.protocol {
+            Protocol::Http(anonymity) | Protocol::Https(anonymity) => Some(anonymity.rank()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or_else(|| Anonymity::Unknown.rank())
+}
+
+/// Post-validation filters applied before a proxy is rendered.
+struct ProxyFilter {
+    min_anonymity_rank: Option<u8>,
+    min_response_time: Option<f64>,
+    max_response_time: Option<f64>,
+}
+
+impl ProxyFilter {
+    fn from_options(options: &OutputOptions) -> Self {
+        Self {
+            min_anonymity_rank: options
+                .min_anonymity
+                .as_deref()
+                .map(anonymity_rank_from_name),
+            min_response_time: options.min_response_time,
+            max_response_time: options.max_response_time,
+        }
+    }
+
+    fn matches(&self, proxy: &Proxy) -> bool {
+        if let Some(min_rank) = self.min_anonymity_rank {
+            if proxy_anonymity_rank(proxy) < min_rank {
+                return false;
+            }
+        }
+        let response_time = proxy.avg_response_time();
+        if let Some(min_time) = self.min_response_time {
+            if response_time < min_time {
+                return false;
+            }
+        }
+        if let Some(max_time) = self.max_response_time {
+            if response_time > max_time {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 async fn process_result<S>(
     source: S,
     options: OutputOptions,
@@ -326,7 +389,13 @@ where
     let _csv = format == "csv";
     let mut found_proxy = false;
     let mut cancelled = false;
-    let mut source = std::pin::pin!(source.enumerate());
+    let filter = Arc::new(ProxyFilter::from_options(&options));
+    let mut source = std::pin::pin!(source
+        .filter_map(move |proxy| {
+            let filter = Arc::clone(&filter);
+            async move { filter.matches(&proxy).then_some(proxy) }
+        })
+        .enumerate());
 
     // One stdout lock for the whole run instead of `print!` re-acquiring the
     // global lock (`std::io::_print`) for every proxy.
@@ -1089,6 +1158,22 @@ mod tests {
     }
 
     #[test]
+    fn validation_filter_flags_are_accepted() {
+        let args = find_from(&[
+            "--min-anonymity",
+            "anonymous",
+            "--max-response-time",
+            "1.5",
+            "--min-response-time",
+            "0.5",
+        ]);
+        assert_eq!(args.output.min_anonymity.as_deref(), Some("anonymous"));
+        assert_eq!(args.output.max_response_time, Some(1.5));
+        assert_eq!(args.output.min_response_time, Some(0.5));
+        assert!(Cli::try_parse_from(["flx", "find", "--min-anonymity", "super"]).is_err());
+    }
+
+    #[test]
     fn generate_completions_flag_is_accepted() {
         let cli = Cli::parse_from(["flx", "--generate-completions", "bash"]);
         assert_eq!(cli.generate_completions, Some(clap_complete::Shell::Bash));
@@ -1163,6 +1248,9 @@ mod tests {
                 format: format.to_owned(),
                 limit,
                 output_file: Some(out.clone()),
+                min_anonymity: None,
+                min_response_time: None,
+                max_response_time: None,
             },
             out,
         )
@@ -1523,6 +1611,95 @@ mod tests {
         let out = run_csv(&proxies, 2);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 3, "header + 2 rows");
+    }
+
+    fn validated_proxy(ip: u8, anonymity: &str, response_time: f64) -> Proxy {
+        use flx::proxy::models::ProxyType;
+        let mut proxy = Proxy::new(std::net::Ipv4Addr::new(10, 0, 0, ip), 8080 + u16::from(ip));
+        proxy
+            .proxy_types
+            .push(ProxyType::checked(anonymity.parse::<Protocol>().unwrap()));
+        proxy.runtimes.record(response_time);
+        proxy
+    }
+
+    fn run_filtered(
+        proxies: &[Proxy],
+        min_anonymity: Option<&str>,
+        min_response_time: Option<f64>,
+        max_response_time: Option<f64>,
+    ) -> Vec<serde_json::Value> {
+        let (options, path) = output_options("json-lines", 0);
+        let options = OutputOptions {
+            min_anonymity: min_anonymity.map(str::to_owned),
+            min_response_time,
+            max_response_time,
+            ..options
+        };
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let s = stream::iter(proxies.iter().cloned());
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        parse_json_lines(&content)
+    }
+
+    #[test]
+    fn process_result_filters_by_min_anonymity() {
+        let proxies = [
+            validated_proxy(1, "HTTP:Transparent", 0.2),
+            validated_proxy(2, "HTTP:Anonymous", 0.2),
+            validated_proxy(3, "HTTP:Elite", 0.2),
+        ];
+        let kept = run_filtered(&proxies, Some("anonymous"), None, None);
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0]["ip"].as_str().unwrap().ends_with(".2"));
+        assert!(kept[1]["ip"].as_str().unwrap().ends_with(".3"));
+    }
+
+    #[test]
+    fn process_result_filters_by_response_time_bounds() {
+        let proxies = [
+            validated_proxy(1, "HTTP:Anonymous", 0.1),
+            validated_proxy(2, "HTTP:Anonymous", 2.0),
+            validated_proxy(3, "HTTP:Anonymous", 0.7),
+        ];
+        let kept = run_filtered(&proxies, None, Some(0.5), Some(1.0));
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0]["ip"].as_str().unwrap().ends_with(".3"));
+    }
+
+    #[test]
+    fn process_result_filters_with_all_bounds_combined() {
+        let proxies = [
+            validated_proxy(1, "HTTP:Transparent", 0.3),
+            validated_proxy(2, "HTTP:Anonymous", 0.9),
+            validated_proxy(3, "HTTP:Elite", 1.5),
+        ];
+        let kept = run_filtered(&proxies, Some("anonymous"), Some(0.5), Some(1.0));
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0]["ip"].as_str().unwrap().ends_with(".2"));
+    }
+
+    #[test]
+    fn process_result_default_keeps_socks_and_conntype_anonymity_free_proxies() {
+        use flx::proxy::models::ProxyType;
+        let mut proxy = Proxy::new(std::net::Ipv4Addr::new(10, 0, 0, 9), 1080);
+        proxy.proxy_types.push(ProxyType::checked(Protocol::Socks5));
+        proxy.runtimes.record(0.4);
+
+        let kept = run_filtered(&[proxy], Some("elite"), None, None);
+        assert_eq!(kept.len(), 1, "types without anonymity pass any threshold");
     }
 
     #[test]

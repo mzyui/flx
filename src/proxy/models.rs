@@ -55,6 +55,18 @@ pub enum Anonymity {
     Unknown,
 }
 
+impl Anonymity {
+    /// Numeric rank from least to most anonymous.
+    pub fn rank(self) -> u8 {
+        match self {
+            Anonymity::Transparent => 0,
+            Anonymity::Anonymous => 1,
+            Anonymity::Elite => 2,
+            Anonymity::Unknown => 3,
+        }
+    }
+}
+
 // ── Protocol ─────────────────────────────────────────────────────────
 
 /// Protocol that a proxy supports.
@@ -430,6 +442,15 @@ mod tests {
             "HTTP".parse::<Protocol>().unwrap(),
             Protocol::Http(Anonymity::Unknown)
         );
+    }
+
+    #[test]
+    fn anonymity_ranks_lowest_to_highest() {
+        assert!(Anonymity::Transparent.rank() < Anonymity::Anonymous.rank());
+        assert!(Anonymity::Anonymous.rank() < Anonymity::Elite.rank());
+        assert!(Anonymity::Elite.rank() < Anonymity::Unknown.rank());
+        assert_eq!(Anonymity::Transparent.rank(), 0);
+        assert_eq!(Anonymity::Unknown.rank(), 3);
     }
 
     #[test]
