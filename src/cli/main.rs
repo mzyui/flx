@@ -605,6 +605,7 @@ fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
         enforce_unique_ip: !options.no_dedup,
         providers: Arc::from(options.provider.as_slice()),
         excluded_providers: Arc::from(options.exclude_provider.as_slice()),
+        custom_sources: Arc::from(options.source_url.as_slice()),
         ..Default::default()
     }
 }
@@ -1116,7 +1117,27 @@ mod tests {
         assert!(fetcher_config(&refreshed.fetcher).refresh_cache);
 
         let default = fetch_from(&[]);
-        assert!(!fetcher_config(&default.fetcher).refresh_cache);
+        assert!(fetcher_config(&default.fetcher).providers.is_empty());
+        assert!(fetcher_config(&default.fetcher)
+            .excluded_providers
+            .is_empty());
+    }
+
+    #[test]
+    fn source_url_flag_lands_in_fetcher_config() {
+        let args = fetch_from(&[
+            "--source-url",
+            "http://127.0.0.1:9999/a.txt",
+            "--source-url",
+            "http://127.0.0.1:9999/b.txt",
+        ]);
+        assert_eq!(
+            fetcher_config(&args.fetcher).custom_sources.as_ref(),
+            [
+                "http://127.0.0.1:9999/a.txt".to_owned(),
+                "http://127.0.0.1:9999/b.txt".to_owned()
+            ]
+        );
     }
 
     #[test]

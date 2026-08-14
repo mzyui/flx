@@ -77,6 +77,27 @@ pub fn select_providers(
         .collect()
 }
 
+/// Provider that scrapes a single user-supplied plaintext URL.
+pub struct CustomUrlProvider(pub Source);
+
+impl CustomUrlProvider {
+    /// Creates a provider from a plaintext proxy-list URL.
+    pub fn new(url: &str) -> anyhow::Result<Self> {
+        Ok(Self(Source::all(url)?))
+    }
+}
+
+#[async_trait]
+impl ProxyProvider for CustomUrlProvider {
+    fn name(&self) -> &'static str {
+        "custom"
+    }
+
+    fn sources(&self) -> Vec<Source> {
+        vec![self.0.clone()]
+    }
+}
+
 #[async_trait]
 pub trait ProxyProvider {
     fn name(&self) -> &'static str;
@@ -585,5 +606,17 @@ mod tests {
             &["proxyscrape".to_owned()],
         );
         assert_eq!(provider_names(&selected), vec!["geonode"]);
+    }
+
+    #[test]
+    fn custom_provider_exposes_its_source_and_tier() {
+        let provider = super::CustomUrlProvider::new("http://127.0.0.1:9999/list").unwrap();
+        assert_eq!(provider.name(), "custom");
+        assert_eq!(provider.tier(), super::ProviderTier::Primary);
+        assert_eq!(provider.sources().len(), 1);
+        assert_eq!(
+            provider.sources()[0].url.to_string(),
+            "http://127.0.0.1:9999/list"
+        );
     }
 }

@@ -26,6 +26,7 @@ pub enum ProviderTier {
     Fallback,
 }
 
+#[derive(Clone)]
 pub struct Source {
     pub url: Uri,
     pub default_types: Arc<[Protocol]>,

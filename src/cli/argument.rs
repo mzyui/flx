@@ -234,6 +234,10 @@ pub struct FetcherArgs {
     #[arg(long)]
     pub exclude_provider: Vec<String>,
 
+    /// Fetch an additional proxy list from this plaintext URL; repeatable.
+    #[arg(long)]
+    pub source_url: Vec<String>,
+
     /// List the providers and sources that would be fetched, then exit.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,

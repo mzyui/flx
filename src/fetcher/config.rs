@@ -11,6 +11,7 @@ pub struct Config {
     pub refresh_cache: bool,
     pub providers: Arc<[String]>,
     pub excluded_providers: Arc<[String]>,
+    pub custom_sources: Arc<[String]>,
 }
 
 impl Config {
@@ -41,6 +42,7 @@ impl Default for Config {
             refresh_cache: false,
             providers: Arc::from(Vec::new()),
             excluded_providers: Arc::from(Vec::new()),
+            custom_sources: Arc::from(Vec::new()),
         }
     }
 }

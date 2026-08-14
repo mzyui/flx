@@ -34,7 +34,10 @@ use tokio::{
 
 use crate::{
     geolookup::GeoLookup,
-    providers::{all_providers, models::Source, select_providers, ProviderTier, ProxyProvider},
+    providers::{
+        all_providers, models::Source, select_providers, CustomUrlProvider, ProviderTier,
+        ProxyProvider,
+    },
     proxy::models::{Protocol, Proxy},
 };
 
@@ -127,15 +130,18 @@ impl ProxyFetcher {
             None
         };
 
-        let providers = select_providers(
+        let mut providers = select_providers(
             all_providers(),
             &config.providers,
             &config.excluded_providers,
         );
-        let known_names: Vec<&str> = all_providers()
+        let mut known_names: Vec<&str> = all_providers()
             .iter()
             .map(|provider| provider.name())
             .collect();
+        if !config.custom_sources.is_empty() {
+            known_names.push("custom");
+        }
         for name in config.providers.iter() {
             if !known_names.contains(&name.as_str()) {
                 anyhow::bail!(
@@ -143,6 +149,12 @@ impl ProxyFetcher {
                     known_names.join(", ")
                 );
             }
+        }
+        for url in config.custom_sources.iter() {
+            providers
+                .push(Arc::new(CustomUrlProvider::new(url).with_context(
+                    || format!("invalid custom source URL `{url}`"),
+                )?));
         }
         if providers.is_empty() {
             #[cfg(feature = "log")]
@@ -591,7 +603,8 @@ mod tests {
         },
         time::Duration,
     };
-    use tokio::{sync::Semaphore, task::JoinSet};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
 
     #[test]
     fn duplicate_endpoint_is_rejected_before_geo_lookup() {
@@ -806,6 +819,45 @@ mod tests {
             ..Config::default()
         };
         assert!(ProxyFetcher::gather(config).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn gather_fetches_custom_source_url_offline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/list");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::with_capacity(512);
+            let mut byte = [0u8; 1];
+            while !headers.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                headers.push(byte[0]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 26\r\nConnection: close\r\n\r\n1.2.3.4:8080\n5.6.7.8:3128\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let config = Config {
+            providers: Arc::from(vec!["custom".to_owned()]),
+            custom_sources: Arc::from(vec![url]),
+            cache_ttl: None,
+            ..Config::default()
+        };
+        let mut fetcher = ProxyFetcher::gather(config).await.unwrap();
+        let mut proxies = Vec::new();
+        while let Some(proxy) = fetcher.get_one().await {
+            proxies.push(proxy);
+        }
+        server.await.unwrap();
+
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].as_text(), "1.2.3.4:8080");
+        assert_eq!(proxies[1].as_text(), "5.6.7.8:3128");
     }
 
     #[tokio::test]
