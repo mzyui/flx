@@ -60,6 +60,23 @@ pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
     ]
 }
 
+/// Keeps only the providers whose name is included by `include` (when
+/// non-empty) and absent from `exclude`.
+pub fn select_providers(
+    providers: Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>>,
+    include: &[String],
+    exclude: &[String],
+) -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
+    providers
+        .into_iter()
+        .filter(|provider| {
+            let in_list = include.is_empty() || include.iter().any(|name| name == provider.name());
+            let excluded = exclude.iter().any(|name| name == provider.name());
+            in_list && !excluded
+        })
+        .collect()
+}
+
 #[async_trait]
 pub trait ProxyProvider {
     fn name(&self) -> &'static str;
@@ -241,12 +258,13 @@ fn append_utf8(
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyProvider, MAX_REDIRECTS};
+    use super::{select_providers, ProxyProvider, MAX_REDIRECTS};
     use http_body_util::Empty;
     use hyper::body::Bytes;
     use hyper_tls::HttpsConnector;
     use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-    use std::{borrow::Cow, sync::Arc, time::Duration};
+    use std::sync::Arc;
+    use std::{borrow::Cow, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -532,5 +550,40 @@ mod tests {
 
         assert!(format!("{error:#}").contains("timed out"));
         server.abort();
+    }
+
+    fn provider_names(providers: &[Arc<dyn ProxyProvider + Send + Sync>]) -> Vec<&'static str> {
+        providers.iter().map(|provider| provider.name()).collect()
+    }
+
+    #[test]
+    fn select_providers_empty_lists_keep_everything() {
+        let providers = super::all_providers();
+        let selected = select_providers(providers.clone(), &[], &[]);
+        assert_eq!(provider_names(&selected).len(), providers.len());
+    }
+
+    #[test]
+    fn select_providers_include_keeps_only_matching_names() {
+        let selected = select_providers(super::all_providers(), &["geonode".to_owned()], &[]);
+        assert_eq!(provider_names(&selected), vec!["geonode"]);
+    }
+
+    #[test]
+    fn select_providers_exclude_drops_matching_names() {
+        let selected = select_providers(super::all_providers(), &[], &["github-raw".to_owned()]);
+        let names = provider_names(&selected);
+        assert!(!names.contains(&"github-raw"));
+        assert_eq!(names.len(), super::all_providers().len() - 1);
+    }
+
+    #[test]
+    fn select_providers_exclude_wins_over_include() {
+        let selected = select_providers(
+            super::all_providers(),
+            &["proxyscrape".to_owned(), "geonode".to_owned()],
+            &["proxyscrape".to_owned()],
+        );
+        assert_eq!(provider_names(&selected), vec!["geonode"]);
     }
 }

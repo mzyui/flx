@@ -34,7 +34,7 @@ use tokio::{
 
 use crate::{
     geolookup::GeoLookup,
-    providers::{all_providers, models::Source, ProviderTier, ProxyProvider},
+    providers::{all_providers, models::Source, select_providers, ProviderTier, ProxyProvider},
     proxy::models::{Protocol, Proxy},
 };
 
@@ -127,7 +127,27 @@ impl ProxyFetcher {
             None
         };
 
-        let providers = all_providers();
+        let providers = select_providers(
+            all_providers(),
+            &config.providers,
+            &config.excluded_providers,
+        );
+        let known_names: Vec<&str> = all_providers()
+            .iter()
+            .map(|provider| provider.name())
+            .collect();
+        for name in config.providers.iter() {
+            if !known_names.contains(&name.as_str()) {
+                anyhow::bail!(
+                    "unknown provider `{name}` (available: {})",
+                    known_names.join(", ")
+                );
+            }
+        }
+        if providers.is_empty() {
+            #[cfg(feature = "log")]
+            log::warn!("provider selection matched no providers");
+        }
 
         let countries = config.normalized_countries();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -765,6 +785,27 @@ mod tests {
                 "country-filter guard should not fire when geo lookup is enabled: {e:#}"
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn gather_rejects_unknown_provider_name() {
+        let config = Config {
+            providers: Arc::from(vec!["not-a-provider".to_owned()]),
+            ..Config::default()
+        };
+        let result = ProxyFetcher::gather(config).await;
+        assert!(result.is_err());
+        let err = result.err().expect("already asserted is_err");
+        assert!(format!("{:#}", err).contains("unknown provider"));
+    }
+
+    #[tokio::test]
+    async fn gather_accepts_valid_provider_include() {
+        let config = Config {
+            providers: Arc::from(vec!["geonode".to_owned()]),
+            ..Config::default()
+        };
+        assert!(ProxyFetcher::gather(config).await.is_ok());
     }
 
     #[tokio::test]

@@ -534,6 +534,8 @@ fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
             .then(|| std::time::Duration::from_secs(options.cache_ttl.saturating_mul(60))),
         refresh_cache: options.refresh_cache,
         enforce_unique_ip: !options.no_dedup,
+        providers: Arc::from(options.provider.as_slice()),
+        excluded_providers: Arc::from(options.exclude_provider.as_slice()),
         ..Default::default()
     }
 }
@@ -1055,6 +1057,29 @@ mod tests {
 
         let default = fetch_from(&[]);
         assert!(fetcher_config(&default.fetcher).enforce_unique_ip);
+    }
+
+    #[test]
+    fn provider_flags_land_in_fetcher_config() {
+        let args = fetch_from(&["--provider", "geonode", "--provider", "proxyscrape"]);
+        assert_eq!(
+            fetcher_config(&args.fetcher).providers.as_ref(),
+            ["geonode".to_owned(), "proxyscrape".to_owned()]
+        );
+
+        let excluded = fetch_from(&["--exclude-provider", "github-raw"]);
+        assert_eq!(
+            fetcher_config(&excluded.fetcher)
+                .excluded_providers
+                .as_ref(),
+            ["github-raw".to_owned()]
+        );
+
+        let default = fetch_from(&[]);
+        assert!(fetcher_config(&default.fetcher).providers.is_empty());
+        assert!(fetcher_config(&default.fetcher)
+            .excluded_providers
+            .is_empty());
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub struct Config {
     pub fallback_threshold: Option<usize>,
     pub cache_ttl: Option<Duration>,
     pub refresh_cache: bool,
+    pub providers: Arc<[String]>,
+    pub excluded_providers: Arc<[String]>,
 }
 
 impl Config {
@@ -37,6 +39,8 @@ impl Default for Config {
                 DEFAULT_CACHE_TTL_MINUTES.saturating_mul(60),
             )),
             refresh_cache: false,
+            providers: Arc::from(Vec::new()),
+            excluded_providers: Arc::from(Vec::new()),
         }
     }
 }

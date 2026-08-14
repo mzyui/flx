@@ -209,6 +209,14 @@ pub struct FetcherArgs {
     #[arg(long, help_heading = "Advanced", default_value_t = false)]
     pub no_dedup: bool,
 
+    /// Scrape only the named providers; repeatable.
+    #[arg(long)]
+    pub provider: Vec<String>,
+
+    /// Skip the named providers; repeatable.
+    #[arg(long)]
+    pub exclude_provider: Vec<String>,
+
     /// List the providers and sources that would be fetched, then exit.
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
