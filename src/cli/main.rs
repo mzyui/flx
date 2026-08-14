@@ -200,7 +200,7 @@ fn main() -> std::process::ExitCode {
         Err(e) => {
             #[cfg(feature = "log")]
             log::error!("Error: {e:?}");
-            #[cfg(not(feature = "log"))]
+            // Fatal errors must be visible even when the log level is off.
             eprintln!("Error: {e:?}");
             std::process::ExitCode::FAILURE
         }

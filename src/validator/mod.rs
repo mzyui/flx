@@ -318,6 +318,28 @@ async fn aggregate_groups(
     }
 }
 
+// Builds a judge pool, retrying the whole preflight once after a short delay
+// so a transient network blip cannot abort the run.
+async fn preflight_pool(
+    urls: &[String],
+    timeout: Duration,
+    insecure: bool,
+) -> anyhow::Result<Arc<checker::JudgePool>> {
+    const PREFLIGHT_RETRIES: usize = 1;
+    const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..=PREFLIGHT_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(PREFLIGHT_RETRY_DELAY).await;
+        }
+        match checker::JudgePool::build(urls, timeout, insecure, report_dropped).await {
+            Ok(pool) => return Ok(pool),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("preflight_pool always runs at least one attempt"))
+}
+
 impl ProxyValidator {
     /// Validates every proxy yielded by the source stream.
     pub async fn validate<S>(proxy_source: S, config: Config) -> anyhow::Result<Self>
@@ -404,28 +426,18 @@ impl ProxyValidator {
             if !need_http {
                 return Ok::<Option<Arc<checker::JudgePool>>, anyhow::Error>(None);
             }
-            let pool = checker::JudgePool::build(
-                &config.http_judge_urls,
-                preflight_timeout,
-                insecure,
-                report_dropped,
-            )
-            .await
-            .context("HTTP online judge pool is empty after preflight")?;
+            let pool = preflight_pool(&config.http_judge_urls, preflight_timeout, insecure)
+                .await
+                .context("HTTP online judge pool is empty after preflight")?;
             Ok::<_, anyhow::Error>(Some(pool))
         };
         let tunnel_preflight = async {
             if !need_tunnel {
                 return Ok::<Option<Arc<checker::JudgePool>>, anyhow::Error>(None);
             }
-            let pool = checker::JudgePool::build(
-                &config.https_judge_urls,
-                preflight_timeout,
-                insecure,
-                report_dropped,
-            )
-            .await
-            .context("HTTPS online judge pool is empty after preflight")?;
+            let pool = preflight_pool(&config.https_judge_urls, preflight_timeout, insecure)
+                .await
+                .context("HTTPS online judge pool is empty after preflight")?;
             Ok::<_, anyhow::Error>(Some(pool))
         };
         let (http_target, tunnel_target) = tokio::join!(http_preflight, tunnel_preflight);
@@ -868,46 +880,87 @@ mod tests {
         assert!((progress.fraction() - 1.0).abs() < f64::EPSILON);
     }
 
+    #[tokio::test]
+    async fn judge_preflight_retries_after_transient_failure() {
+        // Offline-safe: the judge drops the first connection and echoes the
+        // token on the second, so preflight must retry once to pass.
+        let judge = spawn_flaky_echo_judge().await;
+        let config = Config {
+            types: vec![Protocol::Http(Anonymity::Unknown)],
+            http_judge_urls: vec![judge],
+            https_judge_urls: vec![],
+            ..Config::default()
+        };
+        let validator =
+            ProxyValidator::validate(futures_util::stream::iter(Vec::<Proxy>::new()), config)
+                .await
+                .unwrap();
+        assert_eq!(validator.progress().total(), 0);
+    }
+
     /// Spawns a plain-HTTP judge that echoes the `X-Fluxy-Token` header, enough
     /// to pass the startup preflight without touching the network.
     async fn spawn_echo_judge() -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let mut received = Vec::new();
-                loop {
-                    let n = match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    received.extend_from_slice(&buf[..n]);
-                    if received.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let mut token = String::new();
-                for line in received.split(|&b| b == b'\n') {
-                    let line = String::from_utf8_lossy(line);
-                    let (name, value) = line.split_once(':').unwrap_or(("", ""));
-                    if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
-                        token = value.trim().to_owned();
-                        break;
-                    }
-                }
-                let body = format!("HTTP_X_FLUXY_TOKEN = {token}");
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
+            if let Ok((stream, _)) = listener.accept().await {
+                serve_echo_judge(stream).await;
             }
         });
         format!("http://{address}/azenv.php")
+    }
+
+    // Spawns a judge that drops the first connection and echoes the token on
+    // the second, so the preflight retry is exercised without the network.
+    async fn spawn_flaky_echo_judge() -> String {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+            if let Ok((stream, _)) = listener.accept().await {
+                serve_echo_judge(stream).await;
+            }
+        });
+        format!("http://{address}/azenv.php")
+    }
+
+    async fn serve_echo_judge(mut stream: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut buf = [0u8; 4096];
+        let mut received = Vec::new();
+        loop {
+            let n = match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            received.extend_from_slice(&buf[..n]);
+            if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let mut token = String::new();
+        for line in received.split(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(line);
+            let (name, value) = line.split_once(':').unwrap_or(("", ""));
+            if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
+                token = value.trim().to_owned();
+                break;
+            }
+        }
+        let body = format!("HTTP_X_FLUXY_TOKEN = {token}");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
     }
 }
