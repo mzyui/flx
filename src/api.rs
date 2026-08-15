@@ -161,6 +161,13 @@ impl Flx {
         self
     }
 
+    /// Minimum delay in milliseconds between requests to the same host.
+    pub fn fetch_delay(mut self, milliseconds: u64) -> Self {
+        self.fetcher_config.fetch_delay =
+            (milliseconds > 0).then(|| Duration::from_millis(milliseconds));
+        self
+    }
+
     /// Custom HTTP judges for plain HTTP validation.
     pub fn http_judges(mut self, urls: impl Into<Vec<String>>) -> Self {
         self.validator_config.http_judge_urls = urls.into();
@@ -338,6 +345,18 @@ mod tests {
     fn offline_mode_is_stored() {
         assert!(!Flx::fetch().fetcher_config.offline);
         assert!(Flx::fetch().offline().fetcher_config.offline);
+    }
+
+    #[test]
+    fn fetch_delay_zero_disables_throttling() {
+        let disabled = Flx::fetch().fetch_delay(0);
+        assert!(disabled.fetcher_config.fetch_delay.is_none());
+
+        let enabled = Flx::fetch().fetch_delay(250);
+        assert_eq!(
+            enabled.fetcher_config.fetch_delay,
+            Some(std::time::Duration::from_millis(250))
+        );
     }
 
     #[tokio::test]

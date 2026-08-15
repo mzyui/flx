@@ -735,6 +735,8 @@ fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
         excluded_providers: Arc::from(options.exclude_provider.as_slice()),
         custom_sources: Arc::from(options.source_url.as_slice()),
         offline: options.offline,
+        fetch_delay: (options.fetch_delay_ms > 0)
+            .then(|| std::time::Duration::from_millis(options.fetch_delay_ms)),
         ..Default::default()
     }
 }
@@ -1304,6 +1306,18 @@ mod tests {
     fn offline_flag_lands_in_fetcher_config() {
         assert!(fetch_from(&["--offline"]).fetcher.offline);
         assert!(!fetch_from(&[]).fetcher.offline);
+    }
+
+    #[test]
+    fn fetch_delay_flag_lands_in_fetcher_config() {
+        let set = fetch_from(&["--fetch-delay-ms", "250"]);
+        assert_eq!(
+            fetcher_config(&set.fetcher).fetch_delay,
+            Some(std::time::Duration::from_millis(250))
+        );
+
+        let default = fetch_from(&[]);
+        assert_eq!(fetcher_config(&default.fetcher).fetch_delay, None);
     }
 
     #[test]

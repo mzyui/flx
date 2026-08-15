@@ -3,13 +3,13 @@ mod config;
 
 use std::{
     borrow::Cow,
-    collections::{hash_map::DefaultHasher, VecDeque},
+    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     hash::{Hash, Hasher},
     net::Ipv4Addr,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
     time::Duration,
@@ -189,6 +189,7 @@ impl ProxyFetcher {
         let concurrency_limit = config.concurrency_limit;
         let fallback_threshold = config.fallback_threshold;
         let offline = config.offline;
+        let fetch_delay = config.fetch_delay;
 
         // The local body cache is optional and best-effort: if the cache dir
         // cannot be prepared the run simply proceeds without caching.
@@ -204,6 +205,8 @@ impl ProxyFetcher {
             },
             None => None,
         };
+
+        let throttle = Arc::new(Throttle::new());
 
         // Proxies are counted by the consumer as they are accepted, so the
         // coordinator can size up the primary phase without any extra channel
@@ -226,6 +229,12 @@ impl ProxyFetcher {
         let coordinator = tokio::spawn({
             let sender = sender.clone();
             async move {
+                let settings = FetchSettings {
+                    fetch_cache,
+                    offline,
+                    throttle,
+                    fetch_delay,
+                };
                 let mut stop_rx_coordinator = stop_rx_coordinator;
                 let sem = Arc::new(Semaphore::new(concurrency_limit));
                 let mut primary_handles = spawn_phase(
@@ -234,8 +243,7 @@ impl ProxyFetcher {
                     &sem,
                     sender.clone(),
                     stop_rx_primary,
-                    fetch_cache.clone(),
-                    offline,
+                    &settings,
                 );
 
                 let mut primary_aborted = false;
@@ -298,15 +306,8 @@ impl ProxyFetcher {
                     fallback.len()
                 );
 
-                let mut fallback_handles = spawn_phase(
-                    fallback,
-                    &client,
-                    &sem,
-                    sender,
-                    stop_rx_fallback,
-                    fetch_cache,
-                    offline,
-                );
+                let mut fallback_handles =
+                    spawn_phase(fallback, &client, &sem, sender, stop_rx_fallback, &settings);
                 while fallback_handles.join_next().await.is_some() {}
             }
         });
@@ -347,8 +348,7 @@ fn spawn_phase(
     sem: &Arc<Semaphore>,
     tx: mpsc::Sender<Proxy>,
     stop_rx: watch::Receiver<bool>,
-    fetch_cache: Option<Arc<cache::Cache>>,
-    offline: bool,
+    settings: &FetchSettings,
 ) -> JoinSet<()> {
     let mut handles = JoinSet::new();
     for (source, provider) in tasks {
@@ -356,24 +356,11 @@ fn spawn_phase(
         let client = Arc::clone(client);
         let tx = tx.clone();
         let stop_rx = stop_rx.clone();
-        let fetch_cache = fetch_cache.clone();
+        let settings = settings.clone();
 
         handles.spawn(async move {
             let url = source.url.to_string();
-            if let Err(e) = do_work(
-                provider,
-                client,
-                source,
-                tx,
-                permit,
-                stop_rx,
-                FetchSettings {
-                    fetch_cache,
-                    offline,
-                },
-            )
-            .await
-            {
+            if let Err(e) = do_work(provider, client, source, tx, permit, stop_rx, settings).await {
                 #[cfg(feature = "log")]
                 log::error!("{}: {}", url, e);
                 let _ = (url, e);
@@ -384,9 +371,55 @@ fn spawn_phase(
 }
 
 /// Fetch behaviour shared by every source task.
+#[derive(Clone)]
 struct FetchSettings {
     fetch_cache: Option<Arc<cache::Cache>>,
     offline: bool,
+    throttle: Arc<Throttle>,
+    fetch_delay: Option<Duration>,
+}
+
+/// Serializes network requests to the same host.
+struct Throttle {
+    last: Mutex<HashMap<String, time::Instant>>,
+}
+
+impl Throttle {
+    fn new() -> Self {
+        Self {
+            last: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn wait(&self, host: &str, delay: Duration) {
+        let remaining = {
+            let mut last = self.last.lock().unwrap();
+            let now = time::Instant::now();
+            let remaining = last
+                .get(host)
+                .map(|prev| delay.saturating_sub(prev.elapsed()))
+                .unwrap_or_default();
+            last.insert(host.to_owned(), now);
+            remaining
+        };
+        if !remaining.is_zero() {
+            time::sleep(remaining).await;
+        }
+    }
+}
+
+fn source_host(source: &Source) -> String {
+    source
+        .url
+        .host()
+        .map(str::to_owned)
+        .unwrap_or_else(|| source.url.to_string())
+}
+
+async fn throttle_wait(settings: &FetchSettings, source: &Source) {
+    if let Some(delay) = settings.fetch_delay {
+        settings.throttle.wait(&source_host(source), delay).await;
+    }
 }
 
 async fn do_work(
@@ -420,6 +453,7 @@ async fn do_work(
                     .acquire()
                     .await
                     .context("fetcher semaphore closed during shutdown")?;
+                throttle_wait(&settings, &source).await;
                 let body = provider
                     .fetch(client, &url, source.timeout)
                     .await
@@ -441,6 +475,7 @@ async fn do_work(
                 .acquire()
                 .await
                 .context("fetcher semaphore closed during shutdown")?;
+            throttle_wait(&settings, &source).await;
             provider
                 .fetch(client, &url, source.timeout)
                 .await
@@ -623,7 +658,10 @@ impl Drop for ProxyFetcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_proxy, do_work, finish_phase, protocol_hash, DedupTable, ProxyFetcher};
+    use super::{
+        accept_proxy, do_work, finish_phase, protocol_hash, source_host, DedupTable, ProxyFetcher,
+        Throttle,
+    };
     use crate::fetcher::{cache::Cache, Config};
     use crate::geolookup::models::GeoData;
     use crate::providers::models::Source;
@@ -958,6 +996,8 @@ mod tests {
             super::FetchSettings {
                 fetch_cache: Some(Arc::new(cache)),
                 offline: true,
+                throttle: Arc::new(super::Throttle::new()),
+                fetch_delay: None,
             },
         )
         .await
@@ -996,6 +1036,8 @@ mod tests {
             super::FetchSettings {
                 fetch_cache: Some(Arc::new(cache)),
                 offline: true,
+                throttle: Arc::new(super::Throttle::new()),
+                fetch_delay: None,
             },
         )
         .await
@@ -1026,5 +1068,41 @@ mod tests {
         let mut handles = JoinSet::new();
         handles.spawn(async {});
         assert!(finish_phase(handles, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn throttle_spaces_same_host_requests_by_delay() {
+        let throttle = Throttle::new();
+        let delay = Duration::from_millis(100);
+
+        throttle.wait("example.com", delay).await;
+        let start = tokio::time::Instant::now();
+        throttle.wait("example.com", delay).await;
+
+        assert!(
+            start.elapsed() >= delay - Duration::from_millis(50),
+            "a second request to the same host must wait out the delay window"
+        );
+    }
+
+    #[tokio::test]
+    async fn throttle_does_not_delay_unseen_hosts() {
+        let throttle = Throttle::new();
+        let delay = Duration::from_secs(10);
+
+        throttle.wait("example.com", delay).await;
+        let start = tokio::time::Instant::now();
+        throttle.wait("other.example.org", delay).await;
+
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a fresh host must not be held back by another host's delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_host_comes_from_url_host() {
+        let source = Arc::new(Source::all("http://lists.example.org/proxies?page=1").unwrap());
+        assert_eq!(source_host(&source), "lists.example.org");
     }
 }

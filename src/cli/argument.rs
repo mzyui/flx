@@ -235,6 +235,10 @@ pub struct FetcherArgs {
     #[arg(long, help_heading = "Fetching")]
     pub refresh_cache: bool,
 
+    /// Minimum delay in milliseconds between requests to the same host.
+    #[arg(long, default_value_t = 0, help_heading = "Fetching")]
+    pub fetch_delay_ms: u64,
+
     /// Disable deduplication of identical endpoints across sources.
     #[arg(long, help_heading = "Fetching")]
     pub no_dedup: bool,

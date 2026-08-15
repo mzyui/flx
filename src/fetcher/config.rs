@@ -13,6 +13,7 @@ pub struct Config {
     pub excluded_providers: Arc<[String]>,
     pub custom_sources: Arc<[String]>,
     pub offline: bool,
+    pub fetch_delay: Option<Duration>,
 }
 
 impl Config {
@@ -45,6 +46,7 @@ impl Default for Config {
             excluded_providers: Arc::from(Vec::new()),
             custom_sources: Arc::from(Vec::new()),
             offline: false,
+            fetch_delay: None,
         }
     }
 }
@@ -76,5 +78,10 @@ mod tests {
         assert!(countries.contains("ID"));
         assert!(countries.contains("US"));
         assert_eq!(countries.len(), 2);
+    }
+
+    #[test]
+    fn fetch_delay_is_disabled_by_default() {
+        assert_eq!(Config::default().fetch_delay, None);
     }
 }
