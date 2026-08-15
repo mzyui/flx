@@ -58,8 +58,8 @@ impl Display for Frame {
     }
 }
 
-fn show_progress(quiet: bool, stderr_is_terminal: bool, stdout_is_terminal: bool) -> bool {
-    !quiet && stderr_is_terminal && stdout_is_terminal
+fn show_progress(quiet: bool, stderr_is_terminal: bool, stdout_is_pipe: bool) -> bool {
+    !quiet && stderr_is_terminal && !stdout_is_pipe
 }
 
 fn use_color(no_color: bool) -> bool {
@@ -71,14 +71,15 @@ pub struct ValidationBar {
 }
 
 impl ValidationBar {
-    pub fn new(progress: ValidationProgress, quiet: bool, no_color: bool) -> Option<Self> {
+    pub fn new(
+        progress: ValidationProgress,
+        quiet: bool,
+        no_color: bool,
+        stdout_is_pipe: bool,
+    ) -> Option<Self> {
         use std::io::IsTerminal as _;
 
-        if !show_progress(
-            quiet,
-            std::io::stderr().is_terminal(),
-            std::io::stdout().is_terminal(),
-        ) {
+        if !show_progress(quiet, std::io::stderr().is_terminal(), stdout_is_pipe) {
             return None;
         }
         // The global `colored` override is set once in `run_application`, so
@@ -114,13 +115,13 @@ mod tests {
     use flx::ValidationProgress;
 
     #[test]
-    fn progress_is_hidden_when_quiet_or_not_a_terminal() {
-        assert!(show_progress(false, true, true));
-        assert!(!show_progress(true, true, true));
-        assert!(!show_progress(false, false, true));
+    fn progress_is_hidden_when_quiet_or_stdout_is_piped() {
+        assert!(show_progress(false, true, false));
+        assert!(!show_progress(true, true, false));
+        assert!(!show_progress(false, false, false));
         // A piped stdout means a downstream process owns the terminal; the bar
-        // must stay quiet there.
-        assert!(!show_progress(false, true, false));
+        // must stay quiet there. Redirecting to a regular file keeps the bar.
+        assert!(!show_progress(false, true, true));
     }
 
     #[test]

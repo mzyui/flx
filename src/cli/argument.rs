@@ -1,46 +1,37 @@
-use clap::builder::styling::AnsiColor;
-use clap::builder::{PossibleValue, Styles, TypedValueParser};
+use clap::builder::PossibleValue;
+use clap::builder::TypedValueParser;
 use clap::{Args, Parser, Subcommand};
-
-fn get_styles() -> Styles {
-    Styles::styled()
-        .header(AnsiColor::Yellow.on_default())
-        .usage(AnsiColor::Green.on_default())
-        .literal(AnsiColor::BrightGreen.on_default())
-        .placeholder(AnsiColor::Cyan.on_default())
-}
-
-fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| "must be a positive integer".to_owned())?;
-    if parsed == 0 {
-        Err("must be greater than zero".to_owned())
-    } else {
-        Ok(parsed)
-    }
-}
+use std::path::PathBuf;
 
 const VALID_TYPE_NAMES: &[&str] = &[
     "HTTP",
-    "HTTP:Transparent",
-    "HTTP:Anonymous",
-    "HTTP:Elite",
     "HTTPS",
-    "HTTPS:Transparent",
-    "HTTPS:Anonymous",
-    "HTTPS:Elite",
     "SOCKS4",
     "SOCKS5",
+    "CONNECT:80",
+    "CONNECT:25",
+    "HTTP+HTTPS",
+    "HTTP+HTTPS+SOCKS4",
+    "HTTP+HTTPS+SOCKS5",
+    "HTTP+SOCKS4",
+    "HTTP+SOCKS5",
+    "HTTPS+SOCKS4",
+    "HTTPS+SOCKS5",
+    "SOCKS4+SOCKS5",
 ];
 
 fn is_valid_type_value(value: &str) -> bool {
-    value.split('+').all(|part| {
-        VALID_TYPE_NAMES.contains(&part)
-            || part
-                .strip_prefix("CONNECT:")
-                .is_some_and(|port| port.parse::<u16>().is_ok())
-    })
+    VALID_TYPE_NAMES.contains(&value)
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let n: usize = value
+        .parse()
+        .map_err(|_| format!("{value} is not a valid integer"))?;
+    if n == 0 {
+        return Err(format!("{value} must be greater than zero"));
+    }
+    Ok(n)
 }
 
 #[derive(Clone)]
@@ -55,33 +46,20 @@ impl TypedValueParser for TypesValueParser {
         _arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        let value = value
-            .to_str()
-            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidValue).with_cmd(cmd))?;
-        if is_valid_type_value(value) {
-            Ok(value.to_owned())
+        let raw = value.to_string_lossy();
+        if is_valid_type_value(&raw) {
+            Ok(raw.into_owned())
         } else {
-            let mut error = clap::Error::new(clap::error::ErrorKind::InvalidValue).with_cmd(cmd);
-            error.insert(
+            let mut err = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+            err.insert(
                 clap::error::ContextKind::InvalidArg,
                 clap::error::ContextValue::String("TYPES".to_owned()),
             );
-            error.insert(
+            err.insert(
                 clap::error::ContextKind::InvalidValue,
-                clap::error::ContextValue::String(value.to_string()),
+                clap::error::ContextValue::String(raw.into_owned()),
             );
-            error.insert(
-                clap::error::ContextKind::ValidValue,
-                clap::error::ContextValue::Strings(
-                    VALID_TYPE_NAMES
-                        .iter()
-                        .map(|name| name.to_string())
-                        .chain(std::iter::once("CONNECT:<port>".to_string()))
-                        .chain(std::iter::once("HTTP+HTTPS".to_string()))
-                        .collect(),
-                ),
-            );
-            Err(error)
+            Err(err)
         }
     }
 }
@@ -89,44 +67,37 @@ impl TypedValueParser for TypesValueParser {
 #[derive(Parser, Debug)]
 #[command(
     name = "flx",
-    after_help = "Suggestions and bug reports are greatly appreciated:\nhttps://github.com/zevtyardt/flx/issues",
-    styles=get_styles()
+    version,
+    about = "Proxy scraper and validator",
+    after_help = "Suggestions and bug reports: https://github.com/zevtyardt/flx/issues"
 )]
 pub struct Cli {
-    /// Subcommand to run.
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// Suppress non-essential output.
+    #[arg(short = 'q', long, help_heading = "Global")]
+    pub quiet: bool,
+
+    /// Disable colored output.
+    #[arg(long, help_heading = "Global")]
+    pub no_color: bool,
 
     /// Log level for application output.
     #[arg(
         long = "log",
         default_value = "off",
+        help_heading = "Global",
         value_parser([
-            PossibleValue::new("debug"),
-            PossibleValue::new("info"),
-            PossibleValue::new("warn"),
-            PossibleValue::new("error"),
-            PossibleValue::new("trace"),
-            PossibleValue::new("off"),
+            PossibleValue::new("debug").help("Show debug messages"),
+            PossibleValue::new("info").help("Show informational messages"),
+            PossibleValue::new("warn").help("Show warnings only"),
+            PossibleValue::new("error").help("Show errors only"),
+            PossibleValue::new("trace").help("Show all messages"),
+            PossibleValue::new("off").help("No log output"),
         ])
     )]
     pub log_level: String,
-
-    /// Generate a shell completion script and exit.
-    #[arg(long, value_enum, value_name = "SHELL")]
-    pub generate_completions: Option<clap_complete::Shell>,
-
-    /// Generate a man page and exit.
-    #[arg(long, default_value_t = false)]
-    pub generate_man_page: bool,
-
-    /// Suppress non-essential output, such as the validation progress line.
-    #[arg(long, default_value_t = false)]
-    pub quiet: bool,
-
-    /// Disable colored output, including colors in the validation progress line.
-    #[arg(long, default_value_t = false)]
-    pub no_color: bool,
 }
 
 /// The pipeline commands available in the CLI.
@@ -134,216 +105,214 @@ pub struct Cli {
 pub enum Command {
     /// Scrape proxies from the built-in providers and print them.
     Grab(FetchArgs),
-    /// Validate proxies from a file or the built-in providers against online
-    /// judges, printing the survivors.
+    /// Validate proxies from a file or the built-in providers against online judges.
     Find(FindArgs),
-    /// Download (if missing) and verify the GeoLite2 database used for GeoIP
-    /// lookups, then exit.
+    /// Download and verify the GeoLite2 GeoIP database.
+    #[command(name = "geo-update")]
     GeoUpdate,
 }
 
 /// Options shared by every command that render proxies.
-#[derive(Args, Debug, Clone, Default)]
+#[derive(Args, Debug, Clone)]
 pub struct OutputOptions {
     /// Output format for the results.
     #[arg(
-        short,
+        short = 'f',
         long,
         default_value = "default",
+        help_heading = "Output",
         value_parser([
-            PossibleValue::new("default"),
-            PossibleValue::new("text"),
-            PossibleValue::new("json"),
-            PossibleValue::new("json-lines"),
-            PossibleValue::new("pretty-json"),
-            PossibleValue::new("csv"),
+            PossibleValue::new("csv").help("Comma-separated ip,port,protocol,anonymity,country,city,response_time_ms"),
+            PossibleValue::new("default").help("Human-readable summary (json-lines when piped; -o infers format from extension)"),
+            PossibleValue::new("json").help("Compact JSON array"),
+            PossibleValue::new("json-lines").help("One JSON object per line"),
+            PossibleValue::new("pac").help("Proxy Auto-Config JavaScript file"),
+            PossibleValue::new("prefix").help("socks5://ip:port one per line"),
+            PossibleValue::new("pretty-json").help("Indented JSON array"),
+            PossibleValue::new("proxychains").help("proxychains.conf format: type ip port"),
+            PossibleValue::new("text").help("ip:port one per line"),
         ])
     )]
     pub format: String,
 
     /// Maximum number of proxies to retrieve.
-    #[arg(short, long, default_value = "0")]
+    #[arg(short = 'l', long, default_value = "0", help_heading = "Output")]
     pub limit: usize,
 
-    /// File path to save the retrieved proxies; prints to the console otherwise.
-    #[arg(short, long)]
-    pub output_file: Option<std::path::PathBuf>,
+    /// File path to save the retrieved proxies.
+    #[arg(short = 'o', long, help_heading = "Output")]
+    pub output_file: Option<PathBuf>,
 
-    /// Only keep proxies whose best anonymity is at least this level.
-    #[arg(long, value_parser([
-        PossibleValue::new("transparent"),
-        PossibleValue::new("anonymous"),
-        PossibleValue::new("elite"),
-        PossibleValue::new("unknown"),
-    ]))]
-    pub min_anonymity: Option<String>,
-
-    /// Drop proxies slower than this many seconds.
-    #[arg(long)]
-    pub max_response_time: Option<f64>,
-
-    /// Drop proxies faster than this many seconds.
-    #[arg(long)]
-    pub min_response_time: Option<f64>,
-
-    /// Sort the output by this field; buffers the whole result set.
-    #[arg(long, value_parser([
-        PossibleValue::new("avg-response"),
-        PossibleValue::new("country"),
-        PossibleValue::new("anonymity"),
-    ]))]
+    /// Sort the output by this field.
+    #[arg(
+        short = 's',
+        long,
+        help_heading = "Output",
+        value_parser([
+            PossibleValue::new("avg-response").help("Average response time"),
+            PossibleValue::new("country").help("Country ISO code"),
+            PossibleValue::new("anonymity").help("Anonymity level"),
+            PossibleValue::new("response-time").help("Response time"),
+        ])
+    )]
     pub sort: Option<String>,
 
-    /// Sort direction; only meaningful together with `--sort`.
+    /// Sort direction.
     #[arg(
         long,
         default_value = "asc",
-        value_parser([PossibleValue::new("asc"), PossibleValue::new("desc")])
+        help_heading = "Output",
+        value_parser([
+            PossibleValue::new("asc").help("Ascending order"),
+            PossibleValue::new("desc").help("Descending order"),
+        ])
     )]
     pub order: String,
+
+    /// Only keep proxies whose best anonymity is at least this level.
+    #[arg(
+        short = 'a',
+        long,
+        help_heading = "Filtering",
+        value_parser([
+            PossibleValue::new("transparent").help("No anonymity guarantee"),
+            PossibleValue::new("anonymous").help("Hides client IP"),
+            PossibleValue::new("elite").help("Hides proxy usage entirely"),
+            PossibleValue::new("unknown").help("Anonymity could not be determined"),
+        ])
+    )]
+    pub min_anonymity: Option<String>,
+
+    /// Drop proxies slower than this many seconds.
+    #[arg(long, help_heading = "Filtering")]
+    pub max_response_time: Option<f64>,
+
+    /// Drop proxies faster than this many seconds.
+    #[arg(long, help_heading = "Filtering")]
+    pub min_response_time: Option<f64>,
 }
 
 /// Options controlling how proxies are scraped from the built-in providers.
-#[derive(Args, Debug, Clone, Default)]
+#[derive(Args, Debug, Clone)]
 pub struct FetcherArgs {
     /// List of ISO country codes to filter proxies by location.
-    #[arg(short, long, num_args(1..))]
+    #[arg(short = 'c', long, num_args(1..), help_heading = "Fetching")]
     pub countries: Vec<String>,
 
-    /// Enable GeoIP lookup so every proxy carries country information in the
-    /// output without filtering by location.
-    #[arg(long)]
+    /// Enable GeoIP lookup without filtering by location.
+    #[arg(short = 'g', long, help_heading = "Fetching")]
     pub with_geo: bool,
 
-    /// Maximum number of proxy sources fetched concurrently.
-    #[arg(
-        long,
-        help_heading = "Advanced",
-        default_value_t = flx::fetcher::DEFAULT_CONCURRENCY_LIMIT as u64,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    pub fetch_concurrency: u64,
-
-    /// Freshness in minutes for the local provider-source cache; `0` disables
-    /// the cache entirely.
-    #[arg(
-        long,
-        help_heading = "Advanced",
-        default_value_t = flx::fetcher::DEFAULT_CACHE_TTL_MINUTES,
-        value_parser = clap::value_parser!(u64)
-    )]
-    pub cache_ttl: u64,
-
-    /// Ignore the local provider-source cache and fetch every source again.
-    #[arg(long, help_heading = "Advanced", default_value_t = false)]
-    pub refresh_cache: bool,
-
-    /// Disable deduplication of identical endpoints across sources.
-    #[arg(long, help_heading = "Advanced", default_value_t = false)]
-    pub no_dedup: bool,
-
-    /// Scrape only the named providers; repeatable.
-    #[arg(long)]
+    /// Scrape only the named providers.
+    #[arg(short = 'p', long, help_heading = "Fetching")]
     pub provider: Vec<String>,
 
-    /// Skip the named providers; repeatable.
-    #[arg(long)]
+    /// Skip the named providers.
+    #[arg(long, help_heading = "Fetching")]
     pub exclude_provider: Vec<String>,
 
-    /// Fetch an additional proxy list from this plaintext URL; repeatable.
-    #[arg(long)]
+    /// Fetch an additional proxy list from this plaintext URL.
+    #[arg(long, help_heading = "Fetching")]
     pub source_url: Vec<String>,
 
-    /// Serve providers only from the local cache; skip anything uncached.
-    #[arg(long, default_value_t = false)]
+    /// Serve providers only from the local cache.
+    #[arg(long, help_heading = "Fetching")]
     pub offline: bool,
 
     /// List the providers and sources that would be fetched, then exit.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, help_heading = "Fetching")]
     pub dry_run: bool,
+
+    /// Maximum number of proxy sources fetched concurrently.
+    #[arg(long, default_value_t = 25, help_heading = "Fetching")]
+    pub fetch_concurrency: usize,
+
+    /// Freshness in minutes for the local provider-source cache.
+    #[arg(long, default_value_t = 15, help_heading = "Fetching")]
+    pub cache_ttl: u64,
+
+    /// Ignore the local provider-source cache and fetch every source again.
+    #[arg(long, help_heading = "Fetching")]
+    pub refresh_cache: bool,
+
+    /// Disable deduplication of identical endpoints across sources.
+    #[arg(long, help_heading = "Fetching")]
+    pub no_dedup: bool,
 }
 
 /// `flx grab`: scrape proxies from the built-in providers and print them.
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug)]
 pub struct FetchArgs {
     #[command(flatten)]
     pub fetcher: FetcherArgs,
+
     #[command(flatten)]
     pub output: OutputOptions,
 }
 
 /// Options controlling proxy validation against online judges.
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Clone)]
 pub struct ValidatorArgs {
-    /// Proxy types (protocols) to validate; combine several with `+` to
-    /// require all of them and omit to default to `HTTP`.
-    #[arg(num_args(1..), value_parser = TypesValueParser)]
+    /// Proxy types to validate (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT:80, CONNECT:25).
+    #[arg(num_args(1..), value_parser = TypesValueParser, help_heading = "Validation")]
     pub types: Vec<String>,
 
     /// Maximum number of concurrent proxy checks.
-    #[arg(
-        short,
-        long,
-        help_heading = "Advanced",
-        default_value_t = flx::validator::DEFAULT_CONCURRENCY_LIMIT as u64,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    pub max_connections: u64,
+    #[arg(short = 'm', long, default_value_t = 500, help_heading = "Validation")]
+    pub max_connections: usize,
 
     /// Maximum number of attempts to validate a proxy.
-    #[arg(
-        long,
-        help_heading = "Advanced",
-        default_value = "1",
-        value_parser = parse_positive_usize
-    )]
+    #[arg(long, default_value = "1", value_parser = parse_positive_usize, help_heading = "Validation")]
     pub max_attempts: usize,
 
     /// Timeout duration in seconds before giving up.
-    #[arg(
-        long,
-        help_heading = "Advanced",
-        default_value = "3",
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
+    #[arg(long, default_value_t = 3, help_heading = "Validation")]
     pub timeout: u64,
 
     /// Online judges used to validate plain HTTP proxy forwarding.
     #[arg(
         long,
-        help_heading = "Advanced",
         default_value = "http://azenv.net/,http://wfuchs.de/azenv.php,http://proxyjudge.us/,http://shinh.org/env.cgi",
-        value_delimiter = ','
+        value_delimiter = ',',
+        help_heading = "Validation"
     )]
     pub http_judge_urls: Vec<String>,
 
     /// Online judges used for HTTPS, CONNECT and SOCKS tunnels.
     #[arg(
         long,
-        help_heading = "Advanced",
         default_value = "https://aranguren.org/azenv.php,https://wfuchs.de/azenv.php",
-        value_delimiter = ','
+        value_delimiter = ',',
+        help_heading = "Validation"
     )]
     pub https_judge_urls: Vec<String>,
 
-    /// Disable TLS certificate validation for judge connections.
-    #[arg(long, help_heading = "Advanced", default_value_t = false)]
-    pub insecure: bool,
+    /// Disable TLS certificate verification.
+    #[arg(
+        long = "verify-tls",
+        default_value = "false",
+        help_heading = "Validation",
+        value_parser([
+            PossibleValue::new("true").help("Verify TLS certificates"),
+            PossibleValue::new("false").help("Skip TLS certificate verification"),
+        ])
+    )]
+    pub verify_tls: String,
+
+    /// Path to a file containing proxy endpoints (ip:port per line).
+    #[arg(long, help_heading = "Validation")]
+    pub file: Option<PathBuf>,
 }
 
 /// `flx find`: validate proxies from a file or the built-in providers.
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug)]
 pub struct FindArgs {
     #[command(flatten)]
     pub fetcher: FetcherArgs,
 
-    /// File path containing proxies; overrides providers if specified.
-    #[arg(long)]
-    pub file: Option<std::path::PathBuf>,
+    #[command(flatten)]
+    pub output: OutputOptions,
 
     #[command(flatten)]
     pub validator: ValidatorArgs,
-
-    #[command(flatten)]
-    pub output: OutputOptions,
 }

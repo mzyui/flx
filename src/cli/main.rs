@@ -1,9 +1,7 @@
 use anyhow::Context;
-use argument::{Cli, Command, FetchArgs, FetcherArgs, FindArgs, OutputOptions, ValidatorArgs};
-use clap::{
-    error::{ContextKind, ContextValue, ErrorKind},
-    CommandFactory, Parser,
-};
+use argument::Cli;
+use argument::{Command, FetchArgs, FetcherArgs, FindArgs, OutputOptions, ValidatorArgs};
+use clap::Parser;
 #[cfg(feature = "progress_bar")]
 use colored::Colorize;
 #[cfg(feature = "log")]
@@ -211,16 +209,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn report_invalid_type_value(value: &str) {
-    let mut error = clap::Error::new(ErrorKind::ValueValidation).with_cmd(&Cli::command());
-    error.insert(
-        ContextKind::InvalidArg,
-        ContextValue::String("TYPES".to_owned()),
-    );
-    error.insert(
-        ContextKind::InvalidValue,
-        ContextValue::String(value.to_string()),
-    );
-    let _ = error.print();
+    eprintln!("error: invalid value '{value}' for TYPES");
 }
 
 #[cfg(test)]
@@ -268,11 +257,35 @@ fn split_type_groups(tokens: &[String]) -> (Vec<Protocol>, Vec<Vec<Protocol>>) {
     (types, groups)
 }
 
-fn effective_format(format: &str, has_output_file: bool, stdout_is_tty: bool) -> &str {
-    if format == "default" && !has_output_file && !stdout_is_tty {
-        "json-lines"
-    } else {
+// Resolves the output format when the user left `--format` at `default`: an
+// explicit `-o` path infers the format from its file extension and a piped
+// stdout switches to `json-lines`.
+fn effective_format<'a>(
+    format: &'a str,
+    output_path: Option<&std::path::Path>,
+    stdout_is_tty: bool,
+) -> &'a str {
+    if format != "default" {
+        return format;
+    }
+    if let Some(path) = output_path {
+        return match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("json") => "json",
+            Some("jsonl") | Some("ndjson") => "json-lines",
+            Some("csv") => "csv",
+            Some("pac") => "pac",
+            _ => format,
+        };
+    }
+    if stdout_is_tty {
         format
+    } else {
+        "json-lines"
     }
 }
 
@@ -373,6 +386,46 @@ impl ProxyFilter {
     }
 }
 
+/// Maps a proxy's best protocol to a proxychains type string.
+fn proxychains_type(proxy: &Proxy) -> &'static str {
+    for pt in &proxy.proxy_types {
+        match pt.protocol {
+            Protocol::Socks5 => return "socks5",
+            Protocol::Socks4 => return "socks4",
+            _ => {}
+        }
+    }
+    for pt in &proxy.proxy_types {
+        match pt.protocol {
+            Protocol::Http(_) | Protocol::Https(_) => return "http",
+            _ => {}
+        }
+    }
+    "http"
+}
+
+/// Renders a PAC `FindProxyForURL` function from a list of proxies.
+fn render_pac(proxies: &[Proxy]) -> String {
+    let mut out = String::from("function FindProxyForURL(url, host) {\n    return \"");
+    for (i, proxy) in proxies.iter().enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        let directive = proxy
+            .proxy_types
+            .first()
+            .map(|pt| match pt.protocol {
+                Protocol::Socks5 => "SOCKS5",
+                Protocol::Socks4 => "SOCKS",
+                _ => "PROXY",
+            })
+            .unwrap_or("PROXY");
+        out.push_str(&format!("{directive} {}:{}", proxy.ip, proxy.port));
+    }
+    out.push_str("; DIRECT\";\n}\n");
+    out
+}
+
 async fn process_result<S>(
     source: S,
     options: OutputOptions,
@@ -385,7 +438,7 @@ where
 {
     let format = effective_format(
         &options.format,
-        options.output_file.is_some(),
+        options.output_file.as_deref(),
         std::io::stdout().is_terminal(),
     );
     let mut output_file = match options.output_file.as_ref() {
@@ -420,6 +473,49 @@ where
         })
         .enumerate());
 
+    // PAC needs all proxies up front to render FindProxyForURL.
+    if format == "pac" {
+        let mut proxies: Vec<Proxy> = Vec::new();
+        loop {
+            tokio::select! {
+                _ = cancel.notified() => {
+                    cancelled = true;
+                    break;
+                }
+                item = source.next() => {
+                    let Some((_index, proxy)) = item else { break };
+                    if options.limit > 0 && proxies.len() >= options.limit {
+                        break;
+                    }
+                    proxies.push(proxy);
+                }
+            }
+        }
+        if !cancelled {
+            let pac = render_pac(&proxies);
+            if let Some(ref mut file) = output_file {
+                if let Err(error) = file.write_all(pac.as_bytes()).await {
+                    return Err(
+                        anyhow::Error::new(error).context("failed to write PAC to output file")
+                    );
+                }
+            } else {
+                guard.before_write();
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(pac.as_bytes())
+                    .expect("failed to write PAC to stdout");
+                guard.after_write();
+            }
+        }
+        if let Some(file) = output_file.as_mut() {
+            let _ = file.flush().await;
+        }
+        if cancelled {
+            return Ok(RunOutcome::Cancelled);
+        }
+        return Ok(RunOutcome::Finished);
+    }
     // One stdout lock for the whole run instead of `print!` re-acquiring the
     // global lock (`std::io::_print`) for every proxy.
     let mut stdout = std::io::stdout().lock();
@@ -509,7 +605,16 @@ where
                     "csv" => {
                         write_csv_row(&mut buf, &proxy);
                     }
-                    _ => writeln!(&mut buf, "{}", proxy).expect("writing to a Vec cannot fail"),
+                    "proxychains" => {
+                        let pt = proxychains_type(&proxy);
+                        write!(&mut buf, "{pt} {} {}", proxy.ip, proxy.port).unwrap();
+                        buf.push(b'\n');
+                    }
+                    "prefix" => {
+                        write!(&mut buf, "socks5://{}:{}", proxy.ip, proxy.port).unwrap();
+                        buf.push(b'\n');
+                    }
+                     _ => writeln!(&mut buf, "{}", proxy).expect("writing to a Vec cannot fail"),
                 };
 
                 if let Some(ref mut file) = output_file {
@@ -619,7 +724,7 @@ async fn write_output(
 
 fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
     flx::fetcher::Config {
-        concurrency_limit: options.fetch_concurrency as usize,
+        concurrency_limit: options.fetch_concurrency,
         enable_geo_lookup: options.with_geo || !options.countries.is_empty(),
         countries: Arc::from(options.countries.as_slice()),
         cache_ttl: (options.cache_ttl > 0)
@@ -664,16 +769,6 @@ async fn file_source(path: &std::path::Path) -> anyhow::Result<BoxStream> {
 fn run_application() -> anyhow::Result<RunOutcome> {
     let cli = Cli::parse();
 
-    if let Some(shell) = cli.generate_completions {
-        clap_complete::generate(shell, &mut Cli::command(), "flx", &mut std::io::stdout());
-        return Ok(RunOutcome::Finished);
-    }
-
-    if cli.generate_man_page {
-        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
-        return Ok(RunOutcome::Finished);
-    }
-
     #[cfg(feature = "log")]
     {
         let log_level = match cli.log_level.as_str() {
@@ -691,15 +786,8 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     // help text and report a usage error (exit code 2) instead of running.
     let Some(command) = cli.command else {
         use clap::CommandFactory as _;
-        use std::io::IsTerminal as _;
-        use std::io::Write as _;
-        let help = Cli::command().render_help();
         let mut stderr = std::io::stderr().lock();
-        if cli.no_color || !stderr.is_terminal() {
-            writeln!(stderr, "{help}")?;
-        } else {
-            writeln!(stderr, "{}", help.ansi())?;
-        }
+        Cli::command().write_help(&mut stderr)?;
         return Ok(RunOutcome::NoCommand);
     };
 
@@ -798,7 +886,7 @@ async fn run_find(
     // Candidates are recorded while pass 1 streams so the fallback pass can
     // re-validate the same set without re-fetching.
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
-    let source: BoxStream = match &find.file {
+    let source: BoxStream = match &find.validator.file {
         Some(file) => Box::pin(tee_recorder(file_source(file).await?, recordings.clone())),
         None => Box::pin(tee_recorder(
             ProxySource::from_fetcher(fetcher_config(&find.fetcher))
@@ -848,6 +936,16 @@ async fn run_find(
     // Erase the status line before the summary so the two never share a row.
     drop(guard1);
     if !matches!(outcome1, Ok(RunOutcome::Finished)) {
+        if matches!(outcome1, Ok(RunOutcome::Cancelled)) {
+            report_validation_summary(
+                progress1.passed(),
+                progress1.done(),
+                progress1.total(),
+                started.elapsed(),
+                dst.as_deref(),
+                quiet,
+            );
+        }
         return outcome1;
     }
 
@@ -883,6 +981,16 @@ async fn run_find(
         .await;
         drop(guard2);
         if !matches!(outcome2, Ok(RunOutcome::Finished)) {
+            if matches!(outcome2, Ok(RunOutcome::Cancelled)) {
+                report_validation_summary(
+                    p1_passed + progress2.passed(),
+                    progress1.done() + progress2.done(),
+                    progress1.total() + progress2.total(),
+                    started.elapsed(),
+                    dst.as_deref(),
+                    quiet,
+                );
+            }
             return outcome2;
         }
         report_validation_summary(
@@ -990,7 +1098,7 @@ fn make_guard(
     quiet: bool,
     no_color: bool,
 ) -> OutputGuardEither<progress::ValidationBar> {
-    match progress::ValidationBar::new(progress, quiet, no_color) {
+    match progress::ValidationBar::new(progress, quiet, no_color, stdout_is_pipe()) {
         Some(bar) => OutputGuardEither::Bar(bar),
         None => OutputGuardEither::Noop(NoopGuard),
     }
@@ -1025,12 +1133,12 @@ fn validator_config(
     flx::validator::Config {
         types: protocols,
         groups,
-        concurrency_limit: options.max_connections as usize,
+        concurrency_limit: options.max_connections,
         max_attempts: options.max_attempts,
         request_timeout: options.timeout,
         http_judge_urls: options.http_judge_urls.clone(),
         https_judge_urls: options.https_judge_urls.clone(),
-        insecure: options.insecure,
+        insecure: options.verify_tls != "true",
         probe_missed_types,
     }
 }
@@ -1253,36 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn generate_completions_flag_is_accepted() {
-        let cli = Cli::parse_from(["flx", "--generate-completions", "bash"]);
-        assert_eq!(cli.generate_completions, Some(clap_complete::Shell::Bash));
-        assert!(Cli::parse_from(["flx", "--generate-man-page"]).generate_man_page);
-    }
-
-    #[test]
-    fn generate_completions_produces_script() {
-        let mut out = Vec::new();
-        clap_complete::generate(
-            clap_complete::Shell::Bash,
-            &mut Cli::command(),
-            "flx",
-            &mut out,
-        );
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("flx"));
-    }
-
-    #[test]
-    fn generate_man_page_produces_text() {
-        let mut out = Vec::new();
-        clap_mangen::Man::new(Cli::command())
-            .render(&mut out)
-            .unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("flx"));
-    }
-
-    #[test]
     fn cache_ttl_max_value_does_not_overflow() {
         let huge = fetch_from(&["--cache-ttl", "18446744073709551615"]);
         assert_eq!(
@@ -1292,10 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn https_judge_urls_flag_parses_without_duplicate_attr() {
-        // The `#[arg]` for `--https-judge-urls` was
-        // declared twice; ensure the flag still accepts a custom value and
-        // lands in the right field.
+    fn https_judge_urls_flag_parses_custom_value() {
         let cli = find_from(&[
             "SOCKS5",
             "--https-judge-urls",
@@ -1400,13 +1475,31 @@ mod tests {
 
     #[test]
     fn default_format_switches_to_json_lines_when_piped() {
-        assert_eq!(effective_format("default", false, true), "default");
-        assert_eq!(effective_format("default", false, false), "json-lines");
-        // Redirected to a file keeps "default" untouched.
-        assert_eq!(effective_format("default", true, false), "default");
+        assert_eq!(effective_format("default", None, true), "default");
+        assert_eq!(effective_format("default", None, false), "json-lines");
         // Explicit formats are never overridden.
-        assert_eq!(effective_format("json", false, false), "json");
-        assert_eq!(effective_format("pretty-json", false, false), "pretty-json");
+        assert_eq!(effective_format("json", None, false), "json");
+        assert_eq!(effective_format("pretty-json", None, false), "pretty-json");
+    }
+
+    #[test]
+    fn default_format_follows_output_file_extension() {
+        let f = |name: &'static str| Some(std::path::Path::new(name));
+        assert_eq!(effective_format("default", f("a.json"), true), "json");
+        assert_eq!(effective_format("default", f("a.JSON"), true), "json");
+        assert_eq!(
+            effective_format("default", f("a.jsonl"), true),
+            "json-lines"
+        );
+        assert_eq!(
+            effective_format("default", f("a.ndjson"), true),
+            "json-lines"
+        );
+        assert_eq!(effective_format("default", f("a.csv"), true), "csv");
+        assert_eq!(effective_format("default", f("a.pac"), true), "pac");
+        assert_eq!(effective_format("default", f("a.txt"), true), "default");
+        // The extension only infers when the format is still `default`.
+        assert_eq!(effective_format("json", f("a.txt"), true), "json");
     }
 
     #[test]
@@ -1896,5 +1989,133 @@ mod tests {
             Some(Command::Grab(grab)) => assert_eq!(grab.output.format, "json"),
             _ => panic!("expected grab subcommand"),
         }
+    }
+
+    fn run_proxychains(proxies: &[Proxy], limit: usize) -> String {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("proxychains", limit);
+        rt.block_on(async {
+            let s = stream::iter(proxies.to_vec());
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        content
+    }
+
+    fn run_prefix(proxies: &[Proxy], limit: usize) -> String {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("prefix", limit);
+        rt.block_on(async {
+            let s = stream::iter(proxies.to_vec());
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        content
+    }
+
+    fn run_pac(proxies: &[Proxy], limit: usize) -> String {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("pac", limit);
+        rt.block_on(async {
+            let s = stream::iter(proxies.to_vec());
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        content
+    }
+
+    #[test]
+    fn proxychains_renders_type_ip_port() {
+        let mut proxy = sample_proxy(1);
+        proxy
+            .proxy_types
+            .push(flx::proxy::models::ProxyType::checked(Protocol::Socks5));
+        let out = run_proxychains(&[proxy], 0);
+        assert_eq!(out, "socks5 192.168.0.1 8081\n");
+    }
+
+    #[test]
+    fn proxychains_falls_back_to_http_for_http_proxy() {
+        let mut proxy = sample_proxy(2);
+        proxy
+            .proxy_types
+            .push(flx::proxy::models::ProxyType::checked(Protocol::Http(
+                Anonymity::Anonymous,
+            )));
+        let out = run_proxychains(&[proxy], 0);
+        assert_eq!(out, "http 192.168.0.2 8082\n");
+    }
+
+    #[test]
+    fn prefix_renders_socks5_url() {
+        let proxy = sample_proxy(3);
+        let out = run_prefix(&[proxy], 0);
+        assert_eq!(out, "socks5://192.168.0.3:8083\n");
+    }
+
+    #[test]
+    fn prefix_multiple_proxies() {
+        let proxies: Vec<_> = (1..=3).map(sample_proxy).collect();
+        let out = run_prefix(&proxies, 0);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "socks5://192.168.0.1:8081");
+        assert_eq!(lines[1], "socks5://192.168.0.2:8082");
+        assert_eq!(lines[2], "socks5://192.168.0.3:8083");
+    }
+
+    #[test]
+    fn pac_empty_yields_direct_only() {
+        let out = run_pac(&[], 0);
+        assert!(out.contains("FindProxyForURL"));
+        assert!(out.contains("DIRECT"));
+        assert!(!out.contains("PROXY"));
+    }
+
+    #[test]
+    fn pac_renders_proxy_directives() {
+        let mut proxy = sample_proxy(1);
+        proxy
+            .proxy_types
+            .push(flx::proxy::models::ProxyType::checked(Protocol::Http(
+                Anonymity::Anonymous,
+            )));
+        let out = run_pac(&[proxy], 0);
+        assert!(out.contains("PROXY 192.168.0.1:8081"));
+        assert!(out.contains("DIRECT"));
+    }
+
+    #[test]
+    fn pac_respects_limit() {
+        let proxies: Vec<_> = (1..=5).map(sample_proxy).collect();
+        let out = run_pac(&proxies, 3);
+        assert_eq!(out.matches("PROXY").count(), 3);
     }
 }
