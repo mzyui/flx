@@ -5,6 +5,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use futures_util::{stream, Stream, StreamExt};
 
 use crate::{
+    error::FlxError,
     proxy::models::{Protocol, Proxy},
     FetcherConfig, ProxySource, ProxyValidator, ValidationProgress, ValidatorConfig,
 };
@@ -74,9 +75,12 @@ impl Flx {
         Self::default()
     }
 
-    /// Starts a builder that reads `ip:port` lines from `path`.
-    pub fn from_file(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        let source = ProxySource::from_file(path.into())?;
+    pub fn from_file(path: impl Into<PathBuf>) -> Result<Self, FlxError> {
+        let source = ProxySource::from_file(path.into()).map_err(|e| {
+            e.downcast::<std::io::Error>()
+                .map(FlxError::Io)
+                .unwrap_or_else(|other| FlxError::Io(std::io::Error::other(other)))
+        })?;
         Ok(Self {
             source: SourceKind::File(source),
             ..Self::default()
@@ -182,13 +186,13 @@ impl Flx {
     }
 
     /// Runs the pipeline and yields validated proxies as a stream.
-    pub async fn stream(self) -> anyhow::Result<BoxStream> {
+    pub async fn stream(self) -> Result<BoxStream, FlxError> {
         let (stream, _progress) = self.stream_with_progress().await?;
         Ok(stream)
     }
 
     /// Runs the pipeline with live validation counters.
-    pub async fn stream_with_progress(self) -> anyhow::Result<(BoxStream, ValidationProgress)> {
+    pub async fn stream_with_progress(self) -> Result<(BoxStream, ValidationProgress), FlxError> {
         let Flx {
             source,
             fetcher_config,
@@ -197,9 +201,11 @@ impl Flx {
         } = self;
 
         let source = match source {
-            SourceKind::Fetcher => {
-                Box::pin(ProxySource::from_fetcher(fetcher_config).await?) as BoxStream
-            }
+            SourceKind::Fetcher => Box::pin(
+                ProxySource::from_fetcher(fetcher_config)
+                    .await
+                    .map_err(FlxError::Fetch)?,
+            ) as BoxStream,
             SourceKind::File(source) => Box::pin(stream::iter(source)) as BoxStream,
         };
 
@@ -207,14 +213,13 @@ impl Flx {
             if validator_config.types.is_empty() && validator_config.groups.is_empty() {
                 (source, ValidationProgress::default())
             } else {
-                let validator = ProxyValidator::validate(source, validator_config).await?;
+                let validator = ProxyValidator::validate(source, validator_config)
+                    .await
+                    .map_err(FlxError::Validate)?;
                 let progress = validator.progress();
                 (Box::pin(validator) as BoxStream, progress)
             };
 
-        // Cap the final output. Dropping the stream when the limit is reached
-        // propagates the early stop down the chain (validator → fetcher), so
-        // production shuts down promptly, exactly like the CLI.
         let output = if limit > 0 {
             Box::pin(output.take(limit)) as BoxStream
         } else {
@@ -223,9 +228,8 @@ impl Flx {
 
         Ok((output, progress))
     }
-
     /// Runs the pipeline and collects validated proxies.
-    pub async fn collect(self) -> anyhow::Result<Vec<Proxy>> {
+    pub async fn collect(self) -> Result<Vec<Proxy>, FlxError> {
         let stream = self.stream().await?;
         Ok(stream.collect::<Vec<_>>().await)
     }
@@ -234,6 +238,7 @@ impl Flx {
 #[cfg(test)]
 mod tests {
     use super::Flx;
+    use crate::error::FlxError;
     use crate::proxy::models::{Anonymity, Protocol};
     use futures_util::StreamExt;
 
@@ -406,5 +411,22 @@ mod tests {
         assert_eq!(progress.total(), 0);
         assert_eq!(progress.done(), 0);
         assert_eq!(progress.passed(), 0);
+    }
+    #[test]
+    fn from_file_nonexistent_yields_io_error() {
+        let result = Flx::from_file("/nonexistent/path/for/testing");
+        assert!(
+            matches!(result, Err(FlxError::Io(_))),
+            "expected FlxError::Io"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_fetch_config_yields_fetch_error() {
+        let result = Flx::fetch().fetch_concurrency(0).stream().await;
+        assert!(
+            matches!(result, Err(FlxError::Fetch(_))),
+            "expected FlxError::Fetch"
+        );
     }
 }

@@ -44,7 +44,7 @@ use std::{
 // ── Root re-exports ───────────────────────────────────────────────────
 
 pub use api::Flx;
-pub use error::{ProtocolParseError, ProxyParseError};
+pub use error::{FlxError, ProtocolParseError, ProxyParseError};
 pub use fetcher::{Config as FetcherConfig, ProxyFetcher};
 pub use geolookup::models::GeoData;
 pub use geolookup::{sync_database, GeoLookup, SyncOutcome};
@@ -60,7 +60,7 @@ pub use validator::{
 /// Convenience glob for common types.
 pub mod prelude {
     pub use crate::{
-        all_providers, sync_database, Anonymity, FetcherConfig, Flx, GeoData, GeoLookup,
+        all_providers, sync_database, Anonymity, FetcherConfig, Flx, FlxError, GeoData, GeoLookup,
         JudgeHealthReport, Protocol, Proxy, ProxyFetcher, ProxyParseError, ProxySource, ProxyType,
         ProxyValidator, RuntimeStats, ScrapeMode, Source, SyncOutcome, ValidationProgress,
         ValidatorConfig,

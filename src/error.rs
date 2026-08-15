@@ -4,6 +4,20 @@ use std::net::AddrParseError;
 use std::num::ParseIntError;
 
 use thiserror::Error;
+/// Top-level library error.
+#[derive(Debug, Error)]
+pub enum FlxError {
+    #[error("fetch error: {0:#}")]
+    Fetch(#[source] anyhow::Error),
+    #[error("validation error: {0:#}")]
+    Validate(#[source] anyhow::Error),
+    #[error("geo lookup error: {0:#}")]
+    Geo(#[source] anyhow::Error),
+    #[error("io error: {0}")]
+    Io(#[source] std::io::Error),
+    #[error("parse error: {0:#}")]
+    Parse(#[source] anyhow::Error),
+}
 
 /// Error parsing a proxy from text.
 #[derive(Debug, Error)]
