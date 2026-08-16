@@ -308,17 +308,9 @@ pub struct ValidatorArgs {
     )]
     pub https_judge_urls: Vec<String>,
 
-    /// Disable TLS certificate verification.
-    #[arg(
-        long = "verify-tls",
-        default_value = "false",
-        help_heading = "Validation",
-        value_parser([
-            PossibleValue::new("true").help("Verify TLS certificates"),
-            PossibleValue::new("false").help("Skip TLS certificate verification"),
-        ])
-    )]
-    pub verify_tls: String,
+    /// Verify TLS certificates for HTTPS judges.
+    #[arg(long, help_heading = "Validation")]
+    pub verify_tls: bool,
 
     /// Path to a file containing proxy endpoints (ip:port per line).
     #[arg(long, help_heading = "Validation")]

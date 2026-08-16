@@ -1152,7 +1152,7 @@ fn validator_config(
         request_timeout: options.timeout,
         http_judge_urls: options.http_judge_urls.clone(),
         https_judge_urls: options.https_judge_urls.clone(),
-        insecure: options.verify_tls != "true",
+        insecure: !options.verify_tls,
         probe_missed_types,
     }
 }
