@@ -462,12 +462,11 @@ pub async fn support_http(
                 continue;
             }
 
-            let remaining = deadline
-                .checked_duration_since(time::Instant::now())
-                .context("public-IP lookup timed out during HTTP validation")?;
-            let my_ip = time::timeout(remaining, my_ip())
+            // The lookup runs under its own fixed budget (`MY_IP_LOOKUP_TIMEOUT`)
+            // rather than the leftover probe deadline, so a proxy that answers
+            // just before its deadline is not rejected for a slow my-IP fetch.
+            let my_ip = my_ip()
                 .await
-                .context("public-IP lookup timed out during HTTP validation")?
                 .context("cannot determine anonymity level without knowing our own public IP")?;
             let body = String::from_utf8_lossy(&body);
             let anonymity = classify_anonymity(&body, &my_ip);

@@ -27,6 +27,11 @@ static HTTP_IP_ENDPOINTS: [&str; 3] = [
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IP_BODY_BYTES: usize = 64;
 
+// DNS discovery (LOOKUP_TIMEOUT) is followed by the HTTPS fallback
+// (LOOKUP_TIMEOUT again) end-to-end, so the whole lookup is bounded to give
+// it a fixed budget independent of any probe deadline.
+const MY_IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 const PUBLIC_IP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn public_ip_cache_path() -> Option<PathBuf> {
@@ -189,7 +194,14 @@ pub async fn my_ip() -> anyhow::Result<String> {
     // Failures are not stored, so a transient outage can be retried. Replaces
     // the `cached` crate with a single `OnceCell`.
     static CACHE: OnceCell<String> = OnceCell::const_new();
-    CACHE.get_or_try_init(resolve_public_ip).await.cloned()
+    CACHE
+        .get_or_try_init(|| async {
+            time::timeout(MY_IP_LOOKUP_TIMEOUT, resolve_public_ip())
+                .await
+                .context("public-IP lookup timed out")?
+        })
+        .await
+        .cloned()
 }
 
 async fn resolve_public_ip() -> anyhow::Result<String> {

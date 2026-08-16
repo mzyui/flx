@@ -154,16 +154,14 @@ pub(super) async fn support_tunnel(
         {
             Ok(Ok(body)) => {
                 let mut runtimes = RuntimeStats::default();
+                // The lookup runs under its own fixed budget (`MY_IP_LOOKUP_TIMEOUT`)
+                // rather than the leftover probe deadline, so a tunnel that
+                // answers just before its deadline is not rejected for a slow
+                // my-IP fetch.
                 let protocol = if needs_anonymity {
-                    let remaining = deadline
-                        .checked_duration_since(time::Instant::now())
-                        .context("public-IP lookup timed out during tunnel validation")?;
-                    let my_ip = time::timeout(remaining, my_ip())
-                        .await
-                        .context("public-IP lookup timed out during tunnel validation")?
-                        .context(
-                            "cannot determine anonymity level without knowing our own public IP",
-                        )?;
+                    let my_ip = my_ip().await.context(
+                        "cannot determine anonymity level without knowing our own public IP",
+                    )?;
                     let anon = classify_anonymity(&body, &my_ip);
                     Protocol::Https(anon)
                 } else {
