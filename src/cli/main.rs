@@ -749,7 +749,9 @@ fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
         offline: options.offline,
         fetch_delay: (options.fetch_delay_ms > 0)
             .then(|| std::time::Duration::from_millis(options.fetch_delay_ms)),
-        ..Default::default()
+        fallback_threshold: options.fallback_threshold,
+        fallback_phase_timeout: (options.fetch_phase_timeout > 0)
+            .then(|| std::time::Duration::from_secs(options.fetch_phase_timeout)),
     }
 }
 
@@ -1363,6 +1365,36 @@ mod tests {
 
         let default = fetch_from(&[]);
         assert_eq!(fetcher_config(&default.fetcher).fetch_delay, None);
+    }
+
+    #[test]
+    fn fallback_threshold_flag_lands_in_fetcher_config() {
+        let set = fetch_from(&["--fallback-threshold", "10"]);
+        assert_eq!(fetcher_config(&set.fetcher).fallback_threshold, Some(10));
+
+        let default = fetch_from(&[]);
+        assert_eq!(fetcher_config(&default.fetcher).fallback_threshold, None);
+    }
+
+    #[test]
+    fn fetch_phase_timeout_flag_lands_in_fetcher_config() {
+        let set = fetch_from(&["--fetch-phase-timeout", "5"]);
+        assert_eq!(
+            fetcher_config(&set.fetcher).fallback_phase_timeout,
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        let default = fetch_from(&[]);
+        assert_eq!(
+            fetcher_config(&default.fetcher).fallback_phase_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+
+        let unbounded = fetch_from(&["--fetch-phase-timeout", "0"]);
+        assert_eq!(
+            fetcher_config(&unbounded.fetcher).fallback_phase_timeout,
+            None
+        );
     }
 
     #[test]

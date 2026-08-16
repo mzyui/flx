@@ -194,6 +194,7 @@ impl ProxyFetcher {
         );
         let concurrency_limit = config.concurrency_limit;
         let fallback_threshold = config.fallback_threshold;
+        let fallback_phase_timeout = config.fallback_phase_timeout;
         let offline = config.offline;
         let fetch_delay = config.fetch_delay;
 
@@ -314,7 +315,23 @@ impl ProxyFetcher {
 
                 let mut fallback_handles =
                     spawn_phase(fallback, &client, &sem, sender, stop_rx_fallback, &settings);
-                while fallback_handles.join_next().await.is_some() {}
+                match fallback_phase_timeout {
+                    Some(timeout) => {
+                        tokio::select! {
+                            _ = async { while fallback_handles.join_next().await.is_some() {} } => {}
+                            _ = time::sleep(timeout) => {
+                                fallback_handles.abort_all();
+                                while fallback_handles.join_next().await.is_some() {}
+                                #[cfg(feature = "log")]
+                                log::warn!(
+                                    "fallback providers aborted after timeout {:?}",
+                                    timeout
+                                );
+                            }
+                        }
+                    }
+                    None => while fallback_handles.join_next().await.is_some() {},
+                }
             }
         });
 

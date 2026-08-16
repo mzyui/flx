@@ -256,6 +256,14 @@ pub struct FetcherArgs {
     #[arg(long, default_value_t = 0, help_heading = "Fetching")]
     pub fetch_delay_ms: u64,
 
+    /// Skip fallback providers once this many proxies are already collected.
+    #[arg(long, help_heading = "Fetching")]
+    pub fallback_threshold: Option<usize>,
+
+    /// Maximum seconds to wait for the fallback provider phase (0 = unbounded).
+    #[arg(long, default_value_t = 30, help_heading = "Fetching")]
+    pub fetch_phase_timeout: u64,
+
     /// Disable deduplication of identical endpoints across sources.
     #[arg(long, help_heading = "Fetching")]
     pub no_dedup: bool,

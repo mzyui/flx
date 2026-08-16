@@ -11,6 +11,7 @@ pub struct Config {
     pub ip_type_filter: Option<IpType>,
     pub countries: Arc<[String]>,
     pub fallback_threshold: Option<usize>,
+    pub fallback_phase_timeout: Option<Duration>,
     pub cache_ttl: Option<Duration>,
     pub refresh_cache: bool,
     pub providers: Arc<[String]>,
@@ -44,6 +45,7 @@ impl Default for Config {
             ip_type_filter: None,
             countries: Arc::from(Vec::new()),
             fallback_threshold: None,
+            fallback_phase_timeout: None,
             cache_ttl: Some(Duration::from_secs(
                 DEFAULT_CACHE_TTL_MINUTES.saturating_mul(60),
             )),
@@ -91,5 +93,10 @@ mod tests {
     #[test]
     fn fetch_delay_is_disabled_by_default() {
         assert_eq!(Config::default().fetch_delay, None);
+    }
+
+    #[test]
+    fn fallback_phase_timeout_is_disabled_by_default() {
+        assert_eq!(Config::default().fallback_phase_timeout, None);
     }
 }
