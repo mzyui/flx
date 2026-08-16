@@ -2,26 +2,14 @@ use clap::builder::PossibleValue;
 use clap::builder::TypedValueParser;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
-
-const VALID_TYPE_NAMES: &[&str] = &[
-    "HTTP",
-    "HTTPS",
-    "SOCKS4",
-    "SOCKS5",
-    "CONNECT:80",
-    "CONNECT:25",
-    "HTTP+HTTPS",
-    "HTTP+HTTPS+SOCKS4",
-    "HTTP+HTTPS+SOCKS5",
-    "HTTP+SOCKS4",
-    "HTTP+SOCKS5",
-    "HTTPS+SOCKS4",
-    "HTTPS+SOCKS5",
-    "SOCKS4+SOCKS5",
-];
+use std::str::FromStr;
 
 fn is_valid_type_value(value: &str) -> bool {
-    VALID_TYPE_NAMES.contains(&value)
+    // Accept every token the protocol parser understands (including the
+    // `HTTP:Elite`-style anonymity annotations) in any `+` combination.
+    value
+        .split('+')
+        .all(|part| !part.is_empty() && flx::Protocol::from_str(part).is_ok())
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {

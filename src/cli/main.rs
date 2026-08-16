@@ -1683,6 +1683,30 @@ mod tests {
     }
 
     #[test]
+    fn anonymity_annotated_types_parse_and_validate_at_cli() {
+        let args = find_from(&[
+            "HTTP:Elite",
+            "HTTP:Anonymous",
+            "SOCKS5",
+            "HTTP:Anonymous+SOCKS5",
+        ]);
+        let (types, groups) = split_type_groups(&args.validator.types);
+        assert_eq!(
+            types,
+            vec![
+                Protocol::Http(Anonymity::Elite),
+                Protocol::Http(Anonymity::Anonymous),
+                Protocol::Socks5
+            ]
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0],
+            vec![Protocol::Http(Anonymity::Anonymous), Protocol::Socks5]
+        );
+    }
+
+    #[test]
     fn and_group_deduplicates_repeated_members() {
         let (types, groups) = split_type_groups(&["HTTP+HTTPS+HTTP".to_owned()]);
         assert!(types.is_empty());
