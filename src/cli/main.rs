@@ -81,7 +81,7 @@ fn stdout_is_pipe() -> bool {
 fn format_validation_stats(
     valid: usize,
     failed: usize,
-    checked: usize,
+    total: usize,
     elapsed: std::time::Duration,
     rate: f64,
     dst: Option<&str>,
@@ -90,21 +90,21 @@ fn format_validation_stats(
     let f = format!("{failed} failed").red();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    format!("{lead}{v} · {f} · {checked} checked in {elapsed:?} ({rate:.1}/s){suffix}")
+    format!("{lead}{v} · {f} · {total} total in {elapsed:?} ({rate:.1}/s){suffix}")
 }
 
 #[cfg(not(feature = "progress_bar"))]
 fn format_validation_stats(
     valid: usize,
     failed: usize,
-    checked: usize,
+    total: usize,
     elapsed: std::time::Duration,
     rate: f64,
     dst: Option<&str>,
 ) -> String {
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    format!("{lead}{valid} valid · {failed} failed · {checked} checked in {elapsed:?} ({rate:.1}/s){suffix}")
+    format!("{lead}{valid} valid · {failed} failed · {total} total in {elapsed:?} ({rate:.1}/s){suffix}")
 }
 
 /// Formats the end-of-run line for `grab`, colored under the `progress_bar`
@@ -1138,7 +1138,7 @@ fn format_judge_health(report: &flx::JudgeHealthReport) -> String {
 fn report_validation_summary(
     passed: usize,
     done: usize,
-    checked: usize,
+    total: usize,
     elapsed: std::time::Duration,
     dst: Option<&str>,
     quiet: bool,
@@ -1149,14 +1149,14 @@ fn report_validation_summary(
     let rate = if elapsed.is_zero() {
         0.0
     } else {
-        checked as f64 / elapsed.as_secs_f64()
+        total as f64 / elapsed.as_secs_f64()
     };
     eprintln!(
         "{}",
         format_validation_stats(
             passed,
             done.saturating_sub(passed),
-            checked,
+            total,
             elapsed,
             rate,
             dst
