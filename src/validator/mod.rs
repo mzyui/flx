@@ -365,12 +365,17 @@ async fn preflight_pool(
                 let candidates = unique_count(urls);
                 // `build` returns as soon as the first judge passes, so the
                 // remaining preflights settle in the background; snapshot the
-                // report only once every candidate has resolved.
+                // report once every candidate has resolved or a short grace
+                // elapses. The cap keeps one slow straggler judge from holding
+                // up validation startup for the whole preflight timeout; the
+                // pool (not the report) stays authoritative either way.
                 let deadline = tokio::time::Instant::now() + timeout + Duration::from_secs(1);
+                let grace = tokio::time::Instant::now() + Duration::from_millis(250);
                 loop {
                     let failed_len = failed.lock().unwrap_or_else(|e| e.into_inner()).len();
                     if pool.len() + failed_len >= candidates
                         || tokio::time::Instant::now() >= deadline
+                        || tokio::time::Instant::now() >= grace
                     {
                         break;
                     }
