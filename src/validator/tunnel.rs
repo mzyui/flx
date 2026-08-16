@@ -127,14 +127,25 @@ pub(super) async fn support_tunnel(
     // Judges this proxy has already reported as failing (now cooling down);
     // re-probing them within this loop would only burn another connect.
     let mut cooling_down = HashSet::with_capacity(candidates.len());
+    // One shared end-to-end budget across every attempt and judge so a tunnel
+    // that accepts TCP but never completes a handshake is bounded once instead
+    // of paying a full `timeout` per judge/attempt.
+    let budget_started = time::Instant::now();
+    let budget = timeout.saturating_mul(max_attempts as u32);
 
     for offset in 0..total_attempts {
+        let remaining = budget
+            .checked_sub(budget_started.elapsed())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
         let (validation_target, target) = &candidates[offset % candidates.len()];
         if cooling_down.contains(&validation_target.url) {
             continue;
         }
         let started = time::Instant::now();
-        let deadline = started + timeout;
+        let deadline = started + remaining.min(timeout);
         match time::timeout_at(
             deadline,
             probe_once(proxy, &protocol, target, deadline, insecure),
@@ -797,5 +808,52 @@ mod tests {
         assert!(result.unwrap().is_none());
         assert_eq!(pool.len(), 1);
         server.abort();
+    }
+
+    async fn spawn_stalled_clients() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            for _ in 0..16 {
+                match listener.accept().await {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => break,
+                }
+            }
+            time::sleep(Duration::from_secs(30)).await;
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn stalled_tunnel_consumes_one_shared_budget() {
+        // Offline-safe: the blackhole accepts but never completes a handshake,
+        // so the probe must burn one shared budget across the judge pool
+        // rather than one full timeout per judge.
+        let blackhole = spawn_stalled_clients().await;
+        let pool = JudgePool::from_targets(Vec::from([
+            std::sync::Arc::new(ValidationTarget::online("http://127.0.0.1:9/judge-a").unwrap()),
+            std::sync::Arc::new(ValidationTarget::online("http://127.0.0.1:9/judge-b").unwrap()),
+        ]));
+        let started = time::Instant::now();
+        let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), blackhole.port());
+        let result = support_tunnel(
+            &mut proxy,
+            Duration::from_millis(300),
+            1,
+            Protocol::Connect(9),
+            &pool,
+            false,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(result.is_none());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "shared budget not honoured: {elapsed:?}"
+        );
     }
 }
