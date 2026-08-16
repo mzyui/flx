@@ -257,6 +257,29 @@ fn split_type_groups(tokens: &[String]) -> (Vec<Protocol>, Vec<Vec<Protocol>>) {
     (types, groups)
 }
 
+// Mirrors the validator's `advertised_matches_request`: an advertised type
+// covers a requested one when their families line up and any `Unknown`
+// anonymity side is tolerated.
+fn advertised_covers_request(advertised: &[Protocol], requested: Protocol) -> bool {
+    advertised.iter().any(|adv| match (*adv, requested) {
+        (Protocol::Http(a), Protocol::Http(b)) | (Protocol::Https(a), Protocol::Https(b)) => {
+            matches!(a, Anonymity::Unknown) || matches!(b, Anonymity::Unknown) || a == b
+        }
+        (Protocol::Connect(a), Protocol::Connect(b)) => a == b,
+        (adv, req) => adv == req,
+    })
+}
+
+// A candidate needs the fallback (missed-type) probe when nothing is
+// advertised or at least one requested type its advertisement does not cover.
+fn needs_missed_probe(proxy: &Proxy, requested: &[Protocol]) -> bool {
+    let advertised = proxy.expected_types.as_ref();
+    advertised.is_empty()
+        || requested
+            .iter()
+            .any(|req| !advertised_covers_request(advertised, *req))
+}
+
 // Resolves the output format when the user left `--format` at `default`: an
 // explicit `-o` path infers the format from its file extension and a piped
 // stdout switches to `json-lines`.
@@ -722,6 +745,41 @@ async fn write_output(
     Ok(())
 }
 
+// Emits the document a skipped fallback pass would have closed: an empty JSON
+// array for JSON formats and nothing for any other format.
+async fn emit_empty_skipped_fallback(options: &OutputOptions) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let format = effective_format(
+        &options.format,
+        options.output_file.as_deref(),
+        std::io::stdout().is_terminal(),
+    );
+    if !matches!(format, "json" | "pretty-json") {
+        return Ok(());
+    }
+    let mut stdout = std::io::stdout().lock();
+    if let Some(ref file_path) = options.output_file {
+        let mut file = tokio::io::BufWriter::new(
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(file_path)
+                .await
+                .with_context(|| format!("failed to open output file {}", file_path.display()))?,
+        );
+        file.write_all(b"[]\n")
+            .await
+            .context("failed to write proxy to output file")?;
+        file.flush().await?;
+    } else {
+        stdout
+            .write_all(b"[]\n")
+            .context("failed to write proxy to stdout")?;
+    }
+    Ok(())
+}
+
 fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
     let ip_type = options.ip_type.as_deref().map(|name| match name {
         "residential" => IpType::Residential,
@@ -973,17 +1031,41 @@ async fn run_find(
         !protocols.is_empty() && (p1_passed == 0 || (limit > 0 && p1_passed < limit));
 
     if needs_fallback {
-        let candidates = std::mem::take(&mut *recordings.lock().expect("recorder poisoned"));
+        let requested = protocols;
+        // Only candidates whose advertisement leaves a requested type
+        // uncovered can yield new results here; the rest already passed (or
+        // failed) in pass 1 and would only repeat the judge preflight.
+        let candidates: Vec<Proxy> =
+            std::mem::take(&mut *recordings.lock().expect("recorder poisoned"))
+                .into_iter()
+                .filter(|proxy| needs_missed_probe(proxy, &requested))
+                .collect();
+        let mut options2 = find.output.clone();
+        options2.limit = if limit > 0 { limit - p1_passed } else { 0 };
+
+        if candidates.is_empty() {
+            // The second pass would produce no probes, so skip the redundant
+            // judge preflight and emit the document it would have closed.
+            emit_empty_skipped_fallback(&options2).await?;
+            report_validation_summary(
+                p1_passed,
+                progress1.done(),
+                progress1.total(),
+                started.elapsed(),
+                dst.as_deref(),
+                quiet,
+            );
+            return Ok(RunOutcome::Finished);
+        }
+
         let pass2 = ProxyValidator::validate(
             futures_util::stream::iter(candidates),
-            validator_config(&find.validator, protocols, Vec::new(), true),
+            validator_config(&find.validator, requested, Vec::new(), true),
         )
         .await
         .context("failed to start proxy validator")?;
         let progress2 = pass2.progress();
         let guard2 = make_guard(progress2.clone(), quiet, no_color);
-        let mut options2 = find.output.clone();
-        options2.limit = if limit > 0 { limit - p1_passed } else { 0 };
         let outcome2 = process_result(
             pass2,
             options2,
@@ -1395,6 +1477,50 @@ mod tests {
             fetcher_config(&unbounded.fetcher).fallback_phase_timeout,
             None
         );
+    }
+
+    #[test]
+    fn needs_missed_probe_mirrors_validator_gating() {
+        let http = Proxy::with_expected_types(
+            std::net::Ipv4Addr::LOCALHOST,
+            1111,
+            std::sync::Arc::from([Protocol::Http(Anonymity::Unknown)]),
+        );
+        assert!(!needs_missed_probe(
+            &http,
+            &[Protocol::Http(Anonymity::Unknown)]
+        ));
+        assert!(!needs_missed_probe(
+            &http,
+            &[Protocol::Http(Anonymity::Elite)]
+        ));
+        assert!(needs_missed_probe(&http, &[Protocol::Socks5]));
+
+        let empty = Proxy::with_expected_types(
+            std::net::Ipv4Addr::LOCALHOST,
+            1111,
+            std::sync::Arc::from([]),
+        );
+        assert!(needs_missed_probe(
+            &empty,
+            &[Protocol::Http(Anonymity::Unknown)]
+        ));
+
+        let mixed = Proxy::with_expected_types(
+            std::net::Ipv4Addr::LOCALHOST,
+            1111,
+            std::sync::Arc::from([Protocol::Http(Anonymity::Unknown), Protocol::Socks5]),
+        );
+        assert!(!needs_missed_probe(&mixed, &[Protocol::Socks5]));
+        assert!(needs_missed_probe(&mixed, &[Protocol::Connect(9)]));
+
+        let connect80 = Proxy::with_expected_types(
+            std::net::Ipv4Addr::LOCALHOST,
+            1111,
+            std::sync::Arc::from([Protocol::Connect(80)]),
+        );
+        assert!(!needs_missed_probe(&connect80, &[Protocol::Connect(80)]));
+        assert!(needs_missed_probe(&connect80, &[Protocol::Connect(25)]));
     }
 
     #[test]
