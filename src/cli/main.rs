@@ -540,13 +540,15 @@ where
         return Ok(RunOutcome::Finished);
     }
     // One stdout lock for the whole run instead of `print!` re-acquiring the
-    // global lock (`std::io::_print`) for every proxy.
-    let mut stdout = std::io::stdout().lock();
+    // global lock (`std::io::_print`) for every proxy. Buffering batches the
+    // per-proxy writes into a single flush per full buffer instead of one
+    // syscall per proxy.
+    let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
     use std::io::Write as _;
 
     // Reusable per-item buffer: each proxy's bytes are assembled here (no
-    // per-item `String` allocation) and written in a single call, so stdout
-    // issues one syscall per proxy.
+    // per-item `String` allocation) and written in a single call into the
+    // buffered stdout, which flushes in bulk rather than once per proxy.
     let mut buf: Vec<u8> = Vec::new();
 
     // When `cancel` resolves (Ctrl+C in the real binary), the run finalizes a
@@ -711,9 +713,9 @@ where
     }
 }
 
-async fn finalize_json_output(
+async fn finalize_json_output<W: std::io::Write>(
     output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
-    stdout: &mut std::io::StdoutLock<'static>,
+    stdout: &mut W,
     found_proxy: bool,
     suppress_empty_json: bool,
 ) -> anyhow::Result<()> {
@@ -727,9 +729,9 @@ async fn finalize_json_output(
     write_output(output_file, stdout, close).await
 }
 
-async fn write_output(
+async fn write_output<W: std::io::Write>(
     output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
-    stdout: &mut std::io::StdoutLock<'static>,
+    stdout: &mut W,
     content: &str,
 ) -> anyhow::Result<()> {
     if let Some(ref mut file) = output_file {
@@ -737,7 +739,6 @@ async fn write_output(
             .await
             .context("failed to write proxy to output file")?;
     } else {
-        use std::io::Write as _;
         stdout
             .write_all(content.as_bytes())
             .context("failed to write proxy to stdout")?;
