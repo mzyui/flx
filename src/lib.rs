@@ -45,7 +45,7 @@ use std::{
 
 pub use api::Flx;
 pub use error::{FlxError, ProtocolParseError, ProxyParseError};
-pub use fetcher::{Config as FetcherConfig, ProxyFetcher};
+pub use fetcher::{Config as FetcherConfig, FetchStage, ProxyFetcher};
 pub use geolookup::models::GeoData;
 pub use geolookup::{sync_database, GeoLookup, IpType, SyncOutcome};
 pub use providers::all_providers;

@@ -106,6 +106,36 @@ pub struct ProxyFetcher {
     prefetched: Option<Proxy>,
     stop_tx: watch::Sender<bool>,
     stop_signaled: AtomicBool,
+    stages: Option<mpsc::Receiver<FetchStage>>,
+}
+
+/// Fetch-phase transitions observable by a consumer of the proxy stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStage {
+    /// Primary provider tier is being fetched.
+    Primary,
+    /// Fallback provider tier is being fetched.
+    Fallback,
+    /// Gathering finished or was skipped.
+    Done,
+}
+
+// Reports the current gathering phase and always closes with `Done`, even
+// when the coordinator returns early (stop signal or threshold skip).
+struct StageReporter {
+    tx: mpsc::Sender<FetchStage>,
+}
+
+impl StageReporter {
+    fn send(&self, stage: FetchStage) {
+        let _ = self.tx.try_send(stage);
+    }
+}
+
+impl Drop for StageReporter {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(FetchStage::Done);
+    }
 }
 
 impl ProxyFetcher {
@@ -229,6 +259,8 @@ impl ProxyFetcher {
         let stop_rx_primary = stop_rx.clone();
         let stop_rx_fallback = stop_rx;
 
+        let (stage_tx, stages) = mpsc::channel(16);
+
         // Coordinator: runs the primary phase to completion (bounded by
         // PRIMARY_PHASE_TIMEOUT), then decides whether to run the fallback.
         // A `watch` stop-signal lets the consumer abort the primary phase
@@ -236,6 +268,7 @@ impl ProxyFetcher {
         let coordinator = tokio::spawn({
             let sender = sender.clone();
             async move {
+                let stages = StageReporter { tx: stage_tx };
                 let settings = FetchSettings {
                     fetch_cache,
                     offline,
@@ -244,6 +277,7 @@ impl ProxyFetcher {
                 };
                 let mut stop_rx_coordinator = stop_rx_coordinator;
                 let sem = Arc::new(Semaphore::new(concurrency_limit));
+                stages.send(FetchStage::Primary);
                 let mut primary_handles = spawn_phase(
                     primary,
                     &client,
@@ -313,6 +347,7 @@ impl ProxyFetcher {
                     fallback.len()
                 );
 
+                stages.send(FetchStage::Fallback);
                 let mut fallback_handles =
                     spawn_phase(fallback, &client, &sem, sender, stop_rx_fallback, &settings);
                 match fallback_phase_timeout {
@@ -351,6 +386,7 @@ impl ProxyFetcher {
             prefetched: None,
             stop_tx,
             stop_signaled: AtomicBool::new(false),
+            stages: Some(stages),
         })
     }
 }
@@ -548,6 +584,11 @@ impl ProxyFetcher {
         Arc::clone(&self.accepted)
     }
 
+    /// Consumes this fetcher's gathering-phase events for this run.
+    pub fn stage_events(&mut self) -> Option<mpsc::Receiver<FetchStage>> {
+        self.stages.take()
+    }
+
     fn check_drain(&mut self) {
         match self.receiver.try_recv() {
             Ok(proxy) => {
@@ -692,8 +733,8 @@ impl Drop for ProxyFetcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_proxy, do_work, finish_phase, protocol_hash, source_host, DedupTable, ProxyFetcher,
-        Throttle,
+        accept_proxy, do_work, finish_phase, protocol_hash, source_host, DedupTable, FetchStage,
+        ProxyFetcher, Throttle,
     };
     use crate::fetcher::{cache::Cache, Config};
     use crate::geolookup::models::GeoData;
@@ -1056,6 +1097,27 @@ mod tests {
         assert_eq!(proxies.len(), 2);
         assert_eq!(proxies[0].as_text(), "1.2.3.4:8080");
         assert_eq!(proxies[1].as_text(), "5.6.7.8:3128");
+    }
+
+    #[tokio::test]
+    async fn stage_events_report_phases_then_done() {
+        let mut fetcher = ProxyFetcher::gather(Config {
+            offline: true,
+            ..Config::default()
+        })
+        .await
+        .unwrap();
+        let mut rx = fetcher.stage_events().expect("stage stream present");
+        let mut seen = Vec::new();
+        while seen.last() != Some(&FetchStage::Done) {
+            let stage = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("stage event timed out")
+                .expect("stage channel closed before Done");
+            seen.push(stage);
+        }
+        assert_eq!(seen.first(), Some(&FetchStage::Primary));
+        assert!(seen.contains(&FetchStage::Fallback));
     }
 
     #[tokio::test]

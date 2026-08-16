@@ -2,6 +2,7 @@
 
 use std::{
     fmt::{Display, Formatter},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -109,10 +110,73 @@ impl OutputGuard for ValidationBar {
     }
 }
 
+/// Repaintable warmup phase line shown before the validation bar takes over.
+pub struct WarmupBar {
+    status: StatusLine<WarmupFrame>,
+    phase: Arc<Mutex<&'static str>>,
+}
+
+struct WarmupFrame {
+    phase: Arc<Mutex<&'static str>>,
+    color: bool,
+}
+
+impl Display for WarmupFrame {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
+        if self.color {
+            write!(f, "{}", phase.bold().cyan())
+        } else {
+            write!(f, "{phase}")
+        }
+    }
+}
+
+impl WarmupBar {
+    pub fn new(quiet: bool, no_color: bool, stdout_is_pipe: bool) -> Option<Self> {
+        use std::io::IsTerminal as _;
+
+        if !show_progress(quiet, std::io::stderr().is_terminal(), stdout_is_pipe) {
+            return None;
+        }
+        let phase = Arc::new(Mutex::new("Warming up …"));
+        let frame = WarmupFrame {
+            phase: Arc::clone(&phase),
+            color: use_color(no_color),
+        };
+        let status = StatusLine::with_options(frame, status_line::Options::default());
+        Some(Self { status, phase })
+    }
+
+    pub fn set_phase(&self, phase: &'static str) {
+        *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase;
+    }
+}
+
+impl OutputGuard for WarmupBar {
+    fn before_write(&self) {
+        self.status.set_visible(false);
+    }
+
+    fn after_write(&self) {
+        self.status.set_visible(true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{show_progress, use_color, Frame};
+    use super::{show_progress, use_color, Frame, WarmupFrame};
     use flx::ValidationProgress;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn warmup_frame_renders_current_phase() {
+        let frame = WarmupFrame {
+            phase: Arc::new(Mutex::new("Fetching primary sources …")),
+            color: false,
+        };
+        assert!(frame.to_string().contains("Fetching primary sources"));
+    }
 
     #[test]
     fn progress_is_hidden_when_quiet_or_stdout_is_piped() {

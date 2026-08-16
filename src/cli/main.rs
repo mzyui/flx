@@ -8,7 +8,7 @@ use colored::Colorize;
 use flx::initialize_logging;
 use flx::{
     proxy::models::{Anonymity, Protocol, Proxy},
-    IpType, ProxySource, ProxyValidator,
+    FetchStage, IpType, ProxySource, ProxyValidator,
 };
 use futures_util::{Stream, StreamExt};
 use std::io::IsTerminal as _;
@@ -888,7 +888,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
             notify.notify_waiters();
         });
         match command {
-            Command::Grab(grab) => run_grab(grab, cli.quiet, cancel).await,
+            Command::Grab(grab) => run_grab(grab, cli.quiet, cli.no_color, cancel).await,
             Command::Find(find) => run_find(find, cli.quiet, cli.no_color, cancel).await,
             Command::GeoUpdate => run_geo_update().await,
         }
@@ -900,30 +900,58 @@ fn run_application() -> anyhow::Result<RunOutcome> {
 async fn run_grab(
     grab: FetchArgs,
     quiet: bool,
+    no_color: bool,
     cancel: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<RunOutcome> {
     if grab.fetcher.dry_run {
         list_sources();
         return Ok(RunOutcome::Finished);
     }
-    let source = ProxySource::from_fetcher(fetcher_config(&grab.fetcher))
+    let mut fetcher = ProxySource::from_fetcher(fetcher_config(&grab.fetcher))
         .await
         .context("failed to start proxy fetcher")?;
-    let accepted = source.accepted_handle();
+    let accepted = fetcher.accepted_handle();
+    let stages = fetcher.stage_events();
+    let warmup = make_warmup(quiet, no_color);
+    if let Some(bar) = &warmup {
+        bar.set_phase("Fetching proxy lists …");
+    }
+    let watcher = match (&warmup, stages) {
+        (Some(bar), Some(mut rx)) => {
+            let bar = Arc::clone(bar);
+            Some(tokio::spawn(async move {
+                while let Some(stage) = rx.recv().await {
+                    let phase = match stage {
+                        FetchStage::Primary => "Fetching primary sources …",
+                        FetchStage::Fallback => "Fetching fallback sources …",
+                        FetchStage::Done => "Done gathering",
+                    };
+                    bar.set_phase(phase);
+                    if matches!(stage, FetchStage::Done) {
+                        break;
+                    }
+                }
+            }))
+        }
+        _ => None,
+    };
     let started = std::time::Instant::now();
     let dst: Option<String> = grab
         .output
         .output_file
         .as_deref()
         .map(|p| p.to_string_lossy().into_owned());
-    let outcome = process_result(
-        source,
-        grab.output,
-        cancel,
-        &NoopGuard,
-        FinalizeOpts::default(),
-    )
-    .await;
+    let guard: &dyn OutputGuard = match &warmup {
+        Some(bar) => &**bar,
+        None => &NoopGuard,
+    };
+    let outcome =
+        process_result(fetcher, grab.output, cancel, guard, FinalizeOpts::default()).await;
+    if let Some(task) = watcher {
+        task.abort();
+        let _ = task.await;
+    }
+    drop(warmup);
     if !quiet && !stdout_is_pipe() {
         let gathered = accepted.load(std::sync::atomic::Ordering::Relaxed);
         let elapsed = started.elapsed();
@@ -960,22 +988,62 @@ async fn run_find(
     // Candidates are recorded while pass 1 streams so the fallback pass can
     // re-validate the same set without re-fetching.
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
-    let source: BoxStream = match &find.validator.file {
-        Some(file) => Box::pin(tee_recorder(file_source(file).await?, recordings.clone())),
-        None => Box::pin(tee_recorder(
-            ProxySource::from_fetcher(fetcher_config(&find.fetcher))
-                .await
-                .context("failed to start proxy fetcher")?,
-            recordings.clone(),
-        )),
-    };
+    let warmup = make_warmup(quiet, no_color);
+    let config = validator_config(&find.validator, protocols.clone(), groups.clone(), false);
 
-    let pass1 = ProxyValidator::validate(
-        source,
-        validator_config(&find.validator, protocols.clone(), groups.clone(), false),
-    )
-    .await
-    .context("failed to start proxy validator")?;
+    let pass1 = match &find.validator.file {
+        Some(file) => {
+            if let Some(bar) = &warmup {
+                bar.set_phase("Checking online judges …");
+            }
+            let source = Box::pin(tee_recorder(file_source(file).await?, recordings.clone()));
+            let pass = ProxyValidator::validate(source, config)
+                .await
+                .context("failed to start proxy validator")?;
+            drop(warmup);
+            pass
+        }
+        None => {
+            let mut fetcher = ProxySource::from_fetcher(fetcher_config(&find.fetcher))
+                .await
+                .context("failed to start proxy fetcher")?;
+            let stages = fetcher.stage_events();
+            let source = Box::pin(tee_recorder(fetcher, recordings.clone()));
+            if let Some(bar) = &warmup {
+                bar.set_phase("Fetching proxy lists …");
+            }
+            // Watch the gathering phases on a side task while the validator
+            // preflights judges and consumes the stream in parallel.
+            let watcher = match (&warmup, stages) {
+                (Some(bar), Some(mut rx)) => {
+                    let bar = Arc::clone(bar);
+                    Some(tokio::spawn(async move {
+                        while let Some(stage) = rx.recv().await {
+                            let phase = match stage {
+                                FetchStage::Primary => "Fetching primary sources …",
+                                FetchStage::Fallback => "Fetching fallback sources …",
+                                FetchStage::Done => "Checking online judges …",
+                            };
+                            bar.set_phase(phase);
+                            if matches!(stage, FetchStage::Done) {
+                                break;
+                            }
+                        }
+                    }))
+                }
+                _ => None,
+            };
+            let pass = ProxyValidator::validate(source, config)
+                .await
+                .context("failed to start proxy validator")?;
+            if let Some(task) = watcher {
+                task.abort();
+                let _ = task.await;
+            }
+            drop(warmup);
+            pass
+        }
+    };
     if !quiet {
         let health = pass1.judge_health();
         if !health.failed.is_empty() {
@@ -1205,6 +1273,31 @@ fn make_guard(
 #[cfg(not(feature = "progress_bar"))]
 fn make_guard(_progress: flx::ValidationProgress, _quiet: bool, _no_color: bool) -> NoopGuard {
     NoopGuard
+}
+
+#[cfg(feature = "progress_bar")]
+fn make_warmup(quiet: bool, no_color: bool) -> Option<Arc<progress::WarmupBar>> {
+    progress::WarmupBar::new(quiet, no_color, stdout_is_pipe()).map(Arc::new)
+}
+
+#[cfg(not(feature = "progress_bar"))]
+fn make_warmup(_quiet: bool, _no_color: bool) -> Option<Arc<WarmupBar>> {
+    None
+}
+
+// No-op warmup bar for builds without the `progress_bar` feature.
+#[cfg(not(feature = "progress_bar"))]
+pub struct WarmupBar;
+
+#[cfg(not(feature = "progress_bar"))]
+impl WarmupBar {
+    pub fn set_phase(&self, _phase: &'static str) {}
+}
+
+#[cfg(not(feature = "progress_bar"))]
+impl OutputGuard for WarmupBar {
+    fn before_write(&self) {}
+    fn after_write(&self) {}
 }
 
 async fn run_geo_update() -> anyhow::Result<RunOutcome> {
