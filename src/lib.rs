@@ -47,7 +47,7 @@ pub use api::Flx;
 pub use error::{FlxError, ProtocolParseError, ProxyParseError};
 pub use fetcher::{Config as FetcherConfig, ProxyFetcher};
 pub use geolookup::models::GeoData;
-pub use geolookup::{sync_database, GeoLookup, SyncOutcome};
+pub use geolookup::{sync_database, GeoLookup, IpType, SyncOutcome};
 pub use providers::all_providers;
 pub use providers::models::{ProviderTier, ScrapeMode, Source};
 pub use providers::ProxyProvider;
@@ -61,9 +61,9 @@ pub use validator::{
 pub mod prelude {
     pub use crate::{
         all_providers, sync_database, Anonymity, FetcherConfig, Flx, FlxError, GeoData, GeoLookup,
-        JudgeHealthReport, Protocol, Proxy, ProxyFetcher, ProxyParseError, ProxySource, ProxyType,
-        ProxyValidator, RuntimeStats, ScrapeMode, Source, SyncOutcome, ValidationProgress,
-        ValidatorConfig,
+        IpType, JudgeHealthReport, Protocol, Proxy, ProxyFetcher, ProxyParseError, ProxySource,
+        ProxyType, ProxyValidator, RuntimeStats, ScrapeMode, Source, SyncOutcome,
+        ValidationProgress, ValidatorConfig,
     };
 }
 

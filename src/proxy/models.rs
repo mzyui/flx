@@ -463,6 +463,7 @@ mod tests {
             region_iso_code: None,
             region_name: None,
             city_name: None,
+            ip_type: crate::geolookup::IpType::Residential,
         });
 
         let json = proxy.as_json();
@@ -470,6 +471,7 @@ mod tests {
 
         assert_eq!(value["geo"]["iso_code"], "ID");
         assert_eq!(value["geo"]["name"], "Indonesia");
+        assert_eq!(value["geo"]["ip_type"], "residential");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use colored::Colorize;
 use flx::initialize_logging;
 use flx::{
     proxy::models::{Anonymity, Protocol, Proxy},
-    ProxySource, ProxyValidator,
+    IpType, ProxySource, ProxyValidator,
 };
 use futures_util::{Stream, StreamExt};
 use std::io::IsTerminal as _;
@@ -536,7 +536,7 @@ where
     // Emit the CSV header once before the stream starts so the output is
     // always valid even when the stream is empty.
     if _csv && finalize.emit_csv_header {
-        buf.extend_from_slice(b"ip,port,type,response_time,country\n");
+        buf.extend_from_slice(b"ip,port,type,response_time,country,ip_type\n");
         if let Some(ref mut file) = output_file {
             if let Err(error) = file.write_all(&buf).await {
                 write_error = Some(
@@ -723,9 +723,21 @@ async fn write_output(
 }
 
 fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
+    let ip_type = options.ip_type.as_deref().map(|name| match name {
+        "residential" => IpType::Residential,
+        "datacenter" => IpType::Datacenter,
+        "mobile" => IpType::Mobile,
+        "unknown" => IpType::Unknown,
+        _ => IpType::Unknown,
+    });
     flx::fetcher::Config {
         concurrency_limit: options.fetch_concurrency,
-        enable_geo_lookup: options.with_geo || !options.countries.is_empty(),
+        enable_geo_lookup: options.with_geo
+            || !options.countries.is_empty()
+            || options.with_ip_type
+            || options.ip_type.is_some(),
+        enable_ip_type: options.with_ip_type || options.ip_type.is_some(),
+        ip_type_filter: ip_type,
         countries: Arc::from(options.countries.as_slice()),
         cache_ttl: (options.cache_ttl > 0)
             .then(|| std::time::Duration::from_secs(options.cache_ttl.saturating_mul(60))),
@@ -1145,6 +1157,15 @@ fn validator_config(
     }
 }
 
+fn ip_type_str(proxy: &Proxy) -> &'static str {
+    match proxy.geo.ip_type {
+        IpType::Residential => "residential",
+        IpType::Datacenter => "datacenter",
+        IpType::Mobile => "mobile",
+        IpType::Unknown => "unknown",
+    }
+}
+
 fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
     let ip = proxy.ip.to_string();
     let port = proxy.port.to_string();
@@ -1163,6 +1184,7 @@ fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
         proxy_type.as_str(),
         response_time.as_str(),
         country,
+        ip_type_str(proxy),
     ]
     .iter()
     .enumerate()
@@ -1253,6 +1275,29 @@ mod tests {
         let config = fetcher_config(&combined.fetcher);
         assert!(config.enable_geo_lookup);
         assert_eq!(config.countries.as_ref(), ["ID".to_owned()]);
+    }
+
+    #[test]
+    fn with_ip_type_enables_detection_without_filter() {
+        let ip_type_only = fetch_from(&["--with-ip-type"]);
+        let config = fetcher_config(&ip_type_only.fetcher);
+        assert!(config.enable_geo_lookup);
+        assert!(config.enable_ip_type);
+        assert_eq!(config.ip_type_filter, None);
+    }
+
+    #[test]
+    fn ip_type_filter_parses_and_implies_detection() {
+        let filtered = fetch_from(&["--ip-type", "residential"]);
+        let config = fetcher_config(&filtered.fetcher);
+        assert!(config.enable_geo_lookup);
+        assert!(config.enable_ip_type);
+        assert_eq!(config.ip_type_filter, Some(flx::IpType::Residential));
+    }
+
+    #[test]
+    fn invalid_ip_type_value_is_rejected() {
+        assert!(Cli::try_parse_from(["flx", "find", "--ip-type", "bogus"]).is_err());
     }
 
     #[test]
@@ -1769,7 +1814,7 @@ mod tests {
     #[test]
     fn csv_empty_yields_header_only() {
         let out = run_csv(&[], 0);
-        assert_eq!(out, "ip,port,type,response_time,country\n");
+        assert_eq!(out, "ip,port,type,response_time,country,ip_type\n");
     }
 
     #[test]
@@ -1777,8 +1822,9 @@ mod tests {
         let out = run_csv(&[sample_proxy(1)], 0);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "ip,port,type,response_time,country");
+        assert_eq!(lines[0], "ip,port,type,response_time,country,ip_type");
         assert!(lines[1].starts_with("192.168.0.1,8081,"));
+        assert!(lines[1].ends_with(",unknown"));
     }
 
     #[test]
@@ -1787,7 +1833,7 @@ mod tests {
         let out = run_csv(&proxies, 0);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 4, "header + 3 rows");
-        assert_eq!(lines[0], "ip,port,type,response_time,country");
+        assert_eq!(lines[0], "ip,port,type,response_time,country,ip_type");
         assert!(lines[1].contains("192.168.0.1"));
         assert!(lines[2].contains("192.168.0.2"));
         assert!(lines[3].contains("192.168.0.3"));

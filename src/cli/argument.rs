@@ -122,7 +122,7 @@ pub struct OutputOptions {
         default_value = "default",
         help_heading = "Output",
         value_parser([
-            PossibleValue::new("csv").help("Comma-separated ip,port,protocol,anonymity,country,city,response_time_ms"),
+            PossibleValue::new("csv").help("Comma-separated ip,port,type,response_time,country,ip_type"),
             PossibleValue::new("default").help("Human-readable summary (json-lines when piped; -o infers format from extension)"),
             PossibleValue::new("json").help("Compact JSON array"),
             PossibleValue::new("json-lines").help("One JSON object per line"),
@@ -202,6 +202,23 @@ pub struct FetcherArgs {
     /// Enable GeoIP lookup without filtering by location.
     #[arg(short = 'g', long, help_heading = "Fetching")]
     pub with_geo: bool,
+
+    /// Annotate fetched proxies with their IP class.
+    #[arg(long, help_heading = "Fetching")]
+    pub with_ip_type: bool,
+
+    /// Keep only proxies classified as this IP type.
+    #[arg(
+        long,
+        help_heading = "Fetching",
+        value_parser = [
+            PossibleValue::new("residential").help("Home and local ISP networks"),
+            PossibleValue::new("datacenter").help("Cloud and hosting providers"),
+            PossibleValue::new("mobile").help("Mobile carrier networks"),
+            PossibleValue::new("unknown").help("IP type could not be determined"),
+        ]
+    )]
+    pub ip_type: Option<String>,
 
     /// Scrape only the named providers.
     #[arg(short = 'p', long, help_heading = "Fetching")]

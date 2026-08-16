@@ -1,6 +1,8 @@
 //! GeoIP lookup via cached GeoLite2-City database.
 
+mod ip_type;
 pub mod models;
+pub use ip_type::IpType;
 
 use std::{
     env::current_dir,
@@ -24,7 +26,10 @@ use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use maxminddb::{geoip2::City, Reader};
+use maxminddb::{
+    geoip2::{Asn, City},
+    Reader,
+};
 use models::GeoData;
 #[cfg(feature = "progress_bar")]
 use status_line::StatusLine;
@@ -34,6 +39,8 @@ use tokio::time;
 
 const GEOLITE_ENDPOINT_URL: &str =
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb";
+const GEOLITE_ASN_ENDPOINT_URL: &str =
+    "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-ASN.mmdb";
 const MAX_DATABASE_SIZE: usize = 128 * 1024 * 1024;
 const DATABASE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -229,6 +236,12 @@ fn database_path() -> anyhow::Result<PathBuf> {
     Ok(mmdb_path)
 }
 
+fn asn_database_path() -> anyhow::Result<PathBuf> {
+    let mut mmdb_path = data_dir()?;
+    mmdb_path.set_file_name("geolite2-asn.mmdb");
+    Ok(mmdb_path)
+}
+
 fn local_build_epoch(mmdb_path: &Path) -> Option<u64> {
     Reader::open_readfile(mmdb_path)
         .ok()
@@ -263,13 +276,14 @@ async fn write_synced_etag(mmdb_path: &Path, etag: &str) -> anyhow::Result<()> {
 }
 
 async fn fetch_database(
+    url: &str,
     if_none_match: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> anyhow::Result<(hyper::Response<hyper::body::Incoming>, Option<String>)> {
     let https_connector = HttpsConnector::new();
     let client = Client::builder(TokioExecutor::new()).build(https_connector);
 
-    let mut builder = Request::builder().uri(GEOLITE_ENDPOINT_URL).header(
+    let mut builder = Request::builder().uri(url).header(
         hyper::header::USER_AGENT,
         crate::user_agent::next_user_agent(),
     );
@@ -283,12 +297,7 @@ async fn fetch_database(
     let response = tokio::time::timeout_at(deadline, client.request(req))
         .await
         .context("GeoLite2 download request timed out")?
-        .with_context(|| {
-            format!(
-                "failed to download GeoLite2 database from {}",
-                GEOLITE_ENDPOINT_URL
-            )
-        })?;
+        .with_context(|| format!("failed to download GeoLite2 database from {url}"))?;
     let etag = response
         .headers()
         .get(hyper::header::ETAG)
@@ -300,12 +309,13 @@ async fn fetch_database(
 async fn install_response(
     response: hyper::Response<hyper::body::Incoming>,
     mmdb_path: &Path,
+    url: &str,
     deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
     if !response.status().is_success() {
         anyhow::bail!(
             "GeoLite2 download from {} returned status {}",
-            GEOLITE_ENDPOINT_URL,
+            url,
             response.status()
         );
     }
@@ -373,76 +383,112 @@ pub enum SyncOutcome {
     Synced,
 }
 
-/// Ensures the local GeoLite2 database matches the latest mirror revision.
+/// Ensures the local GeoLite2 databases match the latest mirror revision.
 pub async fn sync_database() -> anyhow::Result<SyncOutcome> {
-    let mmdb_path = database_path()?;
-    let db_valid = local_build_epoch(&mmdb_path).is_some();
-    let stored_etag = read_synced_etag(&mmdb_path);
+    let city = sync_one(GEOLITE_ENDPOINT_URL, &database_path()?).await?;
+    let asn = sync_one(GEOLITE_ASN_ENDPOINT_URL, &asn_database_path()?).await?;
+    Ok(match (city, asn) {
+        (SyncOutcome::Synced, _) | (_, SyncOutcome::Synced) => SyncOutcome::Synced,
+        _ => SyncOutcome::UpToDate,
+    })
+}
+
+async fn sync_one(url: &str, mmdb_path: &Path) -> anyhow::Result<SyncOutcome> {
+    let db_valid = local_build_epoch(mmdb_path).is_some();
+    let stored_etag = read_synced_etag(mmdb_path);
     let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
 
     // A valid local copy with a recorded ETag can be checked with `If-None-
     // Match`; a missing or corrupt copy always needs the full body.
     let conditional = db_valid && stored_etag.is_some();
     let (response, remote_etag) = if conditional {
-        fetch_database(stored_etag.as_deref(), deadline).await?
+        fetch_database(url, stored_etag.as_deref(), deadline).await?
     } else {
-        fetch_database(None, deadline).await?
+        fetch_database(url, None, deadline).await?
     };
 
     if response.status() == hyper::StatusCode::NOT_MODIFIED {
         return Ok(SyncOutcome::UpToDate);
     }
 
-    install_response(response, &mmdb_path, deadline).await?;
+    install_response(response, mmdb_path, url, deadline).await?;
     if let Some(etag) = remote_etag {
-        write_synced_etag(&mmdb_path, &etag).await?;
+        write_synced_etag(mmdb_path, &etag).await?;
     }
     Ok(SyncOutcome::Synced)
 }
 
-/// Downloads the GeoLite2 database from the mirror.
-pub async fn download_database(mmdb_path: &Path) -> anyhow::Result<()> {
+/// Downloads a GeoLite2 database from the mirror into `mmdb_path`.
+pub async fn download_database(mmdb_path: &Path, url: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
-    let (response, _etag) = fetch_database(None, deadline).await?;
-    install_response(response, mmdb_path, deadline).await
+    let (response, _etag) = fetch_database(url, None, deadline).await?;
+    install_response(response, mmdb_path, url, deadline).await
+}
+
+async fn ensure_database(
+    mmdb_path: &Path,
+    url: &str,
+    display_name: &str,
+) -> anyhow::Result<Reader<Vec<u8>>> {
+    if !mmdb_path.exists() {
+        #[cfg(feature = "log")]
+        log::debug!("{} does not exist, downloading", mmdb_path.display());
+        download_database(mmdb_path, url)
+            .await
+            .with_context(|| format!("failed to download {display_name}"))?;
+    }
+
+    match Reader::open_readfile(mmdb_path) {
+        Ok(reader) => Ok(reader),
+        Err(e) => {
+            // The file is corrupt or truncated; drop it so the next run re-downloads.
+            if let Err(_remove_err) = remove_file(mmdb_path) {
+                #[cfg(feature = "log")]
+                log::warn!(
+                    "failed to remove corrupt database {}: {}",
+                    mmdb_path.display(),
+                    _remove_err
+                );
+            }
+            Err(anyhow::Error::new(e).context(format!(
+                "failed to open GeoLite2 database {}",
+                mmdb_path.display()
+            )))
+        }
+    }
 }
 
 /// GeoLite2-based IP geolocation resolver.
 pub struct GeoLookup {
     reader: Reader<Vec<u8>>,
+    asn_reader: Option<Reader<Vec<u8>>>,
 }
 
 impl GeoLookup {
-    pub async fn new() -> anyhow::Result<Self> {
+    pub async fn new(need_asn: bool) -> anyhow::Result<Self> {
         let mmdb_path = database_path()?;
 
         let _download_guard = download_lock().lock().await;
-        if !mmdb_path.exists() {
-            #[cfg(feature = "log")]
-            log::debug!("Geolite2-city.mmdb does not exist, downloading");
-            download_database(&mmdb_path)
-                .await
-                .context("failed to download the GeoLite2 city database")?;
-        }
+        let reader = ensure_database(
+            &mmdb_path,
+            GEOLITE_ENDPOINT_URL,
+            "the GeoLite2 city database",
+        )
+        .await?;
+        let asn_reader = if need_asn {
+            Some(
+                ensure_database(
+                    &asn_database_path()?,
+                    GEOLITE_ASN_ENDPOINT_URL,
+                    "the GeoLite2 ASN database",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
-        match Reader::open_readfile(&mmdb_path) {
-            Ok(reader) => Ok(Self { reader }),
-            Err(e) => {
-                // The file is corrupt or truncated; drop it so the next run re-downloads.
-                if let Err(_remove_err) = remove_file(&mmdb_path) {
-                    #[cfg(feature = "log")]
-                    log::warn!(
-                        "failed to remove corrupt database {}: {}",
-                        mmdb_path.display(),
-                        _remove_err
-                    );
-                }
-                Err(anyhow::Error::new(e).context(format!(
-                    "failed to open GeoLite2 database {}",
-                    mmdb_path.display()
-                )))
-            }
-        }
+        Ok(Self { reader, asn_reader })
     }
 
     /// Looks up geographical data for an IP address.
@@ -456,7 +502,25 @@ impl GeoLookup {
             self.extract_region_data(&city, &mut geodata);
             self.extract_city_data(&city, &mut geodata);
         }
+        self.extract_ip_type(ip, &mut geodata);
         geodata
+    }
+
+    fn extract_ip_type(&self, ip: &Ipv4Addr, geodata: &mut GeoData) {
+        let (asn, aso) = match self.asn_reader.as_ref().and_then(|reader| {
+            reader
+                .lookup(std::net::IpAddr::V4(*ip))
+                .ok()
+                .and_then(|result| result.decode::<Asn>().ok())
+                .flatten()
+        }) {
+            Some(record) => (
+                record.autonomous_system_number,
+                record.autonomous_system_organization,
+            ),
+            None => (None, None),
+        };
+        geodata.ip_type = IpType::classify(asn, aso, None, None);
     }
 
     fn extract_country_data(&self, lookup: &City, geodata: &mut GeoData) {

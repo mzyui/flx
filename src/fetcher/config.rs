@@ -1,10 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
+use crate::geolookup::IpType;
+
 /// Configuration for the proxy fetcher.
 pub struct Config {
     pub enforce_unique_ip: bool,
     pub concurrency_limit: usize,
     pub enable_geo_lookup: bool,
+    pub enable_ip_type: bool,
+    pub ip_type_filter: Option<IpType>,
     pub countries: Arc<[String]>,
     pub fallback_threshold: Option<usize>,
     pub cache_ttl: Option<Duration>,
@@ -36,6 +40,8 @@ impl Default for Config {
             enforce_unique_ip: true,
             concurrency_limit: DEFAULT_CONCURRENCY_LIMIT,
             enable_geo_lookup: false,
+            enable_ip_type: false,
+            ip_type_filter: None,
             countries: Arc::from(Vec::new()),
             fallback_threshold: None,
             cache_ttl: Some(Duration::from_secs(
@@ -59,6 +65,8 @@ mod tests {
     #[test]
     fn geo_lookup_is_disabled_by_default() {
         assert!(!Config::default().enable_geo_lookup);
+        assert!(!Config::default().enable_ip_type);
+        assert_eq!(Config::default().ip_type_filter, None);
     }
 
     #[test]
