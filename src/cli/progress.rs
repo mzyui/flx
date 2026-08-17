@@ -126,30 +126,17 @@ struct WarmupFrame {
 impl Display for WarmupFrame {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if let Some(dl) = self.download.borrow().as_ref() {
-            if dl.total > 0 {
+            let text = if dl.total > 0 {
                 let pct = (dl.downloaded as f64 / dl.total as f64) * 100.0;
-                if self.color {
-                    write!(
-                        f,
-                        "Fetching {} … {}",
-                        dl.name,
-                        format!("{pct:.2}%").bold().cyan()
-                    )?;
-                } else {
-                    write!(f, "Fetching {} … {pct:.2}%", dl.name)?;
-                }
+                format!("Fetching {} … {pct:.2}%", dl.name)
             } else {
                 let mb = dl.downloaded as f64 / (1024.0 * 1024.0);
-                if self.color {
-                    write!(
-                        f,
-                        "Fetching {} … {} MB",
-                        dl.name,
-                        format!("{mb:.1}").bold().cyan()
-                    )?;
-                } else {
-                    write!(f, "Fetching {} … {mb:.1} MB", dl.name)?;
-                }
+                format!("Fetching {} … {mb:.1} MB", dl.name)
+            };
+            if self.color {
+                write!(f, "{}", text.bold().cyan())?;
+            } else {
+                write!(f, "{text}")?;
             }
         } else {
             let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
@@ -204,8 +191,24 @@ impl OutputGuard for WarmupBar {
 mod tests {
     use super::{show_progress, use_color, Frame, WarmupFrame};
     use flx::{DownloadProgress, ValidationProgress};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
     use tokio::sync::watch;
+
+    // `colored`'s color decision is a process-global override, so the tests
+    // that render colored output must not interleave with each other.
+    static COLOR_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_color() -> MutexGuard<'static, ()> {
+        COLOR_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn with_color<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = lock_color();
+        colored::control::set_override(true);
+        let result = f();
+        colored::control::set_override(false);
+        result
+    }
 
     #[test]
     fn warmup_frame_renders_current_phase() {
@@ -234,6 +237,24 @@ mod tests {
         let rendered = frame.to_string();
         assert!(rendered.contains("GeoLite2-City.mmdb"));
         assert!(rendered.contains("40.00%"));
+    }
+
+    #[test]
+    fn warmup_frame_colors_download_line_like_phases() {
+        let (tx, download) = watch::channel(None);
+        tx.send_replace(Some(DownloadProgress {
+            name: "GeoLite2-City.mmdb",
+            downloaded: 400,
+            total: 1000,
+        }));
+        let frame = WarmupFrame {
+            phase: Arc::new(Mutex::new("Fetching primary sources …")),
+            download,
+            color: true,
+        };
+        let rendered = with_color(|| frame.to_string());
+        assert!(rendered.contains("\x1b[1;36mFetching GeoLite2-City.mmdb"));
+        assert!(rendered.ends_with("\x1b[0m"));
     }
 
     #[test]
@@ -268,6 +289,7 @@ mod tests {
 
     #[test]
     fn frame_uses_ansi_codes_only_when_colored() {
+        let _guard = lock_color();
         colored::control::set_override(false);
         let plain = Frame::new(ValidationProgress::default(), false).to_string();
         colored::control::set_override(true);

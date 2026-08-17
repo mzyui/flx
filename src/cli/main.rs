@@ -888,12 +888,15 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         let notify = Arc::clone(&cancel);
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            notify.notify_waiters();
+            // `notify_one` stores a permit even when nothing is waiting yet,
+            // so a SIGINT pressed during the warmup phases (geolite download,
+            // judge preflight) is not lost before `process_result` polls it.
+            notify.notify_one();
         });
         match command {
             Command::Grab(grab) => run_grab(grab, cli.quiet, cli.no_color, &download, cancel).await,
             Command::Find(find) => run_find(find, cli.quiet, cli.no_color, &download, cancel).await,
-            Command::GeoUpdate => run_geo_update(&download, cli.quiet, cli.no_color).await,
+            Command::GeoUpdate => run_geo_update(&download, cli.quiet, cli.no_color, cancel).await,
         }
     });
     runtime.shutdown_background();
@@ -911,9 +914,14 @@ async fn run_grab(
         list_sources();
         return Ok(RunOutcome::Finished);
     }
-    let mut fetcher = ProxySource::from_fetcher(fetcher_config(&grab.fetcher))
-        .await
-        .context("failed to start proxy fetcher")?;
+    let mut fetcher = tokio::select! {
+        fetcher = ProxySource::from_fetcher(fetcher_config(&grab.fetcher)) => {
+            fetcher.context("failed to start proxy fetcher")?
+        }
+        _ = cancel.notified() => {
+            return Ok(RunOutcome::Cancelled);
+        }
+    };
     let accepted = fetcher.accepted_handle();
     let stages = fetcher.stage_events();
     let warmup = make_warmup(quiet, no_color, download);
@@ -1002,16 +1010,28 @@ async fn run_find(
                 bar.set_phase("Checking online judges …");
             }
             let source = Box::pin(tee_recorder(file_source(file).await?, recordings.clone()));
-            let pass = ProxyValidator::validate(source, config)
-                .await
-                .context("failed to start proxy validator")?;
+            let validate = ProxyValidator::validate(source, config);
+            tokio::pin!(validate);
+            let pass = tokio::select! {
+                pass = &mut validate => pass.context("failed to start proxy validator")?,
+                _ = cancel.notified() => {
+                    drop(warmup);
+                    return Ok(RunOutcome::Cancelled);
+                }
+            };
             drop(warmup);
             pass
         }
         None => {
-            let mut fetcher = ProxySource::from_fetcher(fetcher_config(&find.fetcher))
-                .await
-                .context("failed to start proxy fetcher")?;
+            let mut fetcher = tokio::select! {
+                fetcher = ProxySource::from_fetcher(fetcher_config(&find.fetcher)) => {
+                    fetcher.context("failed to start proxy fetcher")?
+                }
+                _ = cancel.notified() => {
+                    drop(warmup);
+                    return Ok(RunOutcome::Cancelled);
+                }
+            };
             let stages = fetcher.stage_events();
             let source = Box::pin(tee_recorder(fetcher, recordings.clone()));
             if let Some(bar) = &warmup {
@@ -1038,9 +1058,19 @@ async fn run_find(
                 }
                 _ => None,
             };
-            let pass = ProxyValidator::validate(source, config)
-                .await
-                .context("failed to start proxy validator")?;
+            let validate = ProxyValidator::validate(source, config);
+            tokio::pin!(validate);
+            let pass = tokio::select! {
+                pass = &mut validate => pass.context("failed to start proxy validator")?,
+                _ = cancel.notified() => {
+                    if let Some(task) = watcher {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    drop(warmup);
+                    return Ok(RunOutcome::Cancelled);
+                }
+            };
             if let Some(task) = watcher {
                 task.abort();
                 let _ = task.await;
@@ -1317,14 +1347,21 @@ async fn run_geo_update(
     download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
     quiet: bool,
     no_color: bool,
+    cancel: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<RunOutcome> {
     let warmup = make_warmup(quiet, no_color, download);
     if let Some(bar) = &warmup {
         bar.set_phase("Syncing GeoLite2 databases …");
     }
-    let outcome = flx::sync_database()
-        .await
-        .context("failed to sync the GeoLite2 database")?;
+    let outcome = tokio::select! {
+        outcome = flx::sync_database() => {
+            outcome.context("failed to sync the GeoLite2 database")?
+        }
+        _ = cancel.notified() => {
+            drop(warmup);
+            return Ok(RunOutcome::Cancelled);
+        }
+    };
     drop(warmup);
     match outcome {
         flx::SyncOutcome::Synced => {
