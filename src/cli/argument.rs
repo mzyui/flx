@@ -88,6 +88,16 @@ pub struct Cli {
     pub log_level: String,
 }
 
+fn parse_auth_pair(value: &str) -> Result<String, String> {
+    let (user, pass) = value
+        .split_once(':')
+        .ok_or_else(|| format!("{value} must be in user:pass form"))?;
+    if user.is_empty() || pass.is_empty() {
+        return Err(format!("{value} must be in user:pass form"));
+    }
+    Ok(value.to_owned())
+}
+
 /// The pipeline commands available in the CLI.
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -95,6 +105,8 @@ pub enum Command {
     Grab(FetchArgs),
     /// Validate proxies from a file or the built-in providers against online judges.
     Find(FindArgs),
+    /// Run a gateway forward-proxy backed by validated proxies.
+    Serve(ServeArgs),
     /// Download and verify the GeoLite2 GeoIP database.
     #[command(name = "geo-update")]
     GeoUpdate,
@@ -324,4 +336,65 @@ pub struct FindArgs {
 
     #[command(flatten)]
     pub validator: ValidatorArgs,
+}
+
+/// `flx serve`: run a gateway forward-proxy backed by validated proxies.
+#[derive(Args, Debug)]
+pub struct ServeArgs {
+    #[command(flatten)]
+    pub fetcher: FetcherArgs,
+
+    #[command(flatten)]
+    pub validator: ValidatorArgs,
+
+    /// Address the gateway listener binds to.
+    #[arg(long, default_value = "127.0.0.1", help_heading = "Serve")]
+    pub host: String,
+
+    /// Port the gateway listener binds to.
+    #[arg(long, default_value_t = 8080, help_heading = "Serve")]
+    pub port: u16,
+
+    /// Pin one upstream proxy per client connection (false re-pins every request).
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        help_heading = "Serve"
+    )]
+    pub session: bool,
+
+    /// Idle seconds before a session is closed (0 disables the watchdog).
+    #[arg(long, default_value_t = 60, help_heading = "Serve")]
+    pub session_timeout: u64,
+
+    /// Maximum concurrent sessions (0 is unlimited).
+    #[arg(long, default_value_t = 200, help_heading = "Serve")]
+    pub max_sessions: usize,
+
+    /// Maximum concurrent client connections (0 is unlimited).
+    #[arg(long, default_value_t = 0, help_heading = "Serve")]
+    pub max_clients: usize,
+
+    /// Maximum proxies kept in the pool (0 is unlimited).
+    #[arg(long, default_value_t = 0, help_heading = "Serve")]
+    pub pool_size: usize,
+
+    /// Seconds between pool re-validation passes (0 validates once at startup).
+    #[arg(long, default_value_t = 0, help_heading = "Serve")]
+    pub refresh: u64,
+
+    /// Rank the pool by live dial latency and pin from the fastest.
+    #[arg(long, help_heading = "Serve")]
+    pub use_fastest: bool,
+
+    /// Shared Basic auth credentials (user:pass); unset opens the gateway.
+    #[arg(long, help_heading = "Serve", value_parser = parse_auth_pair)]
+    pub auth: Option<String>,
+
+    /// Seconds a request waits for a pool proxy before replying 503.
+    #[arg(long, default_value_t = 5, help_heading = "Serve")]
+    pub pool_wait: u64,
 }
