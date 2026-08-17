@@ -2,7 +2,6 @@ mod cache;
 mod config;
 
 use std::{
-    borrow::Cow,
     collections::{hash_map::DefaultHasher, HashMap, VecDeque},
     hash::{Hash, Hasher},
     net::Ipv4Addr,
@@ -35,8 +34,8 @@ use tokio::{
 use crate::{
     geolookup::{GeoLookup, IpType},
     providers::{
-        all_providers, models::Source, select_providers, CustomUrlProvider, ProviderTier,
-        ProxyProvider,
+        all_providers, models::Source, parse_all, parsers::ParsedProxy, select_providers,
+        CustomUrlProvider, ProviderTier, ProxyProvider,
     },
     proxy::models::{Protocol, Proxy},
 };
@@ -495,18 +494,15 @@ async fn do_work(
         return Ok(());
     }
     let url = source.url.to_string();
+    let expected_types = Arc::clone(&source.default_types);
 
-    let html = match settings.fetch_cache.as_ref() {
-        Some(fetch_cache) => match fetch_cache.load(&url).await {
-            Some(body) => {
-                #[cfg(feature = "log")]
-                log::debug!("using cached body for {url}");
-                Cow::Owned(body)
-            }
+    let rows: Vec<ParsedProxy> = match settings.fetch_cache.as_ref() {
+        Some(fetch_cache) => match fetch_cache.load_rows(&url).await {
+            Some(rows) => rows,
             None => {
                 if settings.offline {
                     #[cfg(feature = "log")]
-                    log::warn!("offline: no cached body for {url}; skipping");
+                    log::warn!("offline: no cached rows for {url}; skipping");
                     return Ok(());
                 }
                 let _permit = sem
@@ -518,11 +514,12 @@ async fn do_work(
                     .fetch(client, &url, source.timeout)
                     .await
                     .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
-                // Only a real network fetch is worth persisting: a cache hit
-                // that re-wrote the same body to disk every run was pure
-                // write-amplification.
-                fetch_cache.store(&url, body.as_ref()).await;
-                body
+                let mode = source.mode.clone();
+                let rows = tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
+                    .await
+                    .context("provider parser task failed")??;
+                fetch_cache.store_rows(&url, &rows).await;
+                rows
             }
         },
         None => {
@@ -536,10 +533,14 @@ async fn do_work(
                 .await
                 .context("fetcher semaphore closed during shutdown")?;
             throttle_wait(&settings, &source).await;
-            provider
+            let body = provider
                 .fetch(client, &url, source.timeout)
                 .await
-                .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
+                .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
+            let mode = source.mode.clone();
+            tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
+                .await
+                .context("provider parser task failed")??
         }
     };
 
@@ -547,11 +548,16 @@ async fn do_work(
         return Ok(());
     }
 
-    let expected_types = Arc::clone(&source.default_types);
-    provider
-        .scrape_with(html, tx, expected_types, source.mode.clone())
-        .await
-        .with_context(|| format!("failed to scrape proxies from {}", source.url))
+    for (ip, port, protocol) in rows {
+        let proxy = match protocol {
+            Some(protocol) => Proxy::with_expected_types(ip, port, Arc::from([protocol])),
+            None => Proxy::with_expected_types(ip, port, Arc::clone(&expected_types)),
+        };
+        if tx.send(proxy).await.is_err() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 impl ProxyFetcher {
@@ -1165,7 +1171,15 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let url = format!("http://{address}/list");
         let (cache, dir) = temp_cache_dir();
-        cache.store(&url, "1.2.3.4:8080\n5.6.7.8:3128\n").await;
+        cache
+            .store_rows(
+                &url,
+                &[
+                    (Ipv4Addr::new(1, 2, 3, 4), 8080, None),
+                    (Ipv4Addr::new(5, 6, 7, 8), 3128, None),
+                ],
+            )
+            .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let (_, stop_rx) = tokio::sync::watch::channel(false);
         let semaphore = Arc::new(Semaphore::new(1));

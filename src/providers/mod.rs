@@ -243,6 +243,26 @@ pub trait ProxyProvider {
     }
 }
 
+pub(crate) fn parse_all(
+    mode: &ScrapeMode,
+    body: &str,
+) -> anyhow::Result<Vec<parsers::ParsedProxy>> {
+    let mut rows = Vec::new();
+    let mut collect = |row: parsers::ParsedProxy| {
+        rows.push(row);
+        true
+    };
+    match mode {
+        ScrapeMode::Plaintext => parsers::visit_plaintext(body, &mut collect),
+        ScrapeMode::GeonodeJson => parsers::visit_geonode(body, &mut collect)?,
+        ScrapeMode::ProxyNovaJson => parsers::visit_proxynova(body, &mut collect)?,
+        ScrapeMode::HtmlTable => parsers::visit_html_table(body, &mut collect),
+        ScrapeMode::RegexPairs => parsers::visit_regex_pairs(body, &mut collect),
+        ScrapeMode::Base64Rows => parsers::visit_base64_rows(body, &mut collect),
+    }
+    Ok(rows)
+}
+
 fn append_utf8(
     content: &mut String,
     pending: &mut [u8; 3],
