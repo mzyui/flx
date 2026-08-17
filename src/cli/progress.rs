@@ -187,9 +187,78 @@ impl OutputGuard for WarmupBar {
     }
 }
 
+/// Live serve status line: pool, partition and session counters.
+pub struct ServeBar {
+    _status: StatusLine<ServeFrame>,
+}
+
+/// Frames the live pool/session counters into one status line.
+pub struct ServeFrame {
+    pool: crate::server::Pool,
+    color: bool,
+}
+
+impl Display for ServeFrame {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let snap = self.pool.snapshot();
+        let sessions = if snap.max_sessions > 0 {
+            format!("sessions {}/{}", snap.active_sessions, snap.max_sessions)
+        } else {
+            format!("sessions {}", snap.active_sessions)
+        };
+        if self.color {
+            let failovers = format!("{} failovers", snap.failovers).red();
+            let errors = format!("{} errors", snap.errors);
+            write!(
+                f,
+                "{} · {} {} ({} tunnel · {} forward) · {} · {} · {}",
+                "serve".cyan().bold(),
+                "pool".cyan().bold(),
+                snap.pool,
+                snap.tunnel,
+                snap.forward,
+                sessions,
+                failovers,
+                errors,
+            )
+        } else {
+            write!(
+                f,
+                "serve · pool {} ({} tunnel · {} forward) · {sessions} · {} failovers · {} errors",
+                snap.pool, snap.tunnel, snap.forward, snap.failovers, snap.errors,
+            )
+        }
+    }
+}
+
+impl ServeBar {
+    pub fn new(
+        quiet: bool,
+        no_color: bool,
+        stdout_is_pipe: bool,
+        pool: crate::server::Pool,
+    ) -> Option<Self> {
+        use std::io::IsTerminal as _;
+
+        if !show_progress(quiet, std::io::stderr().is_terminal(), stdout_is_pipe) {
+            return None;
+        }
+        let frame = ServeFrame {
+            pool,
+            color: use_color(no_color),
+        };
+        let status = StatusLine::with_options(frame, status_line::Options::default());
+        Some(Self { _status: status })
+    }
+
+    pub fn hide(&self) {
+        self._status.set_visible(false);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{show_progress, use_color, Frame, WarmupFrame};
+    use super::{show_progress, use_color, Frame, ServeFrame, WarmupFrame};
     use flx::{DownloadProgress, ValidationProgress};
     use std::sync::{Arc, Mutex, MutexGuard};
     use tokio::sync::watch;
@@ -294,6 +363,49 @@ mod tests {
         let plain = Frame::new(ValidationProgress::default(), false).to_string();
         colored::control::set_override(true);
         let colored = Frame::new(ValidationProgress::default(), true).to_string();
+        colored::control::set_override(false);
+
+        assert!(!plain.contains('\x1b'));
+        assert!(colored.contains('\x1b'));
+    }
+
+    #[test]
+    fn serve_frame_renders_layout_with_counters() {
+        let frame = ServeFrame {
+            pool: crate::server::Pool::new(0, 0, false),
+            color: false,
+        };
+        let rendered = frame.to_string();
+        assert!(rendered.starts_with("serve · pool 0 (0 tunnel · 0 forward)"));
+        assert!(rendered.contains("sessions 0 · 0 failovers · 0 errors"));
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('/'));
+    }
+
+    #[test]
+    fn serve_frame_renders_max_sessions_when_set() {
+        let frame = ServeFrame {
+            pool: crate::server::Pool::new(200, 0, false),
+            color: false,
+        };
+        assert!(frame.to_string().contains("sessions 0/200"));
+    }
+
+    #[test]
+    fn serve_frame_uses_ansi_codes_only_when_colored() {
+        let _guard = lock_color();
+        colored::control::set_override(false);
+        let plain = ServeFrame {
+            pool: crate::server::Pool::new(0, 0, false),
+            color: false,
+        }
+        .to_string();
+        colored::control::set_override(true);
+        let colored = ServeFrame {
+            pool: crate::server::Pool::new(0, 0, false),
+            color: true,
+        }
+        .to_string();
         colored::control::set_override(false);
 
         assert!(!plain.contains('\x1b'));

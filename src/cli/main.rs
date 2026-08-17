@@ -21,6 +21,8 @@ mod argument;
 mod progress;
 mod server;
 
+use server::ServeSnapshot;
+
 pub trait OutputGuard {
     fn before_write(&self);
     fn after_write(&self);
@@ -74,6 +76,31 @@ fn stdout_is_pipe() -> bool {
 #[cfg(not(unix))]
 fn stdout_is_pipe() -> bool {
     !std::io::stdout().is_terminal()
+}
+
+/// Formats the pool-readiness banner printed once the first proxies land.
+fn format_pool_ready(pool: usize, tunnel: usize, forward: usize) -> String {
+    format!("pool ready: {pool} proxies ({tunnel} tunnel, {forward} forward)")
+}
+
+/// Formats the end-of-run summary line for `serve`, colored under the
+/// `progress_bar` feature and plain otherwise.
+#[cfg(feature = "progress_bar")]
+fn format_serve_summary(snapshot: ServeSnapshot, elapsed: std::time::Duration) -> String {
+    let sessions = format!("{} sessions", snapshot.sessions_total).green();
+    let requests = format!("{} requests", snapshot.requests);
+    let bytes = format!("{:.1} MB relayed", snapshot.bytes as f64 / 1_048_576.0);
+    let failovers = format!("{} failovers", snapshot.failovers).red();
+    format!("serve stopped · {sessions} · {requests} · {bytes} · {failovers} in {elapsed:?}")
+}
+
+#[cfg(not(feature = "progress_bar"))]
+fn format_serve_summary(snapshot: ServeSnapshot, elapsed: std::time::Duration) -> String {
+    let bytes = format!("{:.1} MB relayed", snapshot.bytes as f64 / 1_048_576.0);
+    format!(
+        "serve stopped · {} sessions · {} requests · {bytes} · {} failovers in {elapsed:?}",
+        snapshot.sessions_total, snapshot.requests, snapshot.failovers
+    )
 }
 
 /// Formats the end-of-run stats line for `find`, colored under the
@@ -1340,6 +1367,25 @@ fn make_warmup(
     download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
 ) -> Option<Arc<progress::WarmupBar>> {
     progress::WarmupBar::new(quiet, no_color, stdout_is_pipe(), download.clone()).map(Arc::new)
+}
+
+#[cfg(feature = "progress_bar")]
+fn make_serve_bar(quiet: bool, no_color: bool, pool: server::Pool) -> Option<progress::ServeBar> {
+    progress::ServeBar::new(quiet, no_color, stdout_is_pipe(), pool)
+}
+
+#[cfg(not(feature = "progress_bar"))]
+fn make_serve_bar(_quiet: bool, _no_color: bool, _pool: server::Pool) -> Option<ServeBarNoop> {
+    None
+}
+
+// No-op serve status line for builds without the `progress_bar` feature.
+#[cfg(not(feature = "progress_bar"))]
+pub struct ServeBarNoop;
+
+#[cfg(not(feature = "progress_bar"))]
+impl ServeBarNoop {
+    pub fn hide(&self) {}
 }
 
 #[cfg(not(feature = "progress_bar"))]

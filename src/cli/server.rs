@@ -83,12 +83,30 @@ struct Snapshot {
 struct Stats {
     failovers: AtomicUsize,
     errors: AtomicUsize,
+    sessions_total: AtomicUsize,
+    requests: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+/// Live counters for rendering the serve status line and end-of-run summary.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ServeSnapshot {
+    pub active_sessions: usize,
+    pub max_sessions: usize,
+    pub pool: usize,
+    pub tunnel: usize,
+    pub forward: usize,
+    pub failovers: usize,
+    pub errors: usize,
+    pub sessions_total: usize,
+    pub requests: usize,
+    pub bytes: u64,
 }
 
 /// Shared proxy pool: an immutable snapshot on the hot path plus a pending
 /// batch that is folded in on an amortized schedule.
 #[derive(Clone)]
-struct Pool {
+pub(crate) struct Pool {
     snapshot: Arc<RwLock<Snapshot>>,
     pending: Arc<Mutex<Vec<Proxy>>>,
     dirty: Arc<AtomicBool>,
@@ -106,7 +124,7 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(max_sessions: usize, pool_size: usize, use_fastest: bool) -> Self {
+    pub(crate) fn new(max_sessions: usize, pool_size: usize, use_fastest: bool) -> Self {
         Self {
             snapshot: Arc::new(RwLock::new(Snapshot::default())),
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -334,13 +352,21 @@ impl Pool {
         self.set_snapshot(keep);
     }
 
-    fn snapshot_stats(&self) -> (usize, usize, usize, usize) {
-        (
-            self.sessions.load(Ordering::Relaxed),
-            self.len(),
-            self.stats.failovers.load(Ordering::Relaxed),
-            self.stats.errors.load(Ordering::Relaxed),
-        )
+    pub(crate) fn snapshot(&self) -> ServeSnapshot {
+        self.ensure_fresh();
+        let snap = self.snapshot.read().expect("pool snapshot poisoned");
+        ServeSnapshot {
+            active_sessions: self.sessions.load(Ordering::Relaxed),
+            max_sessions: self.max_sessions,
+            pool: self.len(),
+            tunnel: snap.tunnel.len(),
+            forward: snap.forward.len(),
+            failovers: self.stats.failovers.load(Ordering::Relaxed),
+            errors: self.stats.errors.load(Ordering::Relaxed),
+            sessions_total: self.stats.sessions_total.load(Ordering::Relaxed),
+            requests: self.stats.requests.load(Ordering::Relaxed),
+            bytes: self.stats.bytes.load(Ordering::Relaxed) as u64,
+        }
     }
 }
 
@@ -798,6 +824,7 @@ async fn relay_exact<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     dst: &mut W,
     mut n: u64,
     idle: Duration,
+    count: &AtomicUsize,
 ) -> anyhow::Result<()> {
     let mut chunk = [0u8; MAX_BODY_CHUNK];
     while n > 0 {
@@ -811,6 +838,7 @@ async fn relay_exact<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
         let take = (srcbuf.len() as u64).min(n) as usize;
         dst.write_all(&srcbuf[..take]).await?;
+        count.fetch_add(take, Ordering::Relaxed);
         srcbuf.drain(..take);
         n -= take as u64;
     }
@@ -823,11 +851,13 @@ async fn read_relay_line<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     dst: &mut W,
     idle: Duration,
     cap: usize,
+    count: &AtomicUsize,
 ) -> anyhow::Result<Vec<u8>> {
     let mut line = Vec::with_capacity(64);
     loop {
         if let Some(pos) = srcbuf.iter().position(|&b| b == b'\n') {
             dst.write_all(&srcbuf[..=pos]).await?;
+            count.fetch_add(pos + 1, Ordering::Relaxed);
             line.extend_from_slice(&srcbuf[..pos]);
             srcbuf.drain(..=pos);
             if line.last() == Some(&b'\r') {
@@ -857,21 +887,23 @@ async fn relay_chunked<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     srcbuf: &mut Vec<u8>,
     dst: &mut W,
     idle: Duration,
+    count: &AtomicUsize,
 ) -> anyhow::Result<()> {
     loop {
-        let line = read_relay_line(src, srcbuf, dst, idle, MAX_LINE_BYTES).await?;
+        let line = read_relay_line(src, srcbuf, dst, idle, MAX_LINE_BYTES, count).await?;
         let size_str =
             String::from_utf8_lossy(line.split(|&b| b == b';').next().unwrap_or_default());
         let size = u64::from_str_radix(size_str.trim(), 16).context("invalid chunk size")?;
         if size == 0 {
             loop {
-                let trailer = read_relay_line(src, srcbuf, dst, idle, MAX_LINE_BYTES).await?;
+                let trailer =
+                    read_relay_line(src, srcbuf, dst, idle, MAX_LINE_BYTES, count).await?;
                 if trailer.is_empty() {
                     return Ok(());
                 }
             }
         }
-        relay_exact(src, srcbuf, dst, size + 2, idle).await?;
+        relay_exact(src, srcbuf, dst, size + 2, idle, count).await?;
     }
 }
 
@@ -880,10 +912,12 @@ async fn relay_until_eof<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     srcbuf: &mut Vec<u8>,
     dst: &mut W,
     idle: Duration,
+    count: &AtomicUsize,
 ) -> anyhow::Result<()> {
     if !srcbuf.is_empty() {
         let bytes = std::mem::take(srcbuf);
         dst.write_all(&bytes).await?;
+        count.fetch_add(bytes.len(), Ordering::Relaxed);
     }
     let mut chunk = [0u8; MAX_BODY_CHUNK];
     loop {
@@ -892,6 +926,7 @@ async fn relay_until_eof<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             return Ok(());
         }
         dst.write_all(&chunk[..n]).await?;
+        count.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -993,11 +1028,12 @@ async fn forward_client_body(
     dst: &mut TcpStream,
     semantics: &RequestSemantics,
     idle: Duration,
+    count: &AtomicUsize,
 ) -> anyhow::Result<()> {
     if semantics.chunked {
-        relay_chunked(client, buf, dst, idle).await
+        relay_chunked(client, buf, dst, idle, count).await
     } else if let Some(n) = semantics.content_length {
-        relay_exact(client, buf, dst, n, idle).await
+        relay_exact(client, buf, dst, n, idle, count).await
     } else {
         Ok(())
     }
@@ -1016,16 +1052,19 @@ async fn relay_response_head_and_body(
     rh: &UpstreamHead,
     method: &[u8],
     idle: Duration,
+    count: &AtomicUsize,
 ) -> anyhow::Result<ResponseEnd> {
     let no_body = no_body_response(rh.status, method);
     let eof_delimited = !no_body && !rh.chunked && rh.content_length.is_none();
     if eof_delimited {
         let head = rewrite_response_close(&rh.bytes);
         client.write_all(&head).await?;
-        relay_until_eof(&mut up.stream, &mut up.buf, client, idle).await?;
+        count.fetch_add(head.len(), Ordering::Relaxed);
+        relay_until_eof(&mut up.stream, &mut up.buf, client, idle, count).await?;
         return Ok(ResponseEnd::ClientClose);
     }
     client.write_all(&rh.bytes).await?;
+    count.fetch_add(rh.bytes.len(), Ordering::Relaxed);
     let keeps = upstream_keeps_alive(rh);
     if no_body {
         return Ok(if keeps {
@@ -1035,9 +1074,9 @@ async fn relay_response_head_and_body(
         });
     }
     if rh.chunked {
-        relay_chunked(&mut up.stream, &mut up.buf, client, idle).await?;
+        relay_chunked(&mut up.stream, &mut up.buf, client, idle, count).await?;
     } else if let Some(cl) = rh.content_length {
-        relay_exact(&mut up.stream, &mut up.buf, client, cl, idle).await?;
+        relay_exact(&mut up.stream, &mut up.buf, client, cl, idle, count).await?;
     }
     Ok(if keeps {
         ResponseEnd::KeepAlive
@@ -1052,6 +1091,7 @@ async fn relay_final_response(
     method: &[u8],
     idle: Duration,
     mut pending: Option<UpstreamHead>,
+    count: &AtomicUsize,
 ) -> anyhow::Result<ResponseEnd> {
     loop {
         let rh = match pending.take() {
@@ -1060,13 +1100,15 @@ async fn relay_final_response(
         };
         if rh.status == 101 {
             client.write_all(&rh.bytes).await?;
+            count.fetch_add(rh.bytes.len(), Ordering::Relaxed);
             return Ok(ResponseEnd::Handoff);
         }
         if (100..200).contains(&rh.status) {
             client.write_all(&rh.bytes).await?;
+            count.fetch_add(rh.bytes.len(), Ordering::Relaxed);
             continue;
         }
-        return relay_response_head_and_body(client, up, &rh, method, idle).await;
+        return relay_response_head_and_body(client, up, &rh, method, idle, count).await;
     }
 }
 
@@ -1077,27 +1119,31 @@ async fn expect_phase(
     method: &[u8],
     semantics: &RequestSemantics,
     idle: Duration,
+    count: &AtomicUsize,
 ) -> anyhow::Result<ResponseEnd> {
     loop {
         let up = upstream.as_mut().expect("upstream ensured");
         let rh = read_upstream_head(up, idle).await?;
         if rh.status == 100 {
             client.write_all(&rh.bytes).await?;
+            count.fetch_add(rh.bytes.len(), Ordering::Relaxed);
             let up = upstream.as_mut().expect("upstream ensured");
-            forward_client_body(client, buf, &mut up.stream, semantics, idle).await?;
+            forward_client_body(client, buf, &mut up.stream, semantics, idle, count).await?;
             let up = upstream.as_mut().expect("upstream ensured");
-            return relay_final_response(client, up, method, idle, None).await;
+            return relay_final_response(client, up, method, idle, None, count).await;
         }
         if rh.status == 101 {
             client.write_all(&rh.bytes).await?;
+            count.fetch_add(rh.bytes.len(), Ordering::Relaxed);
             return Ok(ResponseEnd::Handoff);
         }
         if (100..200).contains(&rh.status) {
             client.write_all(&rh.bytes).await?;
+            count.fetch_add(rh.bytes.len(), Ordering::Relaxed);
             continue;
         }
         let up = upstream.as_mut().expect("upstream ensured");
-        let end = relay_response_head_and_body(client, up, &rh, method, idle).await?;
+        let end = relay_response_head_and_body(client, up, &rh, method, idle, count).await?;
         if !buf.is_empty() {
             return Ok(ResponseEnd::ClientClose);
         }
@@ -1186,6 +1232,7 @@ async fn plain_http_roundtrip(
         return Ok((RoundtripEnd::ClientClose, None));
     }
 
+    let count = &pool.stats.bytes;
     let end = if semantics.expect_continue {
         expect_phase(
             client,
@@ -1194,15 +1241,16 @@ async fn plain_http_roundtrip(
             &plan.head.method,
             &semantics,
             cfg.idle,
+            count,
         )
         .await?
     } else {
         {
             let up = upstream.as_mut().expect("upstream ensured");
-            forward_client_body(client, buf, &mut up.stream, &semantics, cfg.idle).await?;
+            forward_client_body(client, buf, &mut up.stream, &semantics, cfg.idle, count).await?;
         }
         let up = upstream.as_mut().expect("upstream ensured");
-        relay_final_response(client, up, &plan.head.method, cfg.idle, None).await?
+        relay_final_response(client, up, &plan.head.method, cfg.idle, None, count).await?
     };
 
     match end {
@@ -1215,7 +1263,12 @@ async fn plain_http_roundtrip(
     }
 }
 
-async fn pipe_bidirectional(a: &mut TcpStream, b: &mut TcpStream, idle: Duration) -> PipeEnd {
+async fn pipe_bidirectional(
+    a: &mut TcpStream,
+    b: &mut TcpStream,
+    idle: Duration,
+    count: &AtomicUsize,
+) -> PipeEnd {
     let mut a2b = [0u8; MAX_BODY_CHUNK];
     let mut b2a = [0u8; MAX_BODY_CHUNK];
     loop {
@@ -1223,6 +1276,7 @@ async fn pipe_bidirectional(a: &mut TcpStream, b: &mut TcpStream, idle: Duration
             r = read_bounded(a, &mut a2b, idle) => match r {
                 Ok(0) => return PipeEnd::ClientClosed,
                 Ok(n) => {
+                    count.fetch_add(n, Ordering::Relaxed);
                     if b.write_all(&a2b[..n]).await.is_err() {
                         return PipeEnd::UpstreamGone;
                     }
@@ -1232,6 +1286,7 @@ async fn pipe_bidirectional(a: &mut TcpStream, b: &mut TcpStream, idle: Duration
             r = read_bounded(b, &mut b2a, idle) => match r {
                 Ok(0) => return PipeEnd::UpstreamGone,
                 Ok(n) => {
+                    count.fetch_add(n, Ordering::Relaxed);
                     if a.write_all(&b2a[..n]).await.is_err() {
                         return PipeEnd::ClientClosed;
                     }
@@ -1307,7 +1362,7 @@ async fn handle_connect(
 
     let mut fails = 0;
     loop {
-        match pipe_bidirectional(client, &mut upstream.stream, cfg.idle).await {
+        match pipe_bidirectional(client, &mut upstream.stream, cfg.idle, &pool.stats.bytes).await {
             PipeEnd::ClientClosed | PipeEnd::IdleTimeout => break,
             PipeEnd::UpstreamGone => {
                 if fails >= MAX_FAILOVERS {
@@ -1341,6 +1396,7 @@ async fn serve_session(
             bail!("pipelined request rejected");
         }
         let head_len = read_head(client, buf, cfg.idle).await?;
+        pool.stats.requests.fetch_add(1, Ordering::Relaxed);
         let head_bytes = buf[..head_len].to_vec();
         buf.drain(..head_len);
         let head = match parse_client_head(&head_bytes) {
@@ -1398,7 +1454,8 @@ async fn serve_session(
                 }
             }
             RoundtripEnd::Handoff(mut up) => {
-                let _ = pipe_bidirectional(client, &mut up.stream, cfg.idle).await;
+                let _ =
+                    pipe_bidirectional(client, &mut up.stream, cfg.idle, &pool.stats.bytes).await;
                 guard.release();
                 return Ok(());
             }
@@ -1411,9 +1468,11 @@ async fn serve_session(
 
 async fn serve_connection(mut client: TcpStream, pool: Pool, cfg: ServeConfig) {
     if !pool.await_session_slot(cfg.pool_wait).await {
+        pool.stats.errors.fetch_add(1, Ordering::Relaxed);
         let _ = client.write_all(RESPONSE_503).await;
         return;
     }
+    pool.stats.sessions_total.fetch_add(1, Ordering::Relaxed);
     let mut guard = PinGuard::new();
     let mut buf = Vec::with_capacity(2048);
     if let Err(e) = serve_session(&mut client, &mut buf, &pool, &cfg, &mut guard).await {
@@ -1548,15 +1607,17 @@ pub async fn run_serve(
         consumer_pool.rebuild();
     });
 
+    let started = std::time::Instant::now();
+    let serve_bar = super::make_serve_bar(quiet, no_color, pool.clone());
     let addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind gateway listener on {addr}"))?;
-    if !quiet {
-        eprintln!("serving on {addr} (fetching and validating proxies in the background)");
-        if args.host != "127.0.0.1" && args.host != "localhost" && args.auth.is_none() {
-            eprintln!("warning: non-loopback bind without --auth exposes an open proxy");
-        }
+    if !quiet && args.host != "127.0.0.1" && args.host != "localhost" && args.auth.is_none() {
+        eprintln!("warning: non-loopback bind without --auth exposes an open proxy");
+    }
+    if !quiet && serve_bar.is_none() {
+        eprintln!("warming up: fetching and validating proxies …");
     }
 
     let clients_sem =
@@ -1564,8 +1625,9 @@ pub async fn run_serve(
     let cfg = ServeConfig::from_args(&args);
     let mut sessions = tokio::task::JoinSet::new();
 
+    // Non-TTY fallback stats; the status line already repaints itself on a TTY.
     let stats_pool = pool.clone();
-    let stats_task = if quiet {
+    let stats_task = if quiet || serve_bar.is_some() {
         None
     } else {
         Some(tokio::spawn(async move {
@@ -1573,13 +1635,19 @@ pub async fn run_serve(
             tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                let (active, size, failovers, errors) = stats_pool.snapshot_stats();
+                let snap = stats_pool.snapshot();
                 eprintln!(
-                    "serve stats: sessions active {active}, pool {size}, failovers {failovers}, errors {errors}"
+                    "serve stats: sessions active {}, pool {}, failovers {}, errors {}, requests {}, sessions total {}",
+                    snap.active_sessions, snap.pool, snap.failovers, snap.errors, snap.requests, snap.sessions_total
                 );
             }
         }))
     };
+
+    let mut house_tick = time::interval(Duration::from_millis(500));
+    house_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut pool_ready_announced = false;
+    let mut pool_empty_announced = false;
 
     let mut refresh_tick = (args.refresh > 0).then(|| {
         let mut tick = time::interval(Duration::from_secs(args.refresh));
@@ -1628,6 +1696,22 @@ pub async fn run_serve(
                 );
                 tokio::spawn(async move { run_refresh(pool, refresh_vconfig, refresh_cfg).await });
             }
+            _ = house_tick.tick() => {
+                if !quiet && serve_bar.is_none() {
+                    let snap = pool.snapshot();
+                    if !pool_ready_announced && snap.tunnel + snap.forward > 0 {
+                        pool_ready_announced = true;
+                        eprintln!(
+                            "serving on {addr} · {}",
+                            super::format_pool_ready(snap.pool, snap.tunnel, snap.forward)
+                        );
+                    }
+                    if !pool_empty_announced && consumer.is_finished() && snap.pool == 0 {
+                        pool_empty_announced = true;
+                        eprintln!("serve: pool empty (all candidates failed)");
+                    }
+                }
+            }
         }
     };
 
@@ -1642,8 +1726,13 @@ pub async fn run_serve(
     if let Some(task) = stats_task {
         task.abort();
     }
+    if let Some(bar) = &serve_bar {
+        bar.hide();
+    }
+    drop(serve_bar);
     if !quiet {
-        eprintln!("serve stopped");
+        let summary = super::format_serve_summary(pool.snapshot(), started.elapsed());
+        eprintln!("{summary}");
     }
     Ok(outcome)
 }
