@@ -7,8 +7,9 @@ use std::{
 };
 
 use colored::Colorize;
-use flx::ValidationProgress;
+use flx::{DownloadProgress, ValidationProgress};
 use status_line::StatusLine;
+use tokio::sync::watch;
 
 use crate::OutputGuard;
 
@@ -118,22 +119,57 @@ pub struct WarmupBar {
 
 struct WarmupFrame {
     phase: Arc<Mutex<&'static str>>,
+    download: watch::Receiver<Option<DownloadProgress>>,
     color: bool,
 }
 
 impl Display for WarmupFrame {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
-        if self.color {
-            write!(f, "{}", phase.bold().cyan())
+        if let Some(dl) = self.download.borrow().as_ref() {
+            if dl.total > 0 {
+                let pct = (dl.downloaded as f64 / dl.total as f64) * 100.0;
+                if self.color {
+                    write!(
+                        f,
+                        "Fetching {} … {}",
+                        dl.name,
+                        format!("{pct:.2}%").bold().cyan()
+                    )?;
+                } else {
+                    write!(f, "Fetching {} … {pct:.2}%", dl.name)?;
+                }
+            } else {
+                let mb = dl.downloaded as f64 / (1024.0 * 1024.0);
+                if self.color {
+                    write!(
+                        f,
+                        "Fetching {} … {} MB",
+                        dl.name,
+                        format!("{mb:.1}").bold().cyan()
+                    )?;
+                } else {
+                    write!(f, "Fetching {} … {mb:.1} MB", dl.name)?;
+                }
+            }
         } else {
-            write!(f, "{phase}")
+            let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
+            if self.color {
+                write!(f, "{}", phase.bold().cyan())?;
+            } else {
+                write!(f, "{phase}")?;
+            }
         }
+        Ok(())
     }
 }
 
 impl WarmupBar {
-    pub fn new(quiet: bool, no_color: bool, stdout_is_pipe: bool) -> Option<Self> {
+    pub fn new(
+        quiet: bool,
+        no_color: bool,
+        stdout_is_pipe: bool,
+        download: watch::Receiver<Option<DownloadProgress>>,
+    ) -> Option<Self> {
         use std::io::IsTerminal as _;
 
         if !show_progress(quiet, std::io::stderr().is_terminal(), stdout_is_pipe) {
@@ -142,6 +178,7 @@ impl WarmupBar {
         let phase = Arc::new(Mutex::new("Warming up …"));
         let frame = WarmupFrame {
             phase: Arc::clone(&phase),
+            download,
             color: use_color(no_color),
         };
         let status = StatusLine::with_options(frame, status_line::Options::default());
@@ -166,16 +203,37 @@ impl OutputGuard for WarmupBar {
 #[cfg(test)]
 mod tests {
     use super::{show_progress, use_color, Frame, WarmupFrame};
-    use flx::ValidationProgress;
+    use flx::{DownloadProgress, ValidationProgress};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::watch;
 
     #[test]
     fn warmup_frame_renders_current_phase() {
+        let (_, download) = watch::channel(None);
         let frame = WarmupFrame {
             phase: Arc::new(Mutex::new("Fetching primary sources …")),
+            download,
             color: false,
         };
         assert!(frame.to_string().contains("Fetching primary sources"));
+    }
+
+    #[test]
+    fn warmup_frame_renders_download_percentage() {
+        let (tx, download) = watch::channel(None);
+        tx.send_replace(Some(DownloadProgress {
+            name: "GeoLite2-City.mmdb",
+            downloaded: 400,
+            total: 1000,
+        }));
+        let frame = WarmupFrame {
+            phase: Arc::new(Mutex::new("Fetching proxy lists …")),
+            download,
+            color: false,
+        };
+        let rendered = frame.to_string();
+        assert!(rendered.contains("GeoLite2-City.mmdb"));
+        assert!(rendered.contains("40.00%"));
     }
 
     #[test]

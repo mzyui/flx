@@ -880,6 +880,9 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     // with `enable_all()` above, so the tokio signal driver is available
     // here. An `Arc<Notify>` is shared so a fallback pass can keep listening.
     let cancel = Arc::new(tokio::sync::Notify::new());
+    // One download observer for the whole process: the warmup bar (and the
+    // `geo-update` bar) renders GeoLite2 download progress from this stream.
+    let download = flx::install_download_observer().expect("download observer installs once");
 
     let outcome = runtime.block_on(async move {
         let notify = Arc::clone(&cancel);
@@ -888,9 +891,9 @@ fn run_application() -> anyhow::Result<RunOutcome> {
             notify.notify_waiters();
         });
         match command {
-            Command::Grab(grab) => run_grab(grab, cli.quiet, cli.no_color, cancel).await,
-            Command::Find(find) => run_find(find, cli.quiet, cli.no_color, cancel).await,
-            Command::GeoUpdate => run_geo_update().await,
+            Command::Grab(grab) => run_grab(grab, cli.quiet, cli.no_color, &download, cancel).await,
+            Command::Find(find) => run_find(find, cli.quiet, cli.no_color, &download, cancel).await,
+            Command::GeoUpdate => run_geo_update(&download, cli.quiet, cli.no_color).await,
         }
     });
     runtime.shutdown_background();
@@ -901,6 +904,7 @@ async fn run_grab(
     grab: FetchArgs,
     quiet: bool,
     no_color: bool,
+    download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
     cancel: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<RunOutcome> {
     if grab.fetcher.dry_run {
@@ -912,7 +916,7 @@ async fn run_grab(
         .context("failed to start proxy fetcher")?;
     let accepted = fetcher.accepted_handle();
     let stages = fetcher.stage_events();
-    let warmup = make_warmup(quiet, no_color);
+    let warmup = make_warmup(quiet, no_color, download);
     if let Some(bar) = &warmup {
         bar.set_phase("Fetching proxy lists …");
     }
@@ -972,6 +976,7 @@ async fn run_find(
     find: FindArgs,
     quiet: bool,
     no_color: bool,
+    download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
     cancel: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<RunOutcome> {
     if find.fetcher.dry_run {
@@ -988,7 +993,7 @@ async fn run_find(
     // Candidates are recorded while pass 1 streams so the fallback pass can
     // re-validate the same set without re-fetching.
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
-    let warmup = make_warmup(quiet, no_color);
+    let warmup = make_warmup(quiet, no_color, download);
     let config = validator_config(&find.validator, protocols.clone(), groups.clone(), false);
 
     let pass1 = match &find.validator.file {
@@ -1276,12 +1281,20 @@ fn make_guard(_progress: flx::ValidationProgress, _quiet: bool, _no_color: bool)
 }
 
 #[cfg(feature = "progress_bar")]
-fn make_warmup(quiet: bool, no_color: bool) -> Option<Arc<progress::WarmupBar>> {
-    progress::WarmupBar::new(quiet, no_color, stdout_is_pipe()).map(Arc::new)
+fn make_warmup(
+    quiet: bool,
+    no_color: bool,
+    download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
+) -> Option<Arc<progress::WarmupBar>> {
+    progress::WarmupBar::new(quiet, no_color, stdout_is_pipe(), download.clone()).map(Arc::new)
 }
 
 #[cfg(not(feature = "progress_bar"))]
-fn make_warmup(_quiet: bool, _no_color: bool) -> Option<Arc<WarmupBar>> {
+fn make_warmup(
+    _quiet: bool,
+    _no_color: bool,
+    _download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
+) -> Option<Arc<WarmupBar>> {
     None
 }
 
@@ -1300,11 +1313,20 @@ impl OutputGuard for WarmupBar {
     fn after_write(&self) {}
 }
 
-async fn run_geo_update() -> anyhow::Result<RunOutcome> {
-    match flx::sync_database()
+async fn run_geo_update(
+    download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
+    quiet: bool,
+    no_color: bool,
+) -> anyhow::Result<RunOutcome> {
+    let warmup = make_warmup(quiet, no_color, download);
+    if let Some(bar) = &warmup {
+        bar.set_phase("Syncing GeoLite2 databases …");
+    }
+    let outcome = flx::sync_database()
         .await
-        .context("failed to sync the GeoLite2 database")?
-    {
+        .context("failed to sync the GeoLite2 database")?;
+    drop(warmup);
+    match outcome {
         flx::SyncOutcome::Synced => {
             println!("GeoLite2 database synced from the P3TERX mirror");
         }

@@ -12,15 +12,7 @@ use std::{
     sync::OnceLock,
 };
 
-#[cfg(feature = "progress_bar")]
-use std::{
-    fmt::{Display, Formatter},
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
 use anyhow::Context;
-#[cfg(feature = "progress_bar")]
-use colored::Colorize;
 use futures_util::{Stream, StreamExt};
 use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Request};
@@ -31,11 +23,7 @@ use maxminddb::{
     Reader,
 };
 use models::GeoData;
-#[cfg(feature = "progress_bar")]
-use status_line::StatusLine;
-use tokio::io::AsyncWriteExt;
-#[cfg(feature = "progress_bar")]
-use tokio::time;
+use tokio::{io::AsyncWriteExt, sync::watch};
 
 const GEOLITE_ENDPOINT_URL: &str =
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-City.mmdb";
@@ -48,6 +36,43 @@ static DOWNLOAD_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn download_lock() -> &'static tokio::sync::Mutex<()> {
     DOWNLOAD_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Snapshot of an in-flight GeoLite2 database download.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadProgress {
+    pub name: &'static str,
+    pub downloaded: usize,
+    pub total: usize,
+}
+
+static DOWNLOAD_EVENTS: OnceLock<watch::Sender<Option<DownloadProgress>>> = OnceLock::new();
+
+/// Installs the download observer and returns a receiver for its events.
+pub fn install_download_observer() -> Option<watch::Receiver<Option<DownloadProgress>>> {
+    let (tx, rx) = watch::channel(None);
+    match DOWNLOAD_EVENTS.set(tx) {
+        Ok(()) => Some(rx),
+        Err(tx) => {
+            let _ = tx.send(None);
+            None
+        }
+    }
+}
+
+fn report_download(event: Option<DownloadProgress>) {
+    if let Some(tx) = DOWNLOAD_EVENTS.get() {
+        let _ = tx.send_replace(event);
+    }
+}
+
+// Ends the active download event on every exit path of the install function.
+struct DownloadNotifier;
+
+impl Drop for DownloadNotifier {
+    fn drop(&mut self) {
+        report_download(None);
+    }
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -171,36 +196,6 @@ where
     }
 
     result
-}
-
-#[cfg(feature = "progress_bar")]
-struct Progress {
-    progress: AtomicUsize, // Bytes downloaded so far.
-    max: f64,              // Expected total size of the download.
-    timer: time::Instant,  // When the download started.
-}
-
-#[cfg(feature = "progress_bar")]
-impl Display for Progress {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} {} Downloading GeoLite2-City.mmdb: {:.2}%",
-            format!("{}:", module_path!()).bright_blue(),
-            "INFO".bright_blue(),
-            (self.progress.load(Ordering::Relaxed) as f64 / self.max) * 100.0
-        )
-    }
-}
-
-#[cfg(all(feature = "progress_bar", feature = "log"))]
-impl Drop for Progress {
-    fn drop(&mut self) {
-        log::debug!(
-            "Finished downloading GeoLite2-City.mmdb in {:?}",
-            self.timer.elapsed()
-        );
-    }
 }
 
 pub(crate) fn data_dir() -> anyhow::Result<PathBuf> {
@@ -332,19 +327,10 @@ async fn install_response(
         );
     }
 
-    #[cfg(feature = "progress_bar")]
-    let max_size = if let Some(length) = response.headers().get(hyper::header::CONTENT_LENGTH) {
-        length.to_str().map(|v| v.parse::<f64>().unwrap_or(0.0))?
-    } else {
-        0.0
-    };
-
-    #[cfg(feature = "progress_bar")]
-    let status = StatusLine::new(Progress {
-        progress: AtomicUsize::new(0),
-        timer: time::Instant::now(),
-        max: max_size,
-    });
+    let name = database_name(url);
+    let total = content_length.unwrap_or(0);
+    let mut downloaded = 0usize;
+    let _notifier = DownloadNotifier;
 
     let chunks = futures_util::stream::unfold(response, |mut response| async move {
         loop {
@@ -365,13 +351,23 @@ async fn install_response(
         MAX_DATABASE_SIZE,
         deadline,
         |chunk_size| {
-            #[cfg(feature = "progress_bar")]
-            status.progress.fetch_add(chunk_size, Ordering::Relaxed);
-            #[cfg(not(feature = "progress_bar"))]
-            let _ = chunk_size;
+            downloaded = downloaded.saturating_add(chunk_size);
+            report_download(Some(DownloadProgress {
+                name,
+                downloaded,
+                total,
+            }));
         },
     )
     .await
+}
+
+fn database_name(url: &str) -> &'static str {
+    if url.contains("ASN") {
+        "GeoLite2-ASN.mmdb"
+    } else {
+        "GeoLite2-City.mmdb"
+    }
 }
 
 /// Result of a GeoLite2 database sync against the mirror.

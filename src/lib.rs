@@ -47,7 +47,9 @@ pub use api::Flx;
 pub use error::{FlxError, ProtocolParseError, ProxyParseError};
 pub use fetcher::{Config as FetcherConfig, FetchStage, ProxyFetcher};
 pub use geolookup::models::GeoData;
-pub use geolookup::{sync_database, GeoLookup, IpType, SyncOutcome};
+pub use geolookup::{
+    install_download_observer, sync_database, DownloadProgress, GeoLookup, IpType, SyncOutcome,
+};
 pub use providers::all_providers;
 pub use providers::models::{ProviderTier, ScrapeMode, Source};
 pub use providers::ProxyProvider;
