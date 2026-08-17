@@ -914,17 +914,27 @@ async fn run_grab(
         list_sources();
         return Ok(RunOutcome::Finished);
     }
+    let fetch_cfg = fetcher_config(&grab.fetcher);
+    let warmup = make_warmup(quiet, no_color, download);
+    if let Some(bar) = &warmup {
+        let phase = if fetch_cfg.enable_geo_lookup {
+            "Preparing GeoLite2 database …"
+        } else {
+            "Fetching proxy lists …"
+        };
+        bar.set_phase(phase);
+    }
     let mut fetcher = tokio::select! {
-        fetcher = ProxySource::from_fetcher(fetcher_config(&grab.fetcher)) => {
+        fetcher = ProxySource::from_fetcher(fetch_cfg) => {
             fetcher.context("failed to start proxy fetcher")?
         }
         _ = cancel.notified() => {
+            drop(warmup);
             return Ok(RunOutcome::Cancelled);
         }
     };
     let accepted = fetcher.accepted_handle();
     let stages = fetcher.stage_events();
-    let warmup = make_warmup(quiet, no_color, download);
     if let Some(bar) = &warmup {
         bar.set_phase("Fetching proxy lists …");
     }
@@ -1023,8 +1033,17 @@ async fn run_find(
             pass
         }
         None => {
+            let fetch_cfg = fetcher_config(&find.fetcher);
+            if let Some(bar) = &warmup {
+                let phase = if fetch_cfg.enable_geo_lookup {
+                    "Preparing GeoLite2 database …"
+                } else {
+                    "Fetching proxy lists …"
+                };
+                bar.set_phase(phase);
+            }
             let mut fetcher = tokio::select! {
-                fetcher = ProxySource::from_fetcher(fetcher_config(&find.fetcher)) => {
+                fetcher = ProxySource::from_fetcher(fetch_cfg) => {
                     fetcher.context("failed to start proxy fetcher")?
                 }
                 _ = cancel.notified() => {

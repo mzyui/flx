@@ -10,6 +10,7 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -31,6 +32,7 @@ const GEOLITE_ASN_ENDPOINT_URL: &str =
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-ASN.mmdb";
 const MAX_DATABASE_SIZE: usize = 128 * 1024 * 1024;
 const DATABASE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const GEOLITE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 static DOWNLOAD_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -75,6 +77,18 @@ impl Drop for DownloadNotifier {
     }
 }
 
+// Announces a download before the network request starts so observers see
+// progress (even just 0.0 MB) during the connect/request phase, not only once
+// body chunks arrive.
+fn begin_download(name: &'static str) -> DownloadNotifier {
+    report_download(Some(DownloadProgress {
+        name,
+        downloaded: 0,
+        total: 0,
+    }));
+    DownloadNotifier
+}
+
 fn temporary_path(path: &Path) -> PathBuf {
     let mut temporary = path.to_path_buf();
     let file_name = path
@@ -98,21 +112,28 @@ fn lock_path(path: &Path) -> PathBuf {
 
 async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     let lock = lock_path(path);
-    tokio::task::spawn_blocking(move || {
-        use fs2::FileExt;
+    // A stopped or wedged process holding the exclusive file lock would
+    // otherwise block this forever; give up after a short wait instead.
+    let acquire = tokio::task::spawn_blocking({
+        let lock = lock.clone();
+        move || {
+            use fs2::FileExt;
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock)
-            .with_context(|| format!("failed to create {}", lock.display()))?;
-        file.lock_exclusive()
-            .with_context(|| format!("failed to lock {}", lock.display()))?;
-        Ok(file)
-    })
-    .await
-    .context("GeoLite2 lock task failed")?
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock)
+                .with_context(|| format!("failed to create {}", lock.display()))?;
+            file.lock_exclusive()
+                .with_context(|| format!("failed to lock {}", lock.display()))?;
+            Ok(file)
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), acquire)
+        .await
+        .context("timed out waiting for the GeoLite2 database lock (held by another flx instance)")?
+        .context("GeoLite2 lock task failed")?
 }
 
 async fn write_database_chunks<S, E, P>(
@@ -289,9 +310,13 @@ async fn fetch_database(
         .body(Empty::<Bytes>::new())
         .context("failed to build GeoLite2 download request")?;
 
-    let response = tokio::time::timeout_at(deadline, client.request(req))
+    // Reaching the mirror (TCP/TLS connect + response headers) is bounded
+    // separately from the body download so an unreachable mirror fails fast
+    // instead of sitting silent for the whole 120s download deadline.
+    let request_deadline = deadline.min(tokio::time::Instant::now() + GEOLITE_CONNECT_TIMEOUT);
+    let response = tokio::time::timeout_at(request_deadline, client.request(req))
         .await
-        .context("GeoLite2 download request timed out")?
+        .context("cannot reach the GeoLite2 mirror")?
         .with_context(|| format!("failed to download GeoLite2 database from {url}"))?;
     let etag = response
         .headers()
@@ -330,7 +355,6 @@ async fn install_response(
     let name = database_name(url);
     let total = content_length.unwrap_or(0);
     let mut downloaded = 0usize;
-    let _notifier = DownloadNotifier;
 
     let chunks = futures_util::stream::unfold(response, |mut response| async move {
         loop {
@@ -407,6 +431,7 @@ async fn sync_one(url: &str, mmdb_path: &Path) -> anyhow::Result<SyncOutcome> {
         return Ok(SyncOutcome::UpToDate);
     }
 
+    let _notifier = begin_download(database_name(url));
     install_response(response, mmdb_path, url, deadline).await?;
     if let Some(etag) = remote_etag {
         write_synced_etag(mmdb_path, &etag).await?;
@@ -417,6 +442,7 @@ async fn sync_one(url: &str, mmdb_path: &Path) -> anyhow::Result<SyncOutcome> {
 /// Downloads a GeoLite2 database from the mirror into `mmdb_path`.
 pub async fn download_database(mmdb_path: &Path, url: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
+    let _notifier = begin_download(database_name(url));
     let (response, _etag) = fetch_database(url, None, deadline).await?;
     install_response(response, mmdb_path, url, deadline).await
 }
@@ -546,11 +572,27 @@ impl GeoLookup {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_synced_etag, sync_marker_path, temporary_path, write_database_chunks,
-        write_synced_etag,
+        begin_download, install_download_observer, read_synced_etag, sync_marker_path,
+        temporary_path, write_database_chunks, write_synced_etag,
     };
     use futures_util::stream;
     use hyper::body::Bytes;
+
+    #[test]
+    fn download_start_event_is_announced_then_cleared() {
+        let Some(rx) = install_download_observer() else {
+            return; // another test already owns the process-wide observer
+        };
+        let mut rx = rx;
+        {
+            let _notifier = begin_download("GeoLite2-City.mmdb");
+            let event = rx.borrow_and_update().expect("observer alive");
+            assert_eq!(event.name, "GeoLite2-City.mmdb");
+            assert_eq!(event.downloaded, 0);
+            assert_eq!(event.total, 0);
+        }
+        assert!(rx.borrow().is_none());
+    }
 
     #[tokio::test]
     async fn etag_marker_round_trips_through_sidecar() {
