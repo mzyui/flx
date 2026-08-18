@@ -366,6 +366,18 @@ pub struct ServeArgs {
     )]
     pub session: bool,
 
+    /// Pin one upstream proxy per client IP across all of that IP's connections
+    /// (e.g. a client that pools many sockets still exits via the same proxy).
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        help_heading = "Serve"
+    )]
+    pub sticky_ip: bool,
+
     /// Idle seconds before a session is closed (0 disables the watchdog).
     #[arg(long, default_value_t = 60, help_heading = "Serve")]
     pub session_timeout: u64,

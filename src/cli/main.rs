@@ -2679,6 +2679,14 @@ mod tests {
     }
 
     #[test]
+    fn serve_sticky_ip_flag_parses_bare_and_explicit_values() {
+        assert!(serve_from(&["--sticky-ip"]).sticky_ip);
+        assert!(serve_from(&["--sticky-ip", "true"]).sticky_ip);
+        assert!(!serve_from(&["--sticky-ip", "false"]).sticky_ip);
+        assert!(!serve_from(&[]).sticky_ip);
+    }
+
+    #[test]
     fn serve_flattens_fetcher_and_validator_args() {
         let serve = serve_from(&[
             "--provider",

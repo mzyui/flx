@@ -1,7 +1,8 @@
 //! Gateway forward-proxy server (`flx serve`).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    net::IpAddr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
@@ -53,6 +54,7 @@ struct ServeConfig {
     pool_wait: Duration,
     dial_timeout: Duration,
     auth: Option<Arc<str>>,
+    sticky: Option<StickyTable>,
 }
 
 impl ServeConfig {
@@ -63,6 +65,106 @@ impl ServeConfig {
             pool_wait: Duration::from_secs(args.pool_wait),
             dial_timeout: Duration::from_secs(args.validator.timeout),
             auth: args.auth.as_deref().map(Arc::from),
+            sticky: None,
+        }
+    }
+}
+
+/// Pins one upstream proxy per client IP while any of that IP's connections are
+/// alive. Keyed by the immediate TCP peer, so a client that opens a pool of
+/// connections (e.g. urllib3) still exits through the same proxy on every request.
+#[derive(Clone)]
+struct StickyTable {
+    inner: Arc<Mutex<HashMap<IpAddr, StickyEntry>>>,
+    pool: Pool,
+}
+
+struct StickyEntry {
+    proxy: Proxy,
+    conns: usize,
+}
+
+impl StickyTable {
+    fn new(pool: Pool) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            pool,
+        }
+    }
+
+    /// Returns the proxy currently pinned to `ip`, if any.
+    fn current(&self, ip: IpAddr) -> Option<Proxy> {
+        self.inner
+            .lock()
+            .expect("sticky map poisoned")
+            .get(&ip)
+            .map(|entry| entry.proxy.clone())
+    }
+
+    /// Reuse or create the pinned proxy for `ip`, bumping its connection count.
+    async fn acquire(&self, ip: IpAddr, kind: PartitionKind, wait: Duration) -> Option<Proxy> {
+        {
+            let mut map = self.inner.lock().expect("sticky map poisoned");
+            if let Some(entry) = map.get_mut(&ip) {
+                entry.conns += 1;
+                return Some(entry.proxy.clone());
+            }
+        }
+        let proxy = self.pool.await_proxy(kind, wait, &HashSet::new()).await?;
+        self.pool.mark_in_use(proxy.as_text());
+        let mut map = self.inner.lock().expect("sticky map poisoned");
+        if let Some(entry) = map.get_mut(&ip) {
+            // A concurrent connection from the same IP already created the entry.
+            self.pool.release(proxy.as_text());
+            entry.conns += 1;
+            return Some(entry.proxy.clone());
+        }
+        map.insert(
+            ip,
+            StickyEntry {
+                proxy: proxy.clone(),
+                conns: 1,
+            },
+        );
+        Some(proxy)
+    }
+
+    /// Swap the pinned proxy for `ip` after the previous one failed.
+    async fn repin(
+        &self,
+        ip: IpAddr,
+        kind: PartitionKind,
+        wait: Duration,
+        exclude: &HashSet<String>,
+    ) -> Option<Proxy> {
+        let old = self.current(ip);
+        let new = self.pool.await_proxy(kind, wait, exclude).await?;
+        self.pool.mark_in_use(new.as_text());
+        if let Some(entry) = self.inner.lock().expect("sticky map poisoned").get_mut(&ip) {
+            entry.proxy = new.clone();
+        }
+        if let Some(old) = old {
+            self.pool.release(old.as_text());
+        }
+        Some(new)
+    }
+}
+
+/// Lifetime handle binding a connection to its IP's pinned proxy.
+struct StickyLease {
+    table: StickyTable,
+    ip: IpAddr,
+}
+
+impl Drop for StickyLease {
+    fn drop(&mut self) {
+        let mut map = self.table.inner.lock().expect("sticky map poisoned");
+        if let Some(entry) = map.get_mut(&self.ip) {
+            entry.conns -= 1;
+            if entry.conns == 0 {
+                self.table.pool.release(entry.proxy.as_text());
+                map.remove(&self.ip);
+            }
         }
     }
 }
@@ -1015,7 +1117,13 @@ async fn acquire_tunnel(
     guard: &mut PinGuard,
     exclude: &mut HashSet<String>,
     authority: &str,
+    peer_ip: Option<IpAddr>,
 ) -> anyhow::Result<Option<Upstream>> {
+    if cfg.sticky.is_some() {
+        if let (Some(ip), Some(table)) = (peer_ip, &cfg.sticky) {
+            return acquire_tunnel_sticky(pool, cfg, table, exclude, authority, ip).await;
+        }
+    }
     let mut last_error: Option<anyhow::Error> = None;
     for _ in 0..=MAX_FAILOVERS {
         let Some(proxy) = pool
@@ -1043,6 +1151,53 @@ async fn acquire_tunnel(
                 pool.stats.errors.fetch_add(1, Ordering::Relaxed);
                 exclude.insert(proxy.as_text().to_owned());
                 last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no tunnel upstream available")))
+}
+
+async fn acquire_tunnel_sticky(
+    pool: &Pool,
+    cfg: &ServeConfig,
+    table: &StickyTable,
+    exclude: &mut HashSet<String>,
+    authority: &str,
+    ip: IpAddr,
+) -> anyhow::Result<Option<Upstream>> {
+    let mut proxy = match table.current(ip) {
+        Some(proxy) => proxy,
+        None => {
+            return Ok(None);
+        }
+    };
+    let mut last_error: Option<anyhow::Error> = None;
+    for _ in 0..=MAX_FAILOVERS {
+        let result = async {
+            let mut stream = dial_upstream(pool, &proxy, cfg.dial_timeout).await?;
+            negotiate_tunnel(&mut stream, &proxy, authority, cfg.dial_timeout).await?;
+            Ok::<TcpStream, anyhow::Error>(stream)
+        }
+        .await;
+        match result {
+            Ok(stream) => {
+                return Ok(Some(Upstream {
+                    proxy,
+                    stream,
+                    buf: Vec::new(),
+                }));
+            }
+            Err(e) => {
+                pool.stats.errors.fetch_add(1, Ordering::Relaxed);
+                exclude.insert(proxy.as_text().to_owned());
+                last_error = Some(e);
+                match table
+                    .repin(ip, PartitionKind::Tunnel, cfg.pool_wait, exclude)
+                    .await
+                {
+                    Some(next) => proxy = next,
+                    None => break,
+                }
             }
         }
     }
@@ -1185,9 +1340,15 @@ async fn ensure_upstream(
     guard: &mut PinGuard,
     upstream: &mut Option<Upstream>,
     exclude: &mut HashSet<String>,
+    peer_ip: Option<IpAddr>,
 ) -> anyhow::Result<bool> {
     if upstream.is_some() {
         return Ok(true);
+    }
+    if cfg.sticky.is_some() {
+        if let (Some(ip), Some(table)) = (peer_ip, &cfg.sticky) {
+            return ensure_upstream_sticky(client, pool, cfg, table, upstream, exclude, ip).await;
+        }
     }
     for _ in 0..=MAX_FAILOVERS {
         let Some(proxy) = pool
@@ -1217,11 +1378,55 @@ async fn ensure_upstream(
     Ok(false)
 }
 
+async fn ensure_upstream_sticky(
+    client: &mut TcpStream,
+    pool: &Pool,
+    cfg: &ServeConfig,
+    table: &StickyTable,
+    upstream: &mut Option<Upstream>,
+    exclude: &mut HashSet<String>,
+    ip: IpAddr,
+) -> anyhow::Result<bool> {
+    let mut proxy = match table.current(ip) {
+        Some(proxy) => proxy,
+        None => {
+            let _ = client.write_all(RESPONSE_503).await;
+            return Ok(false);
+        }
+    };
+    for _ in 0..2 {
+        match dial_upstream(pool, &proxy, cfg.dial_timeout).await {
+            Ok(stream) => {
+                *upstream = Some(Upstream {
+                    proxy,
+                    stream,
+                    buf: Vec::new(),
+                });
+                return Ok(true);
+            }
+            Err(_) => {
+                pool.stats.errors.fetch_add(1, Ordering::Relaxed);
+                exclude.insert(proxy.as_text().to_owned());
+                match table
+                    .repin(ip, PartitionKind::Tunnel, cfg.pool_wait, exclude)
+                    .await
+                {
+                    Some(next) => proxy = next,
+                    None => break,
+                }
+            }
+        }
+    }
+    let _ = client.write_all(RESPONSE_502).await;
+    Ok(false)
+}
+
 struct ForwardRequest<'a> {
     head: &'a ClientHead,
     forwarded: &'a [u8],
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn plain_http_roundtrip(
     client: &mut TcpStream,
     buf: &mut Vec<u8>,
@@ -1230,13 +1435,24 @@ async fn plain_http_roundtrip(
     guard: &mut PinGuard,
     mut upstream: Option<Upstream>,
     plan: ForwardRequest<'_>,
+    peer_ip: Option<IpAddr>,
 ) -> anyhow::Result<(RoundtripEnd, Option<Upstream>)> {
     let semantics = request_semantics(plan.head)?;
 
     let mut exclude: HashSet<String> = HashSet::new();
     let mut wrote = false;
     for _ in 0..2 {
-        if !ensure_upstream(client, pool, cfg, guard, &mut upstream, &mut exclude).await? {
+        if !ensure_upstream(
+            client,
+            pool,
+            cfg,
+            guard,
+            &mut upstream,
+            &mut exclude,
+            peer_ip,
+        )
+        .await?
+        {
             return Ok((RoundtripEnd::ClientClose, None));
         }
         let up = upstream.as_mut().expect("upstream ensured");
@@ -1370,19 +1586,21 @@ async fn handle_connect(
     cfg: &ServeConfig,
     guard: &mut PinGuard,
     authority: &str,
+    peer_ip: Option<IpAddr>,
 ) -> anyhow::Result<()> {
     let mut exclude: HashSet<String> = HashSet::new();
-    let mut upstream = match acquire_tunnel(pool, cfg, guard, &mut exclude, authority).await {
-        Ok(Some(up)) => up,
-        Ok(None) => {
-            let _ = client.write_all(RESPONSE_503).await;
-            return Ok(());
-        }
-        Err(_) => {
-            let _ = client.write_all(RESPONSE_502).await;
-            return Ok(());
-        }
-    };
+    let mut upstream =
+        match acquire_tunnel(pool, cfg, guard, &mut exclude, authority, peer_ip).await {
+            Ok(Some(up)) => up,
+            Ok(None) => {
+                let _ = client.write_all(RESPONSE_503).await;
+                return Ok(());
+            }
+            Err(_) => {
+                let _ = client.write_all(RESPONSE_502).await;
+                return Ok(());
+            }
+        };
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
@@ -1399,7 +1617,7 @@ async fn handle_connect(
                 pool.stats.failovers.fetch_add(1, Ordering::Relaxed);
                 exclude.insert(upstream.proxy.as_text().to_owned());
                 drop(upstream);
-                match acquire_tunnel(pool, cfg, guard, &mut exclude, authority).await {
+                match acquire_tunnel(pool, cfg, guard, &mut exclude, authority, peer_ip).await {
                     Ok(Some(up)) => upstream = up,
                     _ => break,
                 }
@@ -1416,6 +1634,7 @@ async fn serve_session(
     pool: &Pool,
     cfg: &ServeConfig,
     guard: &mut PinGuard,
+    peer_ip: Option<IpAddr>,
 ) -> anyhow::Result<()> {
     let mut upstream: Option<Upstream> = None;
     loop {
@@ -1445,7 +1664,7 @@ async fn serve_session(
                     return Ok(());
                 }
             };
-            return handle_connect(client, pool, cfg, guard, &authority).await;
+            return handle_connect(client, pool, cfg, guard, &authority, peer_ip).await;
         }
         let absolute = match request_target(&head) {
             Ok(absolute) => absolute,
@@ -1466,11 +1685,14 @@ async fn serve_session(
             head: &head,
             forwarded: &forwarded,
         };
-        let (end, next) =
-            match plain_http_roundtrip(client, buf, pool, cfg, guard, upstream, plan).await {
-                Ok(result) => result,
-                Err(_) => return Ok(()),
-            };
+        let (end, next) = match plain_http_roundtrip(
+            client, buf, pool, cfg, guard, upstream, plan, peer_ip,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => return Ok(()),
+        };
         upstream = next;
         match end {
             RoundtripEnd::ClientClose => return Ok(()),
@@ -1500,9 +1722,29 @@ async fn serve_connection(mut client: TcpStream, pool: Pool, cfg: ServeConfig) {
         return;
     }
     pool.stats.sessions_total.fetch_add(1, Ordering::Relaxed);
+    let peer_ip = client.peer_addr().ok().map(|addr| addr.ip());
+    let _lease = match &cfg.sticky {
+        Some(table) => match peer_ip {
+            Some(ip) => match table
+                .acquire(ip, PartitionKind::Tunnel, cfg.pool_wait)
+                .await
+            {
+                Some(_) => Some(StickyLease {
+                    table: table.clone(),
+                    ip,
+                }),
+                None => {
+                    let _ = client.write_all(RESPONSE_503).await;
+                    return;
+                }
+            },
+            None => None,
+        },
+        None => None,
+    };
     let mut guard = PinGuard::new();
     let mut buf = Vec::with_capacity(2048);
-    if let Err(e) = serve_session(&mut client, &mut buf, &pool, &cfg, &mut guard).await {
+    if let Err(e) = serve_session(&mut client, &mut buf, &pool, &cfg, &mut guard, peer_ip).await {
         #[cfg(feature = "log")]
         log::trace!("serve session ended: {e:#}");
         #[cfg(not(feature = "log"))]
@@ -1649,7 +1891,10 @@ pub async fn run_serve(
 
     let clients_sem =
         (args.max_clients > 0).then(|| Arc::new(tokio::sync::Semaphore::new(args.max_clients)));
-    let cfg = ServeConfig::from_args(&args);
+    let mut cfg = ServeConfig::from_args(&args);
+    if args.sticky_ip {
+        cfg.sticky = Some(StickyTable::new(pool.clone()));
+    }
     let mut sessions = tokio::task::JoinSet::new();
 
     // Non-TTY fallback stats; the status line already repaints itself on a TTY.
@@ -1796,6 +2041,7 @@ mod tests {
             pool_wait: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(3),
             auth: None,
+            sticky: None,
         }
     }
 
@@ -2445,6 +2691,56 @@ mod tests {
         assert_ne!(
             s1, s2,
             "two sessions must pin different upstreams (D1)\ngot1={s1:?}\ngot2={s2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_ip_pins_same_upstream_across_connections() {
+        let up_a = spawn_connect_echo("UPA").await;
+        let up_b = spawn_connect_echo("UPB").await;
+        let pool = Pool::new(0, 0, false);
+        for proxy in [https_proxy(up_a), https_proxy(up_b)] {
+            pool.add(proxy);
+        }
+        pool.rebuild();
+        let mut cfg = serve_config();
+        cfg.sticky = Some(StickyTable::new(pool.clone()));
+        let gateway = spawn_gateway_with_pool(pool, cfg).await;
+
+        let mut c1 = tcp(gateway).await;
+        let mut c2 = tcp(gateway).await;
+        for c in [&mut c1, &mut c2] {
+            c.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                .await
+                .unwrap();
+            let (head, _tail) = time::timeout(Duration::from_secs(2), read_until_head(c))
+                .await
+                .unwrap();
+            assert!(head.starts_with(b"HTTP/1.1 200"), "{head:?}");
+        }
+        c1.write_all(b"probe").await.unwrap();
+        c2.write_all(b"probe").await.unwrap();
+        let got1 = time::timeout(
+            Duration::from_secs(2),
+            read_until_contains(&mut c1, b"probe"),
+        )
+        .await
+        .unwrap();
+        let got2 = time::timeout(
+            Duration::from_secs(2),
+            read_until_contains(&mut c2, b"probe"),
+        )
+        .await
+        .unwrap();
+        let s1 = String::from_utf8_lossy(&got1).into_owned();
+        let s2 = String::from_utf8_lossy(&got2).into_owned();
+        assert_eq!(
+            s1, s2,
+            "sticky IP must pin the same upstream across connections (S1)\ngot1={s1:?}\ngot2={s2:?}"
+        );
+        assert!(
+            (s1.starts_with("UPA") || s1.starts_with("UPB")) && s1.contains("probe"),
+            "connection must have tunnelled to a real upstream: {s1:?}"
         );
     }
 
