@@ -19,9 +19,6 @@ use tokio::{io::AsyncWriteExt, runtime};
 mod argument;
 #[cfg(feature = "progress_bar")]
 mod progress;
-mod server;
-
-use server::ServeSnapshot;
 
 pub trait OutputGuard {
     fn before_write(&self);
@@ -76,31 +73,6 @@ fn stdout_is_pipe() -> bool {
 #[cfg(not(unix))]
 fn stdout_is_pipe() -> bool {
     !std::io::stdout().is_terminal()
-}
-
-/// Formats the pool-readiness banner printed once the first proxies land.
-fn format_pool_ready(pool: usize, tunnel: usize, forward: usize) -> String {
-    format!("pool ready: {pool} proxies ({tunnel} tunnel, {forward} forward)")
-}
-
-/// Formats the end-of-run summary line for `serve`, colored under the
-/// `progress_bar` feature and plain otherwise.
-#[cfg(feature = "progress_bar")]
-fn format_serve_summary(snapshot: ServeSnapshot, elapsed: std::time::Duration) -> String {
-    let sessions = format!("{} sessions", snapshot.sessions_total).green();
-    let requests = format!("{} requests", snapshot.requests);
-    let bytes = format!("{:.1} MB relayed", snapshot.bytes as f64 / 1_048_576.0);
-    let failovers = format!("{} failovers", snapshot.failovers).red();
-    format!("serve stopped · {sessions} · {requests} · {bytes} · {failovers} in {elapsed:?}")
-}
-
-#[cfg(not(feature = "progress_bar"))]
-fn format_serve_summary(snapshot: ServeSnapshot, elapsed: std::time::Duration) -> String {
-    let bytes = format!("{:.1} MB relayed", snapshot.bytes as f64 / 1_048_576.0);
-    format!(
-        "serve stopped · {} sessions · {} requests · {bytes} · {} failovers in {elapsed:?}",
-        snapshot.sessions_total, snapshot.requests, snapshot.failovers
-    )
 }
 
 /// Formats the end-of-run stats line for `find`, colored under the
@@ -924,9 +896,6 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         match command {
             Command::Grab(grab) => run_grab(grab, cli.quiet, cli.no_color, &download, cancel).await,
             Command::Find(find) => run_find(find, cli.quiet, cli.no_color, &download, cancel).await,
-            Command::Serve(serve) => {
-                server::run_serve(serve, cli.quiet, cli.no_color, &download, &cancel).await
-            }
             Command::GeoUpdate => run_geo_update(&download, cli.quiet, cli.no_color, cancel).await,
         }
     });
@@ -1382,25 +1351,6 @@ fn make_warmup(
         download.clone(),
     )
     .map(Arc::new)
-}
-
-#[cfg(feature = "progress_bar")]
-fn make_serve_bar(quiet: bool, no_color: bool, pool: server::Pool) -> Option<progress::ServeBar> {
-    progress::ServeBar::new(quiet, no_color, stdout_is_pipe(), pool)
-}
-
-#[cfg(not(feature = "progress_bar"))]
-fn make_serve_bar(_quiet: bool, _no_color: bool, _pool: server::Pool) -> Option<ServeBarNoop> {
-    None
-}
-
-// No-op serve status line for builds without the `progress_bar` feature.
-#[cfg(not(feature = "progress_bar"))]
-pub struct ServeBarNoop;
-
-#[cfg(not(feature = "progress_bar"))]
-impl ServeBarNoop {
-    pub fn hide(&self) {}
 }
 
 #[cfg(not(feature = "progress_bar"))]
@@ -2596,125 +2546,5 @@ mod tests {
         let proxies: Vec<_> = (1..=5).map(sample_proxy).collect();
         let out = run_pac(&proxies, 3);
         assert_eq!(out.matches("PROXY").count(), 3);
-    }
-
-    use argument::ServeArgs;
-
-    fn serve_from(args: &[&str]) -> ServeArgs {
-        let mut full = vec!["flx", "serve"];
-        full.extend_from_slice(args);
-        match Cli::parse_from(full).command {
-            Some(Command::Serve(serve)) => serve,
-            _ => panic!("expected a serve subcommand"),
-        }
-    }
-
-    #[test]
-    fn serve_subcommand_is_accepted() {
-        let cli = Cli::parse_from(["flx", "serve"]);
-        assert!(matches!(cli.command, Some(Command::Serve(_))));
-    }
-
-    #[test]
-    fn serve_defaults_are_sane() {
-        let serve = serve_from(&[]);
-        assert_eq!(serve.host, "127.0.0.1");
-        assert_eq!(serve.port, 8080);
-        assert!(serve.session);
-        assert_eq!(serve.session_timeout, 60);
-        assert_eq!(serve.max_sessions, 200);
-        assert_eq!(serve.max_clients, 0);
-        assert_eq!(serve.pool_size, 0);
-        assert_eq!(serve.refresh, 0);
-        assert!(!serve.use_fastest);
-        assert_eq!(serve.auth, None);
-        assert_eq!(serve.pool_wait, 5);
-    }
-
-    #[test]
-    fn serve_flags_parse_and_reach_serve_args() {
-        let serve = serve_from(&[
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "9090",
-            "--session",
-            "false",
-            "--session-timeout",
-            "30",
-            "--max-sessions",
-            "10",
-            "--max-clients",
-            "5",
-            "--pool-size",
-            "50",
-            "--refresh",
-            "120",
-            "--use-fastest",
-            "--auth",
-            "user:pass",
-            "--pool-wait",
-            "0",
-            "SOCKS5+HTTP",
-        ]);
-        assert_eq!(serve.host, "0.0.0.0");
-        assert_eq!(serve.port, 9090);
-        assert!(!serve.session);
-        assert_eq!(serve.session_timeout, 30);
-        assert_eq!(serve.max_sessions, 10);
-        assert_eq!(serve.max_clients, 5);
-        assert_eq!(serve.pool_size, 50);
-        assert_eq!(serve.refresh, 120);
-        assert!(serve.use_fastest);
-        assert_eq!(serve.auth.as_deref(), Some("user:pass"));
-        assert_eq!(serve.pool_wait, 0);
-        assert_eq!(serve.validator.types, ["SOCKS5+HTTP".to_owned()]);
-    }
-
-    #[test]
-    fn serve_session_flag_parses_bare_and_explicit_values() {
-        assert!(serve_from(&["--session"]).session);
-        assert!(serve_from(&["--session", "true"]).session);
-        assert!(!serve_from(&["--session", "false"]).session);
-    }
-
-    #[test]
-    fn serve_sticky_ip_flag_parses_bare_and_explicit_values() {
-        assert!(serve_from(&["--sticky-ip"]).sticky_ip);
-        assert!(serve_from(&["--sticky-ip", "true"]).sticky_ip);
-        assert!(!serve_from(&["--sticky-ip", "false"]).sticky_ip);
-        assert!(!serve_from(&[]).sticky_ip);
-    }
-
-    #[test]
-    fn serve_flattens_fetcher_and_validator_args() {
-        let serve = serve_from(&[
-            "--provider",
-            "geonode",
-            "--countries",
-            "ID",
-            "--max-connections",
-            "25",
-            "--timeout",
-            "7",
-        ]);
-        assert_eq!(serve.fetcher.provider, ["geonode".to_owned()]);
-        assert_eq!(serve.fetcher.countries, ["ID".to_owned()]);
-        assert_eq!(serve.validator.max_connections, 25);
-        assert_eq!(serve.validator.timeout, 7);
-    }
-
-    #[test]
-    fn serve_rejects_malformed_auth() {
-        assert!(Cli::try_parse_from(["flx", "serve", "--auth", "nocolon"]).is_err());
-        assert!(Cli::try_parse_from(["flx", "serve", "--auth", ":pass"]).is_err());
-        assert!(Cli::try_parse_from(["flx", "serve", "--auth", "user:"]).is_err());
-        assert!(Cli::try_parse_from(["flx", "serve", "--auth", "user:pass"]).is_ok());
-    }
-
-    #[test]
-    fn serve_dry_run_is_accepted() {
-        assert!(serve_from(&["--dry-run"]).fetcher.dry_run);
-        assert!(!serve_from(&[]).fetcher.dry_run);
     }
 }
