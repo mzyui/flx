@@ -153,14 +153,17 @@ impl Pool {
         if self.pool_size > 0 && self.len() >= self.pool_size {
             return;
         }
-        let mut pending = self.pending.lock().expect("pool pending poisoned");
-        if pending.len() >= REBUILD_BATCH {
-            drop(pending);
+        let should_rebuild = {
+            let mut pending = self.pending.lock().expect("pool pending poisoned");
+            pending.push(proxy);
+            pending.len() >= REBUILD_BATCH
+        };
+        if should_rebuild {
+            // Fold the whole pending batch (including the proxy just pushed)
+            // into the snapshot.
             self.rebuild();
             return;
         }
-        pending.push(proxy);
-        drop(pending);
         self.dirty.store(true, Ordering::Release);
         self.notify.notify_one();
     }
@@ -172,12 +175,25 @@ impl Pool {
     }
 
     fn rebuild(&self) {
-        let mut pending = std::mem::take(&mut *self.pending.lock().expect("pool pending poisoned"));
+        let pending = std::mem::take(&mut *self.pending.lock().expect("pool pending poisoned"));
         let mut snap = self.snapshot.write().expect("pool snapshot poisoned");
-        let mut all = Vec::with_capacity(snap.tunnel.len() + snap.forward.len() + pending.len());
-        all.extend_from_slice(&snap.tunnel);
-        all.extend_from_slice(&snap.forward);
-        all.append(&mut pending);
+        // The tunnel and forward partitions overlap (an HTTP proxy is both
+        // tunnel- and forward-capable), so merge them and the pending batch
+        // into a unique set first — otherwise every rebuild would double-count
+        // the overlap and the pool would grow without bound.
+        let mut seen =
+            HashSet::with_capacity(snap.tunnel.len() + snap.forward.len() + pending.len());
+        let mut all = Vec::with_capacity(seen.capacity());
+        for p in snap
+            .tunnel
+            .iter()
+            .chain(snap.forward.iter())
+            .chain(pending.iter())
+        {
+            if seen.insert(p.as_text().to_owned()) {
+                all.push(p.clone());
+            }
+        }
         if self.pool_size > 0 && all.len() > self.pool_size {
             all.truncate(self.pool_size);
         }
@@ -196,14 +212,19 @@ impl Pool {
     }
 
     fn set_snapshot(&self, proxies: Vec<Proxy>) {
+        let mut seen = HashSet::with_capacity(proxies.len());
+        let uniq: Vec<Proxy> = proxies
+            .into_iter()
+            .filter(|p| seen.insert(p.as_text().to_owned()))
+            .collect();
         let mut snap = self.snapshot.write().expect("pool snapshot poisoned");
-        snap.tunnel = proxies
+        snap.tunnel = uniq
             .iter()
             .filter(|p| proxy_is_tunnel_capable(p))
             .cloned()
             .collect::<Vec<_>>()
             .into();
-        snap.forward = proxies
+        snap.forward = uniq
             .iter()
             .filter(|p| proxy_is_forward_capable(p))
             .cloned()
@@ -345,7 +366,11 @@ impl Pool {
         };
         let mut seen = HashSet::new();
         keep.retain(|p| seen.insert(p.as_text().to_owned()));
-        keep.extend(fresh);
+        for p in fresh {
+            if seen.insert(p.as_text().to_owned()) {
+                keep.push(p);
+            }
+        }
         if self.pool_size > 0 && keep.len() > self.pool_size {
             keep.truncate(self.pool_size);
         }
@@ -353,7 +378,9 @@ impl Pool {
     }
 
     pub(crate) fn snapshot(&self) -> ServeSnapshot {
-        self.ensure_fresh();
+        // Reads the published snapshot without forcing a rebuild: folding the
+        // pending batch into the snapshot is driven by `add()`/`pick()`/the
+        // consumer, so a repaint must stay O(1) and never clone the whole pool.
         let snap = self.snapshot.read().expect("pool snapshot poisoned");
         ServeSnapshot {
             active_sessions: self.sessions.load(Ordering::Relaxed),
@@ -1535,7 +1562,7 @@ pub async fn run_serve(
         ]);
     }
 
-    let warmup = super::make_warmup(quiet, no_color, download);
+    let warmup = super::make_warmup(quiet, no_color, download, false);
     let vconfig =
         super::validator_config(&args.validator, protocols.clone(), groups.clone(), false);
 
@@ -2171,6 +2198,63 @@ mod tests {
         let endpoints: Vec<&str> = snap.forward.iter().map(|p| p.as_text()).collect();
         assert!(endpoints.contains(&"127.0.0.1:1111"));
         assert!(!endpoints.contains(&"127.0.0.1:3333"));
+    }
+
+    #[tokio::test]
+    async fn repeated_rebuild_keeps_pool_stable() {
+        // HTTP proxies are both tunnel- and forward-capable, so they live in
+        // both partitions. Without dedup, every rebuild re-merged the two
+        // overlapping partitions and doubled the pool until it ran away.
+        let pool = Pool::new(0, 0, false);
+        for i in 0..100u16 {
+            pool.add(http_proxy(i));
+        }
+        pool.rebuild();
+        let base = pool.snapshot();
+        for _ in 0..50 {
+            pool.rebuild();
+        }
+        let after = pool.snapshot();
+        assert_eq!(after.tunnel, base.tunnel, "tunnel partition must not grow");
+        assert_eq!(
+            after.forward, base.forward,
+            "forward partition must not grow"
+        );
+        assert_eq!(
+            after.pool, base.pool,
+            "pool must not grow on repeated rebuilds"
+        );
+        assert_eq!(after.tunnel, 100);
+        assert_eq!(after.forward, 100);
+    }
+
+    #[tokio::test]
+    async fn add_folds_proxy_that_triggers_batch_rebuild() {
+        // A proxy arriving when pending is full must still be folded in, not dropped.
+        let pool = Pool::new(0, 0, false);
+        for i in 0..(REBUILD_BATCH as u16) {
+            pool.add(http_proxy(i));
+        }
+        pool.rebuild();
+        let snap = pool.snapshot();
+        assert_eq!(
+            snap.tunnel, REBUILD_BATCH,
+            "no proxy should be dropped when the batch rebuild fires"
+        );
+        assert_eq!(snap.forward, REBUILD_BATCH);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reads_without_rebuilding() {
+        // Repainting the status line must not fold pending into the snapshot.
+        let pool = Pool::new(0, 0, false);
+        pool.add(http_proxy(1111));
+        pool.rebuild();
+        let before = pool.snapshot();
+        pool.add(http_proxy(2222)); // sits in pending, under the batch size
+        let after = pool.snapshot();
+        assert_eq!(after.tunnel, before.tunnel);
+        assert_eq!(after.forward, before.forward);
     }
 
     #[test]

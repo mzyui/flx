@@ -946,7 +946,14 @@ async fn run_grab(
         return Ok(RunOutcome::Finished);
     }
     let fetch_cfg = fetcher_config(&grab.fetcher);
-    let warmup = make_warmup(quiet, no_color, download);
+    // The grab bar clashes with the proxies streamed to stdout, so only show it
+    // when output is redirected (a file via `-o` or a piped stdout).
+    let show_bar = !quiet && (grab.output.output_file.is_some() || stdout_is_pipe());
+    let warmup = if show_bar {
+        make_warmup(quiet, no_color, download, show_bar)
+    } else {
+        None
+    };
     if let Some(bar) = &warmup {
         let phase = if fetch_cfg.enable_geo_lookup {
             "Preparing GeoLite2 database …"
@@ -1042,7 +1049,7 @@ async fn run_find(
     // Candidates are recorded while pass 1 streams so the fallback pass can
     // re-validate the same set without re-fetching.
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
-    let warmup = make_warmup(quiet, no_color, download);
+    let warmup = make_warmup(quiet, no_color, download, false);
     let config = validator_config(&find.validator, protocols.clone(), groups.clone(), false);
 
     let pass1 = match &find.validator.file {
@@ -1365,8 +1372,16 @@ fn make_warmup(
     quiet: bool,
     no_color: bool,
     download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
+    allow_piped: bool,
 ) -> Option<Arc<progress::WarmupBar>> {
-    progress::WarmupBar::new(quiet, no_color, stdout_is_pipe(), download.clone()).map(Arc::new)
+    progress::WarmupBar::new(
+        quiet,
+        no_color,
+        stdout_is_pipe(),
+        allow_piped,
+        download.clone(),
+    )
+    .map(Arc::new)
 }
 
 #[cfg(feature = "progress_bar")]
@@ -1393,6 +1408,7 @@ fn make_warmup(
     _quiet: bool,
     _no_color: bool,
     _download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
+    _allow_piped: bool,
 ) -> Option<Arc<WarmupBar>> {
     None
 }
@@ -1418,7 +1434,7 @@ async fn run_geo_update(
     no_color: bool,
     cancel: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<RunOutcome> {
-    let warmup = make_warmup(quiet, no_color, download);
+    let warmup = make_warmup(quiet, no_color, download, false);
     if let Some(bar) = &warmup {
         bar.set_phase("Syncing GeoLite2 databases …");
     }

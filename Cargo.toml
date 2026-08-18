@@ -20,10 +20,10 @@ log = { version = "0.4.22", optional = true }
 stderrlog = { version = "0.6.0", optional = true }
 async-trait = "0.1.83"
 status-line = { version = "0.2.0", optional = true }
-colored = { version = "2.1.0", optional = true }
+colored = { version = "3.1.1", optional = true }
 clap = { version = "4.5", optional = true, features = ["derive"] }
-directories = "5.0.1"
-maxminddb = "0.27.0"
+directories = "6.0.0"
+maxminddb = "0.30.0"
 serde = { version = "1.0.215", features = ["derive", "rc"] }
 serde_json = "1.0.133"
 
@@ -31,9 +31,9 @@ serde_json = "1.0.133"
 futures-util = "0.3"
 memchr = "2.8.3"
 aho-corasick = "1.1"
-hashbrown = "0.15.2"
+hashbrown = "0.17.1"
 fs2 = "0.4.3"
-hickory-resolver = "0.24"
+hickory-resolver = "0.26.1"
 
 # request client
 hyper = { version = "1", features = ["client", "http1"] }

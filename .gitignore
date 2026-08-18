@@ -19,7 +19,6 @@ target/
 #.idea/
 .claude/
 .opencode
-docs/
 
 # local agent instructions, never committed
 AGENTS.md

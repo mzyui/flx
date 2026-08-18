@@ -8,8 +8,9 @@ use std::{
 use anyhow::Context;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use hickory_resolver::{
-    config::{LookupIpStrategy, NameServerConfigGroup, ResolverConfig, ResolverOpts},
-    TokioAsyncResolver,
+    config::{LookupIpStrategy, NameServerConfig, ResolverConfig, ResolverOpts},
+    net::runtime::TokioRuntimeProvider,
+    TokioResolver,
 };
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
@@ -147,9 +148,9 @@ async fn my_ip_via_dns() -> anyhow::Result<String> {
     Ok(ip.to_string())
 }
 
-static DNS_RESOLVER: OnceCell<TokioAsyncResolver> = OnceCell::const_new();
+static DNS_RESOLVER: OnceCell<TokioResolver> = OnceCell::const_new();
 
-fn build_dns_resolver() -> TokioAsyncResolver {
+fn build_dns_resolver() -> TokioResolver {
     // `myip.opendns.com` only publishes an A record; the default strategy also
     // queries AAAA and would fail the whole lookup with "no record found".
     let mut opts = ResolverOpts::default();
@@ -157,18 +158,18 @@ fn build_dns_resolver() -> TokioAsyncResolver {
     opts.timeout = LOOKUP_TIMEOUT;
     opts.attempts = 1;
 
-    TokioAsyncResolver::tokio(
-        ResolverConfig::from_parts(
-            None,
-            vec![],
-            NameServerConfigGroup::from_ips_clear(
-                &[IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222))], // OpenDNS server
-                53,
-                false,
-            ),
-        ),
-        opts,
-    )
+    let config = ResolverConfig::from_parts(
+        None,
+        vec![],
+        vec![NameServerConfig::udp(IpAddr::V4(Ipv4Addr::new(
+            208, 67, 222, 222,
+        )))], // OpenDNS server
+    );
+
+    TokioResolver::builder_with_config(config, TokioRuntimeProvider::new())
+        .with_options(opts)
+        .build()
+        .expect("failed to build OpenDNS resolver")
 }
 
 async fn my_ip_via_https() -> anyhow::Result<String> {

@@ -261,7 +261,7 @@ fn asn_database_path() -> anyhow::Result<PathBuf> {
 fn local_build_epoch(mmdb_path: &Path) -> Option<u64> {
     Reader::open_readfile(mmdb_path)
         .ok()
-        .map(|reader| reader.metadata.build_epoch)
+        .map(|reader| reader.metadata().build_epoch)
 }
 
 fn sync_marker_path(mmdb_path: &Path) -> PathBuf {
