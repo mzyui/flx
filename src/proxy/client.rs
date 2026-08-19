@@ -181,14 +181,30 @@ pub trait ProxyClient {
         if use_tls || req.uri().scheme_str().unwrap_or("") == "https" {
             time::timeout(
                 remaining,
-                self.send_via_conn(req, stream, runtimes, true, insecure),
+                self.send_via_conn(
+                    req,
+                    stream,
+                    runtimes,
+                    SendOptions {
+                        tls: true,
+                        insecure,
+                    },
+                ),
             )
             .await
             .context("timed out sending request over TLS")?
         } else {
             time::timeout(
                 remaining,
-                self.send_via_conn(req, stream, runtimes, false, insecure),
+                self.send_via_conn(
+                    req,
+                    stream,
+                    runtimes,
+                    SendOptions {
+                        tls: false,
+                        insecure,
+                    },
+                ),
             )
             .await
             .context("timed out sending request")?
@@ -200,8 +216,7 @@ pub trait ProxyClient {
         req: Request<B>,
         stream: TcpStream,
         mut runtimes: RuntimeStats,
-        tls: bool,
-        insecure: bool,
+        opts: SendOptions,
     ) -> anyhow::Result<ProxyRuntimes<Response<Incoming>>>
     where
         B: Body + 'static + Debug + Send,
@@ -210,11 +225,11 @@ pub trait ProxyClient {
     {
         let host = self.host();
 
-        if tls {
+        if opts.tls {
             self.log_trace("Starting TLS connection");
             let start_time = time::Instant::now();
 
-            let connector = tls_connector(insecure);
+            let connector = tls_connector(opts.insecure);
             let sni_host = req
                 .uri()
                 .host()
@@ -290,6 +305,12 @@ pub trait ProxyClient {
             log::error!("{}: {}", self.host(), _msg);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct SendOptions {
+    tls: bool,
+    insecure: bool,
 }
 
 impl ProxyClient for Proxy {

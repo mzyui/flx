@@ -79,33 +79,28 @@ fn stdout_is_pipe() -> bool {
 /// Formats the end-of-run stats line for `find`, colored under the
 /// `progress_bar` feature and plain otherwise.
 #[cfg(feature = "progress_bar")]
-fn format_validation_stats(
-    valid: usize,
-    failed: usize,
-    total: usize,
-    elapsed: std::time::Duration,
-    rate: f64,
-    dst: Option<&str>,
-) -> String {
-    let v = format!("{valid} valid").green();
-    let f = format!("{failed} failed").red();
+fn format_validation_stats(stats: &ValidationStats, rate: f64, dst: Option<&str>) -> String {
+    let v = format!("{} valid", stats.passed).green();
+    let f = format!("{} failed", stats.done.saturating_sub(stats.passed)).red();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    format!("{lead}{v} · {f} · {total} total in {elapsed:?} ({rate:.1}/s){suffix}")
+    format!(
+        "{lead}{v} · {f} · {} total in {:?} ({rate:.1}/s){suffix}",
+        stats.total, stats.elapsed
+    )
 }
 
 #[cfg(not(feature = "progress_bar"))]
-fn format_validation_stats(
-    valid: usize,
-    failed: usize,
-    total: usize,
-    elapsed: std::time::Duration,
-    rate: f64,
-    dst: Option<&str>,
-) -> String {
+fn format_validation_stats(stats: &ValidationStats, rate: f64, dst: Option<&str>) -> String {
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    format!("{lead}{valid} valid · {failed} failed · {total} total in {elapsed:?} ({rate:.1}/s){suffix}")
+    format!(
+        "{lead}{} valid · {} failed · {} total in {:?} ({rate:.1}/s){suffix}",
+        stats.passed,
+        stats.done.saturating_sub(stats.passed),
+        stats.total,
+        stats.elapsed
+    )
 }
 
 /// Formats the end-of-run line for `grab`, colored under the `progress_bar`
@@ -1251,10 +1246,12 @@ async fn run_find(
     if !matches!(outcome1, Ok(RunOutcome::Finished)) {
         if matches!(outcome1, Ok(RunOutcome::Cancelled)) {
             report_validation_summary(
-                progress1.passed(),
-                progress1.done(),
-                progress1.total(),
-                started.elapsed(),
+                ValidationStats {
+                    passed: progress1.passed(),
+                    done: progress1.done(),
+                    total: progress1.total(),
+                    elapsed: started.elapsed(),
+                },
                 dst.as_deref(),
                 quiet,
             );
@@ -1287,10 +1284,12 @@ async fn run_find(
             // judge preflight and emit the document it would have closed.
             emit_empty_skipped_fallback(&options2).await?;
             report_validation_summary(
-                p1_passed,
-                progress1.done(),
-                progress1.total(),
-                started.elapsed(),
+                ValidationStats {
+                    passed: p1_passed,
+                    done: progress1.done(),
+                    total: progress1.total(),
+                    elapsed: started.elapsed(),
+                },
                 dst.as_deref(),
                 quiet,
             );
@@ -1320,10 +1319,12 @@ async fn run_find(
         if !matches!(outcome2, Ok(RunOutcome::Finished)) {
             if matches!(outcome2, Ok(RunOutcome::Cancelled)) {
                 report_validation_summary(
-                    p1_passed + progress2.passed(),
-                    progress1.done() + progress2.done(),
-                    progress1.total() + progress2.total(),
-                    started.elapsed(),
+                    ValidationStats {
+                        passed: p1_passed + progress2.passed(),
+                        done: progress1.done() + progress2.done(),
+                        total: progress1.total() + progress2.total(),
+                        elapsed: started.elapsed(),
+                    },
                     dst.as_deref(),
                     quiet,
                 );
@@ -1331,10 +1332,12 @@ async fn run_find(
             return outcome2;
         }
         report_validation_summary(
-            p1_passed + progress2.passed(),
-            progress1.done() + progress2.done(),
-            progress1.total() + progress2.total(),
-            started.elapsed(),
+            ValidationStats {
+                passed: p1_passed + progress2.passed(),
+                done: progress1.done() + progress2.done(),
+                total: progress1.total() + progress2.total(),
+                elapsed: started.elapsed(),
+            },
             dst.as_deref(),
             quiet,
         );
@@ -1342,10 +1345,12 @@ async fn run_find(
     }
 
     report_validation_summary(
-        progress1.passed(),
-        progress1.done(),
-        progress1.total(),
-        started.elapsed(),
+        ValidationStats {
+            passed: progress1.passed(),
+            done: progress1.done(),
+            total: progress1.total(),
+            elapsed: started.elapsed(),
+        },
         dst.as_deref(),
         quiet,
     );
@@ -1374,33 +1379,24 @@ fn format_judge_health(report: &flx::JudgeHealthReport) -> String {
     )
 }
 
-fn report_validation_summary(
+#[derive(Clone, Copy)]
+struct ValidationStats {
     passed: usize,
     done: usize,
     total: usize,
     elapsed: std::time::Duration,
-    dst: Option<&str>,
-    quiet: bool,
-) {
+}
+
+fn report_validation_summary(stats: ValidationStats, dst: Option<&str>, quiet: bool) {
     if quiet || stdout_is_pipe() {
         return;
     }
-    let rate = if elapsed.is_zero() {
+    let rate = if stats.elapsed.is_zero() {
         0.0
     } else {
-        total as f64 / elapsed.as_secs_f64()
+        stats.total as f64 / stats.elapsed.as_secs_f64()
     };
-    eprintln!(
-        "{}",
-        format_validation_stats(
-            passed,
-            done.saturating_sub(passed),
-            total,
-            elapsed,
-            rate,
-            dst
-        )
-    );
+    eprintln!("{}", format_validation_stats(&stats, rate, dst));
 }
 
 // Forwards every candidate while appending a copy to the recordings buffer,

@@ -101,17 +101,14 @@ impl JudgeTarget {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn support_tunnel(
     proxy: &mut Proxy,
-    timeout: Duration,
-    max_attempts: usize,
     protocol: Protocol,
     pool: &JudgePool,
-    insecure: bool,
-    support_cookies: bool,
-    support_referer: bool,
+    params: &super::WorkParams,
 ) -> anyhow::Result<Option<ProxyRuntimes<Protocol>>> {
+    let timeout = params.request_timeout;
+    let max_attempts = params.max_attempts;
     // HTTPS tunnels are classified by anonymity, which requires knowing our own
     // public IP to detect transparent proxies. SOCKS/CONNECT only prove tunnel
     // capability, so they are reported without an anonymity class. The public-IP
@@ -151,15 +148,7 @@ pub(super) async fn support_tunnel(
         let deadline = started + remaining.min(timeout);
         match time::timeout_at(
             deadline,
-            probe_once(
-                proxy,
-                &protocol,
-                target,
-                deadline,
-                insecure,
-                support_cookies,
-                support_referer,
-            ),
+            probe_once(proxy, &protocol, target, deadline, params),
         )
         .await
         {
@@ -221,9 +210,7 @@ async fn probe_once(
     protocol: &Protocol,
     target: &JudgeTarget,
     deadline: time::Instant,
-    insecure: bool,
-    support_cookies: bool,
-    support_referer: bool,
+    params: &super::WorkParams,
 ) -> anyhow::Result<String> {
     let remaining = deadline
         .checked_duration_since(time::Instant::now())
@@ -258,24 +245,9 @@ async fn probe_once(
     probe.advance(ValidationStatus::HandshakePassed);
     let body = time::timeout_at(deadline, async {
         if target.scheme == "https" {
-            verify_tls_judge(
-                stream.into_inner(),
-                target,
-                insecure,
-                authority,
-                support_cookies,
-                support_referer,
-            )
-            .await
+            verify_tls_judge(stream.into_inner(), target, authority, params).await
         } else {
-            verify_judge(
-                &mut stream,
-                target,
-                authority,
-                support_cookies,
-                support_referer,
-            )
-            .await
+            verify_judge(&mut stream, target, authority, params).await
         }
     })
     .await
@@ -401,11 +373,12 @@ async fn read_discard(stream: &mut BufReader<TcpStream>, length: usize) -> anyho
 async fn verify_tls_judge(
     stream: TcpStream,
     target: &JudgeTarget,
-    insecure: bool,
     authority: &str,
-    support_cookies: bool,
-    support_referer: bool,
+    params: &super::WorkParams,
 ) -> anyhow::Result<String> {
+    let insecure = params.insecure;
+    let support_cookies = params.support_cookies;
+    let support_referer = params.support_referer;
     use hyper::client::conn::http1::handshake;
     use hyper_util::rt::TokioIo;
 
@@ -453,9 +426,10 @@ async fn verify_judge(
     stream: &mut BufReader<TcpStream>,
     target: &JudgeTarget,
     authority: &str,
-    support_cookies: bool,
-    support_referer: bool,
+    params: &super::WorkParams,
 ) -> anyhow::Result<String> {
+    let support_cookies = params.support_cookies;
+    let support_referer = params.support_referer;
     let mut buf = [0u8; 2048];
     let request = write_request(
         &mut buf,
@@ -540,6 +514,16 @@ mod tests {
     };
 
     const JUDGE_URL: &str = "http://127.0.0.1:9/fluxy-test-token";
+
+    fn test_params(request_timeout: Duration) -> super::super::WorkParams {
+        super::super::WorkParams {
+            max_attempts: 1,
+            request_timeout,
+            insecure: false,
+            support_cookies: false,
+            support_referer: false,
+        }
+    }
 
     fn pool_with(target: ValidationTarget) -> JudgePool {
         JudgePool::from_targets(Vec::from([std::sync::Arc::new(target)]))
@@ -638,9 +622,7 @@ mod tests {
                 &protocol,
                 &target,
                 time::Instant::now() + Duration::from_secs(1),
-                false,
-                false,
-                false,
+                &test_params(Duration::from_secs(1)),
             ),
         )
         .await;
@@ -680,18 +662,10 @@ mod tests {
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
         });
-        let result = support_tunnel(
-            &mut proxy,
-            Duration::from_millis(50),
-            1,
-            Protocol::Socks5,
-            &pool,
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+        let params = test_params(Duration::from_millis(50));
+        let result = support_tunnel(&mut proxy, Protocol::Socks5, &pool, &params)
+            .await
+            .unwrap();
 
         assert!(result.is_none());
         time::timeout(Duration::from_secs(1), server)
@@ -716,15 +690,12 @@ mod tests {
             request_token: "fluxy-test-token".to_owned(),
         });
         let started = time::Instant::now();
+        let params = test_params(Duration::from_millis(50));
         let result = support_tunnel(
             &mut proxy,
-            Duration::from_millis(50),
-            1,
             Protocol::Https(Anonymity::Unknown),
             &pool,
-            false,
-            false,
-            false,
+            &params,
         )
         .await
         .unwrap();
@@ -775,9 +746,7 @@ mod tests {
             &Protocol::Connect(9),
             &target,
             deadline,
-            false,
-            false,
-            false,
+            &test_params(Duration::from_secs(1)),
         )
         .await;
 
@@ -812,9 +781,7 @@ mod tests {
             &Protocol::Connect(8080),
             &target,
             deadline,
-            false,
-            false,
-            false,
+            &test_params(Duration::from_secs(1)),
         )
         .await;
 
@@ -856,17 +823,8 @@ mod tests {
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
         });
-        let result = support_tunnel(
-            &mut proxy,
-            Duration::from_millis(200),
-            1,
-            Protocol::Connect(9),
-            &pool,
-            false,
-            false,
-            false,
-        )
-        .await;
+        let params = test_params(Duration::from_millis(200));
+        let result = support_tunnel(&mut proxy, Protocol::Connect(9), &pool, &params).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
         assert_eq!(pool.len(), 1);
@@ -901,18 +859,10 @@ mod tests {
         ]));
         let started = time::Instant::now();
         let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), blackhole.port());
-        let result = support_tunnel(
-            &mut proxy,
-            Duration::from_millis(300),
-            1,
-            Protocol::Connect(9),
-            &pool,
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+        let params = test_params(Duration::from_millis(300));
+        let result = support_tunnel(&mut proxy, Protocol::Connect(9), &pool, &params)
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
 
         assert!(result.is_none());
@@ -973,9 +923,13 @@ mod tests {
                 &Protocol::Connect(9),
                 &target,
                 time::Instant::now() + Duration::from_secs(1),
-                false,
-                support_cookies,
-                support_referer,
+                &super::super::WorkParams {
+                    max_attempts: 1,
+                    request_timeout: Duration::from_secs(1),
+                    insecure: false,
+                    support_cookies,
+                    support_referer,
+                },
             ),
         )
         .await;

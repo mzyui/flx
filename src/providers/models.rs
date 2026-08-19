@@ -9,6 +9,12 @@ use hyper::Uri;
 
 use crate::proxy::models::{Anonymity, Protocol};
 
+/// Bundles the default protocols and scrape mode for a provider body.
+pub struct ScrapeContext {
+    pub default_types: Arc<[Protocol]>,
+    pub mode: ScrapeMode,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScrapeMode {
     Plaintext,

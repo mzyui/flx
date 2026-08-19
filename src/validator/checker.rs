@@ -377,15 +377,16 @@ async fn to_raw_response(
     Ok(content)
 }
 
-pub async fn support_http(
+pub(crate) async fn support_http(
     proxy: &mut Proxy,
-    timeout: Duration,
-    max_attempts: usize,
     pool: &JudgePool,
-    insecure: bool,
-    support_cookies: bool,
-    support_referer: bool,
+    params: &super::WorkParams,
 ) -> anyhow::Result<Option<ProxyRuntimes<Protocol>>> {
+    let timeout = params.request_timeout;
+    let max_attempts = params.max_attempts;
+    let insecure = params.insecure;
+    let support_cookies = params.support_cookies;
+    let support_referer = params.support_referer;
     let useragent = crate::user_agent::next_user_agent();
     // One shared end-to-end budget across every attempt and judge so a proxy
     // that accepts TCP but never replies is bounded once instead of paying a
@@ -893,17 +894,14 @@ mod tests {
         ]));
         let started = Instant::now();
         let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), blackhole.port());
-        let result = support_http(
-            &mut proxy,
-            Duration::from_millis(300),
-            1,
-            &pool,
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+        let params = super::super::WorkParams {
+            max_attempts: 1,
+            request_timeout: Duration::from_millis(300),
+            insecure: false,
+            support_cookies: false,
+            support_referer: false,
+        };
+        let result = support_http(&mut proxy, &pool, &params).await.unwrap();
         let elapsed = started.elapsed();
 
         assert!(result.is_none());
@@ -965,17 +963,14 @@ mod tests {
                 ValidationTarget::online("http://127.0.0.1:9/fluxy-test-token").unwrap(),
             )]));
             let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), address.port());
-            let result = support_http(
-                &mut proxy,
-                Duration::from_millis(500),
-                1,
-                &pool,
-                false,
+            let params = super::super::WorkParams {
+                max_attempts: 1,
+                request_timeout: Duration::from_millis(500),
+                insecure: false,
                 support_cookies,
                 support_referer,
-            )
-            .await
-            .unwrap();
+            };
+            let result = support_http(&mut proxy, &pool, &params).await.unwrap();
             result.is_some()
         }
 

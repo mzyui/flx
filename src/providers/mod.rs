@@ -11,7 +11,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Request};
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use models::Source;
+use models::{ScrapeContext, ScrapeMode, Source};
 use tokio::time;
 
 const MAX_SOURCE_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -42,7 +42,6 @@ pub use proxynova::ProxyNovaProvider;
 pub use proxyscrape::ProxyscrapeProvider;
 
 pub use models::ProviderTier;
-use models::ScrapeMode;
 
 pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
     vec![
@@ -201,17 +200,25 @@ pub trait ProxyProvider {
         tx: tokio::sync::mpsc::Sender<Proxy>,
         default_types: Arc<[Protocol]>,
     ) -> anyhow::Result<()> {
-        self.scrape_with(html, tx, default_types, ScrapeMode::Plaintext)
-            .await
+        self.scrape_with(
+            html,
+            tx,
+            ScrapeContext {
+                default_types,
+                mode: ScrapeMode::Plaintext,
+            },
+        )
+        .await
     }
 
     async fn scrape_with(
         &self,
         body: Cow<'static, str>,
         tx: tokio::sync::mpsc::Sender<Proxy>,
-        default_types: Arc<[Protocol]>,
-        mode: ScrapeMode,
+        ctx: ScrapeContext,
     ) -> anyhow::Result<()> {
+        let default_types = ctx.default_types;
+        let mode = ctx.mode;
         tokio::task::spawn_blocking(move || {
             let mut receiver_closed = false;
             let mut forward = |(ip, port, protocol): parsers::ParsedProxy| {
@@ -299,7 +306,7 @@ fn append_utf8(
 
 #[cfg(test)]
 mod tests {
-    use super::{select_providers, ProxyProvider, MAX_REDIRECTS};
+    use super::{select_providers, ProxyProvider, ScrapeContext, MAX_REDIRECTS};
     use http_body_util::Empty;
     use hyper::body::Bytes;
     use hyper_tls::HttpsConnector;
@@ -386,8 +393,10 @@ mod tests {
         let producer = tokio::spawn(TestProvider.scrape_with(
             Cow::Owned(body),
             tx,
-            Arc::from([crate::proxy::models::Protocol::Socks5]),
-            super::ScrapeMode::Plaintext,
+            ScrapeContext {
+                default_types: Arc::from([crate::proxy::models::Protocol::Socks5]),
+                mode: super::ScrapeMode::Plaintext,
+            },
         ));
 
         tokio::task::yield_now().await;
@@ -408,8 +417,10 @@ mod tests {
         let producer = tokio::spawn(TestProvider.scrape_with(
             Cow::Owned(body),
             tx,
-            Arc::from([crate::proxy::models::Protocol::Socks5]),
-            super::ScrapeMode::Plaintext,
+            ScrapeContext {
+                default_types: Arc::from([crate::proxy::models::Protocol::Socks5]),
+                mode: super::ScrapeMode::Plaintext,
+            },
         ));
 
         tokio::task::yield_now().await;

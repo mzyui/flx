@@ -109,12 +109,18 @@ struct JudgeTargets {
     tunnel: Arc<checker::JudgePool>,
 }
 
-struct WorkParams {
+pub(crate) struct WorkParams {
     max_attempts: usize,
-    request_timeout: u64,
+    request_timeout: Duration,
     insecure: bool,
     support_cookies: bool,
     support_referer: bool,
+}
+
+struct SingletonJob {
+    proxy: Arc<Proxy>,
+    protocol: Protocol,
+    requested: Protocol,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,32 +165,19 @@ fn result_satisfies_request(result: &Protocol, requested: &Protocol) -> bool {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_probe(
     proxy: &mut Proxy,
-    timeout: Duration,
-    max_attempts: usize,
-    insecure: bool,
-    support_cookies: bool,
-    support_referer: bool,
     protocol: Protocol,
     requested: Protocol,
     targets: &JudgeTargets,
+    params: &WorkParams,
 ) -> anyhow::Result<Option<ProxyType>> {
     if let Protocol::Http(_) = protocol {
         // The judge request performs its own connect and negotiation; avoid a
         // redundant TCP preflight for every HTTP proxy.
-        let result = checker::support_http(
-            proxy,
-            timeout,
-            max_attempts,
-            &targets.http,
-            insecure,
-            support_cookies,
-            support_referer,
-        )
-        .await
-        .with_context(|| format!("{}: HTTP check failed", proxy.as_text()))?;
+        let result = checker::support_http(proxy, &targets.http, params)
+            .await
+            .with_context(|| format!("{}: HTTP check failed", proxy.as_text()))?;
         if let Some(result) =
             result.filter(|result| result_satisfies_request(&result.inner, &requested))
         {
@@ -194,18 +187,9 @@ async fn run_probe(
             Ok(None)
         }
     } else {
-        let result = tunnel::support_tunnel(
-            proxy,
-            timeout,
-            max_attempts,
-            protocol,
-            &targets.tunnel,
-            insecure,
-            support_cookies,
-            support_referer,
-        )
-        .await
-        .with_context(|| format!("{}: tunnel check failed", proxy.as_text()))?;
+        let result = tunnel::support_tunnel(proxy, protocol, &targets.tunnel, params)
+            .await
+            .with_context(|| format!("{}: tunnel check failed", proxy.as_text()))?;
         if let Some(result) =
             result.filter(|result| result_satisfies_request(&result.inner, &requested))
         {
@@ -218,27 +202,19 @@ async fn run_probe(
 }
 
 async fn do_work(
-    proxy: Arc<Proxy>,
+    job: SingletonJob,
     sender: mpsc::Sender<Proxy>,
     counters: ValidationProgress,
-    protocol: Protocol,
-    requested: Protocol,
     targets: JudgeTargets,
-    params: WorkParams,
+    params: &WorkParams,
 ) -> anyhow::Result<()> {
-    let mut proxy = proxy.validation_probe();
-    let result = run_probe(
-        &mut proxy,
-        Duration::from_secs(params.request_timeout),
-        params.max_attempts,
-        params.insecure,
-        params.support_cookies,
-        params.support_referer,
+    let SingletonJob {
+        proxy,
         protocol,
         requested,
-        &targets,
-    )
-    .await;
+    } = job;
+    let mut proxy = proxy.validation_probe();
+    let result = run_probe(&mut proxy, protocol, requested, &targets, params).await;
     counters.done.fetch_add(1, Ordering::Relaxed);
     if let Some(proxy_type) = result? {
         proxy.proxy_types.push(proxy_type);
@@ -260,7 +236,7 @@ async fn do_group_work(
     member: GroupMemberJob,
     group_tx: mpsc::Sender<GroupWorkResult>,
     targets: JudgeTargets,
-    params: WorkParams,
+    params: &WorkParams,
 ) -> anyhow::Result<()> {
     let GroupMemberJob {
         proxy,
@@ -270,19 +246,7 @@ async fn do_group_work(
         group_len,
     } = member;
     let mut probe = proxy.validation_probe();
-    let result = match run_probe(
-        &mut probe,
-        Duration::from_secs(params.request_timeout),
-        params.max_attempts,
-        params.insecure,
-        params.support_cookies,
-        params.support_referer,
-        protocol,
-        protocol,
-        &targets,
-    )
-    .await
-    {
+    let result = match run_probe(&mut probe, protocol, protocol, &targets, params).await {
         Ok(Some(proxy_type)) => {
             probe.proxy_types.push(proxy_type);
             Some(probe)
@@ -747,7 +711,7 @@ impl ProxyValidator {
                 let group_tx = worker_group_tx.clone();
                 let params = WorkParams {
                     max_attempts,
-                    request_timeout,
+                    request_timeout: Duration::from_secs(request_timeout),
                     insecure,
                     support_cookies,
                     support_referer,
@@ -760,7 +724,15 @@ impl ProxyValidator {
                             requested,
                         } => {
                             if let Err(_e) = do_work(
-                                proxy, sender, counters, protocol, requested, targets, params,
+                                SingletonJob {
+                                    proxy,
+                                    protocol,
+                                    requested,
+                                },
+                                sender,
+                                counters,
+                                targets,
+                                &params,
                             )
                             .await
                             {
@@ -785,7 +757,7 @@ impl ProxyValidator {
                                 },
                                 group_tx,
                                 targets,
-                                params,
+                                &params,
                             )
                             .await
                             {

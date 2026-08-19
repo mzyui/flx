@@ -277,14 +277,14 @@ impl ProxyFetcher {
                 let mut stop_rx_coordinator = stop_rx_coordinator;
                 let sem = Arc::new(Semaphore::new(concurrency_limit));
                 stages.send(FetchStage::Primary);
-                let mut primary_handles = spawn_phase(
-                    primary,
-                    &client,
-                    &sem,
-                    sender.clone(),
-                    stop_rx_primary,
-                    &settings,
-                );
+                let primary_ctx = PhaseContext {
+                    client: Arc::clone(&client),
+                    sem: Arc::clone(&sem),
+                    tx: sender.clone(),
+                    stop_rx: stop_rx_primary,
+                    settings: settings.clone(),
+                };
+                let mut primary_handles = spawn_phase(primary, &primary_ctx);
 
                 let mut primary_aborted = false;
                 tokio::select! {
@@ -347,8 +347,14 @@ impl ProxyFetcher {
                 );
 
                 stages.send(FetchStage::Fallback);
-                let mut fallback_handles =
-                    spawn_phase(fallback, &client, &sem, sender, stop_rx_fallback, &settings);
+                let fallback_ctx = PhaseContext {
+                    client: Arc::clone(&client),
+                    sem: Arc::clone(&sem),
+                    tx: sender,
+                    stop_rx: stop_rx_fallback,
+                    settings: settings.clone(),
+                };
+                let mut fallback_handles = spawn_phase(fallback, &fallback_ctx);
                 match fallback_phase_timeout {
                     Some(timeout) => {
                         tokio::select! {
@@ -401,25 +407,31 @@ async fn finish_phase(mut handles: JoinSet<()>, timeout: Duration) -> bool {
     false
 }
 
-fn spawn_phase(
-    tasks: Vec<(Arc<Source>, Arc<dyn ProxyProvider + Send + Sync>)>,
-    client: &Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
-    sem: &Arc<Semaphore>,
+struct FetchJob {
+    provider: Arc<dyn ProxyProvider + Send + Sync>,
+    source: Arc<Source>,
+}
+
+#[derive(Clone)]
+struct PhaseContext {
+    client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
+    sem: Arc<Semaphore>,
     tx: mpsc::Sender<Proxy>,
     stop_rx: watch::Receiver<bool>,
-    settings: &FetchSettings,
+    settings: FetchSettings,
+}
+
+fn spawn_phase(
+    tasks: Vec<(Arc<Source>, Arc<dyn ProxyProvider + Send + Sync>)>,
+    ctx: &PhaseContext,
 ) -> JoinSet<()> {
     let mut handles = JoinSet::new();
     for (source, provider) in tasks {
-        let permit = Arc::clone(sem);
-        let client = Arc::clone(client);
-        let tx = tx.clone();
-        let stop_rx = stop_rx.clone();
-        let settings = settings.clone();
-
+        let job = FetchJob { provider, source };
+        let ctx = ctx.clone();
         handles.spawn(async move {
-            let url = source.url.to_string();
-            if let Err(e) = do_work(provider, client, source, tx, permit, stop_rx, settings).await {
+            let url = job.source.url.to_string();
+            if let Err(e) = do_work(job, ctx).await {
                 #[cfg(feature = "log")]
                 log::error!("{}: {}", url, e);
                 let _ = (url, e);
@@ -481,37 +493,31 @@ async fn throttle_wait(settings: &FetchSettings, source: &Source) {
     }
 }
 
-async fn do_work(
-    provider: Arc<dyn ProxyProvider + Send + Sync>,
-    client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
-    source: Arc<Source>,
-    tx: mpsc::Sender<Proxy>,
-    sem: Arc<Semaphore>,
-    stop_rx: watch::Receiver<bool>,
-    settings: FetchSettings,
-) -> anyhow::Result<()> {
-    if *stop_rx.borrow() {
+async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<()> {
+    let FetchJob { provider, source } = job;
+    if *ctx.stop_rx.borrow() {
         return Ok(());
     }
     let url = source.url.to_string();
     let expected_types = Arc::clone(&source.default_types);
 
-    let rows: Vec<ParsedProxy> = match settings.fetch_cache.as_ref() {
+    let rows: Vec<ParsedProxy> = match ctx.settings.fetch_cache.as_ref() {
         Some(fetch_cache) => match fetch_cache.load_rows(&url).await {
             Some(rows) => rows,
             None => {
-                if settings.offline {
+                if ctx.settings.offline {
                     #[cfg(feature = "log")]
                     log::warn!("offline: no cached rows for {url}; skipping");
                     return Ok(());
                 }
-                let _permit = sem
+                let _permit = ctx
+                    .sem
                     .acquire()
                     .await
                     .context("fetcher semaphore closed during shutdown")?;
-                throttle_wait(&settings, &source).await;
+                throttle_wait(&ctx.settings, &source).await;
                 let body = provider
-                    .fetch(client, &url, source.timeout)
+                    .fetch(Arc::clone(&ctx.client), &url, source.timeout)
                     .await
                     .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
                 let mode = source.mode.clone();
@@ -523,18 +529,19 @@ async fn do_work(
             }
         },
         None => {
-            if settings.offline {
+            if ctx.settings.offline {
                 #[cfg(feature = "log")]
                 log::warn!("offline: cache disabled; skipping {url}");
                 return Ok(());
             }
-            let _permit = sem
+            let _permit = ctx
+                .sem
                 .acquire()
                 .await
                 .context("fetcher semaphore closed during shutdown")?;
-            throttle_wait(&settings, &source).await;
+            throttle_wait(&ctx.settings, &source).await;
             let body = provider
-                .fetch(client, &url, source.timeout)
+                .fetch(Arc::clone(&ctx.client), &url, source.timeout)
                 .await
                 .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
             let mode = source.mode.clone();
@@ -544,7 +551,7 @@ async fn do_work(
         }
     };
 
-    if *stop_rx.borrow() {
+    if *ctx.stop_rx.borrow() {
         return Ok(());
     }
 
@@ -553,7 +560,7 @@ async fn do_work(
             Some(protocol) => Proxy::with_expected_types(ip, port, Arc::from([protocol])),
             None => Proxy::with_expected_types(ip, port, Arc::clone(&expected_types)),
         };
-        if tx.send(proxy).await.is_err() {
+        if ctx.tx.send(proxy).await.is_err() {
             break;
         }
     }
@@ -607,20 +614,19 @@ impl ProxyFetcher {
     }
 
     fn accept(&mut self, proxy: Proxy) -> Option<Proxy> {
-        let result = accept_proxy(
-            &mut self.unique_ips,
-            self.config.enforce_unique_ip,
-            &self.countries,
-            self.ip_type_filter.as_ref(),
-            &mut self.counter,
-            &self.accepted,
-            proxy,
-            |ip| {
-                self.geolookup
-                    .as_ref()
-                    .map(|geolookup| geolookup.lookup(ip))
-            },
-        );
+        let mut ctx = AcceptContext {
+            unique_ips: &mut self.unique_ips,
+            enforce_unique_ip: self.config.enforce_unique_ip,
+            countries: &self.countries,
+            ip_type_filter: self.ip_type_filter.as_ref(),
+            counter: &mut self.counter,
+            accepted: &self.accepted,
+        };
+        let result = accept_proxy(&mut ctx, proxy, |ip| {
+            self.geolookup
+                .as_ref()
+                .map(|geolookup| geolookup.lookup(ip))
+        });
         if result.is_some() {
             if let Some(threshold) = self.config.fallback_threshold {
                 // Signal the stop atomically: `compare_exchange` ensures
@@ -640,22 +646,23 @@ impl ProxyFetcher {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn accept_proxy<F>(
-    unique_ips: &mut DedupTable,
+struct AcceptContext<'a> {
+    unique_ips: &'a mut DedupTable,
     enforce_unique_ip: bool,
-    countries: &HashSet<String>,
-    ip_type_filter: Option<&IpType>,
-    counter: &mut usize,
-    accepted: &AtomicUsize,
-    mut proxy: Proxy,
-    lookup: F,
-) -> Option<Proxy>
+    countries: &'a HashSet<String>,
+    ip_type_filter: Option<&'a IpType>,
+    counter: &'a mut usize,
+    accepted: &'a AtomicUsize,
+}
+
+fn accept_proxy<F>(ctx: &mut AcceptContext, mut proxy: Proxy, lookup: F) -> Option<Proxy>
 where
     F: FnOnce(&Ipv4Addr) -> Option<crate::geolookup::models::GeoData>,
 {
-    if enforce_unique_ip
-        && !unique_ips.insert((proxy.ip, proxy.port, protocol_hash(&proxy.expected_types)))
+    if ctx.enforce_unique_ip
+        && !ctx
+            .unique_ips
+            .insert((proxy.ip, proxy.port, protocol_hash(&proxy.expected_types)))
     {
         return None;
     }
@@ -663,26 +670,26 @@ where
     if let Some(geo) = lookup(&proxy.ip) {
         proxy.geo = Arc::new(geo);
 
-        if !countries.is_empty()
+        if !ctx.countries.is_empty()
             && !proxy
                 .geo
                 .iso_code
                 .as_ref()
-                .map(|code| countries.contains(code.as_ref()))
+                .map(|code| ctx.countries.contains(code.as_ref()))
                 .unwrap_or(false)
         {
             return None;
         }
     }
 
-    if let Some(want) = ip_type_filter {
+    if let Some(want) = ctx.ip_type_filter {
         if proxy.geo.ip_type != *want {
             return None;
         }
     }
 
-    *counter += 1;
-    accepted.fetch_add(1, Ordering::Relaxed);
+    *ctx.counter += 1;
+    ctx.accepted.fetch_add(1, Ordering::Relaxed);
     Some(proxy)
 }
 
@@ -739,8 +746,8 @@ impl Drop for ProxyFetcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_proxy, do_work, finish_phase, protocol_hash, source_host, DedupTable, FetchStage,
-        ProxyFetcher, Throttle,
+        accept_proxy, do_work, finish_phase, protocol_hash, source_host, AcceptContext, DedupTable,
+        FetchJob, FetchStage, PhaseContext, ProxyFetcher, Throttle,
     };
     use crate::fetcher::{cache::Cache, Config};
     use crate::geolookup::models::GeoData;
@@ -812,12 +819,14 @@ mod tests {
         let proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 1), 8080);
 
         assert!(accept_proxy(
-            &mut unique_ips,
-            config.enforce_unique_ip,
-            &countries,
-            None,
-            &mut counter,
-            &accepted,
+            &mut AcceptContext {
+                unique_ips: &mut unique_ips,
+                enforce_unique_ip: config.enforce_unique_ip,
+                countries: &countries,
+                ip_type_filter: None,
+                counter: &mut counter,
+                accepted: &accepted,
+            },
             proxy.clone(),
             |_| {
                 lookups.fetch_add(1, Ordering::Relaxed);
@@ -826,12 +835,14 @@ mod tests {
         )
         .is_some());
         assert!(accept_proxy(
-            &mut unique_ips,
-            config.enforce_unique_ip,
-            &countries,
-            None,
-            &mut counter,
-            &accepted,
+            &mut AcceptContext {
+                unique_ips: &mut unique_ips,
+                enforce_unique_ip: config.enforce_unique_ip,
+                countries: &countries,
+                ip_type_filter: None,
+                counter: &mut counter,
+                accepted: &accepted,
+            },
             proxy,
             |_| {
                 lookups.fetch_add(1, Ordering::Relaxed);
@@ -853,26 +864,16 @@ mod tests {
             Proxy::with_expected_types(ip, 8080, Arc::from([Protocol::Http(Anonymity::Unknown)]));
         let socks5 = Proxy::with_expected_types(ip, 8080, Arc::from([Protocol::Socks5]));
 
-        let first = accept_proxy(
-            &mut unique_ips,
-            true,
-            &countries,
-            None,
-            &mut counter,
-            &accepted,
-            http,
-            |_| None,
-        );
-        let second = accept_proxy(
-            &mut unique_ips,
-            true,
-            &countries,
-            None,
-            &mut counter,
-            &accepted,
-            socks5,
-            |_| None,
-        );
+        let mut ctx = AcceptContext {
+            unique_ips: &mut unique_ips,
+            enforce_unique_ip: true,
+            countries: &countries,
+            ip_type_filter: None,
+            counter: &mut counter,
+            accepted: &accepted,
+        };
+        let first = accept_proxy(&mut ctx, http, |_| None);
+        let second = accept_proxy(&mut ctx, socks5, |_| None);
 
         assert!(first.is_some());
         assert!(second.is_some());
@@ -933,12 +934,14 @@ mod tests {
         let proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 2), 8080);
 
         let result = accept_proxy(
-            &mut unique_ips,
-            true,
-            &countries,
-            None,
-            &mut counter,
-            &accepted,
+            &mut AcceptContext {
+                unique_ips: &mut unique_ips,
+                enforce_unique_ip: true,
+                countries: &countries,
+                ip_type_filter: None,
+                counter: &mut counter,
+                accepted: &accepted,
+            },
             proxy,
             |_| {
                 Some(GeoData {
@@ -959,38 +962,28 @@ mod tests {
         let accepted = AtomicUsize::new(0);
         let residential = Proxy::new(Ipv4Addr::new(192, 0, 2, 3), 8080);
         let datacenter = Proxy::new(Ipv4Addr::new(192, 0, 2, 4), 8081);
-        let want = Some(&crate::geolookup::IpType::Residential);
+        let want = crate::geolookup::IpType::Residential;
 
-        let accepted_home = accept_proxy(
-            &mut unique_ips,
-            true,
-            &countries,
-            want,
-            &mut counter,
-            &accepted,
-            residential,
-            |_| {
-                Some(GeoData {
-                    ip_type: crate::geolookup::IpType::Residential,
-                    ..GeoData::default()
-                })
-            },
-        );
-        let rejected_datacenter = accept_proxy(
-            &mut unique_ips,
-            true,
-            &countries,
-            want,
-            &mut counter,
-            &accepted,
-            datacenter,
-            |_| {
-                Some(GeoData {
-                    ip_type: crate::geolookup::IpType::Datacenter,
-                    ..GeoData::default()
-                })
-            },
-        );
+        let mut ctx = AcceptContext {
+            unique_ips: &mut unique_ips,
+            enforce_unique_ip: true,
+            countries: &countries,
+            ip_type_filter: Some(&want),
+            counter: &mut counter,
+            accepted: &accepted,
+        };
+        let accepted_home = accept_proxy(&mut ctx, residential, |_| {
+            Some(GeoData {
+                ip_type: crate::geolookup::IpType::Residential,
+                ..GeoData::default()
+            })
+        });
+        let rejected_datacenter = accept_proxy(&mut ctx, datacenter, |_| {
+            Some(GeoData {
+                ip_type: crate::geolookup::IpType::Datacenter,
+                ..GeoData::default()
+            })
+        });
 
         assert!(accepted_home.is_some());
         assert!(rejected_datacenter.is_none());
@@ -1137,22 +1130,23 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(1));
         let source = Arc::new(Source::all(&url).unwrap());
 
-        do_work(
-            Arc::new(OfflineTestProvider),
-            test_client(),
+        let job = FetchJob {
+            provider: Arc::new(OfflineTestProvider),
             source,
-            tx.clone(),
-            semaphore,
+        };
+        let ctx = PhaseContext {
+            client: test_client(),
+            sem: semaphore,
+            tx: tx.clone(),
             stop_rx,
-            super::FetchSettings {
+            settings: super::FetchSettings {
                 fetch_cache: Some(Arc::new(cache)),
                 offline: true,
                 throttle: Arc::new(super::Throttle::new()),
                 fetch_delay: None,
             },
-        )
-        .await
-        .unwrap();
+        };
+        do_work(job, ctx).await.unwrap();
         drop(tx);
 
         assert!(
@@ -1185,22 +1179,23 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(1));
         let source = Arc::new(Source::all(&url).unwrap());
 
-        do_work(
-            Arc::new(OfflineTestProvider),
-            test_client(),
+        let job = FetchJob {
+            provider: Arc::new(OfflineTestProvider),
             source,
-            tx.clone(),
-            semaphore,
+        };
+        let ctx = PhaseContext {
+            client: test_client(),
+            sem: semaphore,
+            tx: tx.clone(),
             stop_rx,
-            super::FetchSettings {
+            settings: super::FetchSettings {
                 fetch_cache: Some(Arc::new(cache)),
                 offline: true,
                 throttle: Arc::new(super::Throttle::new()),
                 fetch_delay: None,
             },
-        )
-        .await
-        .unwrap();
+        };
+        do_work(job, ctx).await.unwrap();
         drop(tx);
 
         assert!(
