@@ -113,6 +113,8 @@ struct WorkParams {
     max_attempts: usize,
     request_timeout: u64,
     insecure: bool,
+    support_cookies: bool,
+    support_referer: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -157,11 +159,14 @@ fn result_satisfies_request(result: &Protocol, requested: &Protocol) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_probe(
     proxy: &mut Proxy,
     timeout: Duration,
     max_attempts: usize,
     insecure: bool,
+    support_cookies: bool,
+    support_referer: bool,
     protocol: Protocol,
     requested: Protocol,
     targets: &JudgeTargets,
@@ -169,9 +174,17 @@ async fn run_probe(
     if let Protocol::Http(_) = protocol {
         // The judge request performs its own connect and negotiation; avoid a
         // redundant TCP preflight for every HTTP proxy.
-        let result = checker::support_http(proxy, timeout, max_attempts, &targets.http, insecure)
-            .await
-            .with_context(|| format!("{}: HTTP check failed", proxy.as_text()))?;
+        let result = checker::support_http(
+            proxy,
+            timeout,
+            max_attempts,
+            &targets.http,
+            insecure,
+            support_cookies,
+            support_referer,
+        )
+        .await
+        .with_context(|| format!("{}: HTTP check failed", proxy.as_text()))?;
         if let Some(result) =
             result.filter(|result| result_satisfies_request(&result.inner, &requested))
         {
@@ -188,6 +201,8 @@ async fn run_probe(
             protocol,
             &targets.tunnel,
             insecure,
+            support_cookies,
+            support_referer,
         )
         .await
         .with_context(|| format!("{}: tunnel check failed", proxy.as_text()))?;
@@ -217,6 +232,8 @@ async fn do_work(
         Duration::from_secs(params.request_timeout),
         params.max_attempts,
         params.insecure,
+        params.support_cookies,
+        params.support_referer,
         protocol,
         requested,
         &targets,
@@ -258,6 +275,8 @@ async fn do_group_work(
         Duration::from_secs(params.request_timeout),
         params.max_attempts,
         params.insecure,
+        params.support_cookies,
+        params.support_referer,
         protocol,
         protocol,
         &targets,
@@ -471,6 +490,8 @@ impl ProxyValidator {
         let concurrency_limit = config.concurrency_limit;
         let insecure = config.insecure;
         let probe_missed = config.probe_missed_types;
+        let support_cookies = config.support_cookies;
+        let support_referer = config.support_referer;
         let preflight_timeout = Duration::from_secs(config.request_timeout);
         let need_http = expected
             .iter()
@@ -728,6 +749,8 @@ impl ProxyValidator {
                     max_attempts,
                     request_timeout,
                     insecure,
+                    support_cookies,
+                    support_referer,
                 };
                 async move {
                     match job {

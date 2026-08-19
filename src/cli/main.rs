@@ -14,7 +14,8 @@ use futures_util::{Stream, StreamExt};
 use std::io::IsTerminal as _;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::{io::AsyncWriteExt, runtime};
+use std::time::Duration;
+use tokio::{io::AsyncWriteExt, runtime, time};
 
 mod argument;
 #[cfg(feature = "progress_bar")]
@@ -339,6 +340,15 @@ fn anonymity_rank_from_name(name: &str) -> u8 {
     }
 }
 
+fn anonymity_from_name(name: &str) -> Option<Anonymity> {
+    match name {
+        "transparent" => Some(Anonymity::Transparent),
+        "anonymous" => Some(Anonymity::Anonymous),
+        "elite" => Some(Anonymity::Elite),
+        _ => None,
+    }
+}
+
 /// Best anonymity rank across a proxy's validated types; types without an
 /// anonymity level (SOCKS, CONNECT) count as `Unknown`.
 fn proxy_anonymity_rank(proxy: &Proxy) -> u8 {
@@ -372,6 +382,7 @@ fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
 /// Post-validation filters applied before a proxy is rendered.
 struct ProxyFilter {
     min_anonymity_rank: Option<u8>,
+    levels: Vec<Anonymity>,
     min_response_time: Option<f64>,
     max_response_time: Option<f64>,
 }
@@ -383,6 +394,11 @@ impl ProxyFilter {
                 .min_anonymity
                 .as_deref()
                 .map(anonymity_rank_from_name),
+            levels: options
+                .levels
+                .iter()
+                .filter_map(|level| anonymity_from_name(level))
+                .collect(),
             min_response_time: options.min_response_time,
             max_response_time: options.max_response_time,
         }
@@ -393,6 +409,17 @@ impl ProxyFilter {
             if proxy_anonymity_rank(proxy) < min_rank {
                 return false;
             }
+        }
+        if !self.levels.is_empty()
+            && !proxy.proxy_types.iter().any(|proxy_type| {
+                matches!(
+                    proxy_type.protocol,
+                    Protocol::Http(anonymity) | Protocol::Https(anonymity)
+                        if self.levels.contains(&anonymity)
+                )
+            })
+        {
+            return false;
         }
         let response_time = proxy.avg_response_time();
         if let Some(min_time) = self.min_response_time {
@@ -828,16 +855,86 @@ fn list_sources() {
 
 type BoxStream = std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>>;
 
-async fn file_source(path: &std::path::Path) -> anyhow::Result<BoxStream> {
-    let path = path.to_owned();
+async fn file_source(paths: &[std::path::PathBuf]) -> anyhow::Result<BoxStream> {
+    let paths = paths.to_owned();
     let proxies = tokio::task::spawn_blocking(move || {
-        ProxySource::from_file(path.clone())
-            .with_context(|| format!("failed to read proxies from {}", path.display()))
-            .map(Iterator::collect::<Vec<_>>)
+        let mut proxies = Vec::new();
+        for path in paths {
+            let parsed = ProxySource::from_file(path.clone())
+                .with_context(|| format!("failed to read proxies from {}", path.display()))?
+                .collect::<Vec<_>>();
+            proxies.extend(parsed);
+        }
+        Ok::<_, anyhow::Error>(proxies)
     })
     .await
     .context("proxy file reader task failed")??;
     Ok(Box::pin(futures_util::stream::iter(proxies)))
+}
+
+const VERSION_CHECK_URL: &str = "https://raw.githubusercontent.com/mzyui/flx/main/Cargo.toml";
+const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Returns true when `latest` is a newer release than `current`.
+fn check_version(current: &str, latest: &str) -> bool {
+    fn parse(version: &str) -> Vec<u64> {
+        version
+            .trim()
+            .trim_start_matches('v')
+            .split('.')
+            .filter_map(|part| {
+                part.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .collect()
+    }
+    let current = parse(current);
+    let latest = parse(latest);
+    for (ours, theirs) in current.iter().zip(latest.iter()) {
+        if ours != theirs {
+            return theirs > ours;
+        }
+    }
+    latest.len() > current.len()
+}
+
+async fn fetch_latest_version() -> anyhow::Result<String> {
+    use http_body_util::{BodyExt, Empty};
+    use hyper::body::Bytes;
+    use hyper_tls::HttpsConnector;
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+
+    let client = Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(VERSION_CHECK_TIMEOUT)
+        .build::<_, Empty<Bytes>>(HttpsConnector::new());
+    let request = hyper::Request::builder()
+        .uri(VERSION_CHECK_URL)
+        .header("User-Agent", format!("flx/{}", env!("CARGO_PKG_VERSION")))
+        .body(Empty::<Bytes>::new())
+        .context("failed to build version check request")?;
+    let response = time::timeout(VERSION_CHECK_TIMEOUT, client.request(request))
+        .await
+        .context("version check timed out")?
+        .context("version check request failed")?;
+    if !response.status().is_success() {
+        anyhow::bail!("version check returned {}", response.status());
+    }
+    let body = time::timeout(VERSION_CHECK_TIMEOUT, response.into_body().collect())
+        .await
+        .context("version check body timed out")?
+        .context("version check body failed")?
+        .to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    let version = body
+        .lines()
+        .find(|line| line.trim_start().starts_with("version"))
+        .and_then(|line| line.split('=').nth(1))
+        .map(|value| value.trim().trim_matches('"').trim_matches('\'').to_owned())
+        .context("version not found in Cargo.toml")?;
+    Ok(version)
 }
 
 fn run_application() -> anyhow::Result<RunOutcome> {
@@ -885,6 +982,19 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     let download = flx::install_download_observer().expect("download observer installs once");
 
     let outcome = runtime.block_on(async move {
+        if !cli.skip_version_check && !cli.quiet {
+            let current = env!("CARGO_PKG_VERSION").to_owned();
+            tokio::spawn(async move {
+                match fetch_latest_version().await {
+                    Ok(latest) if check_version(&current, &latest) => {
+                        eprintln!(
+                            "A new flx version is available: {latest} (you are on {current})."
+                        );
+                    }
+                    _ => {}
+                }
+            });
+        }
         let notify = Arc::clone(&cancel);
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
@@ -1021,89 +1131,89 @@ async fn run_find(
     let warmup = make_warmup(quiet, no_color, download, false);
     let config = validator_config(&find.validator, protocols.clone(), groups.clone(), false);
 
-    let pass1 = match &find.validator.file {
-        Some(file) => {
-            if let Some(bar) = &warmup {
-                bar.set_phase("Checking online judges …");
-            }
-            let source = Box::pin(tee_recorder(file_source(file).await?, recordings.clone()));
-            let validate = ProxyValidator::validate(source, config);
-            tokio::pin!(validate);
-            let pass = tokio::select! {
-                pass = &mut validate => pass.context("failed to start proxy validator")?,
-                _ = cancel.notified() => {
-                    drop(warmup);
-                    return Ok(RunOutcome::Cancelled);
-                }
-            };
-            drop(warmup);
-            pass
+    let pass1 = if !find.validator.files.is_empty() {
+        if let Some(bar) = &warmup {
+            bar.set_phase("Checking online judges …");
         }
-        None => {
-            let fetch_cfg = fetcher_config(&find.fetcher);
-            if let Some(bar) = &warmup {
-                let phase = if fetch_cfg.enable_geo_lookup {
-                    "Preparing GeoLite2 database …"
-                } else {
-                    "Fetching proxy lists …"
-                };
-                bar.set_phase(phase);
+        let source = Box::pin(tee_recorder(
+            file_source(&find.validator.files).await?,
+            recordings.clone(),
+        ));
+        let validate = ProxyValidator::validate(source, config);
+        tokio::pin!(validate);
+        let pass = tokio::select! {
+            pass = &mut validate => pass.context("failed to start proxy validator")?,
+            _ = cancel.notified() => {
+                drop(warmup);
+                return Ok(RunOutcome::Cancelled);
             }
-            let mut fetcher = tokio::select! {
-                fetcher = ProxySource::from_fetcher(fetch_cfg) => {
-                    fetcher.context("failed to start proxy fetcher")?
-                }
-                _ = cancel.notified() => {
-                    drop(warmup);
-                    return Ok(RunOutcome::Cancelled);
-                }
+        };
+        drop(warmup);
+        pass
+    } else {
+        let fetch_cfg = fetcher_config(&find.fetcher);
+        if let Some(bar) = &warmup {
+            let phase = if fetch_cfg.enable_geo_lookup {
+                "Preparing GeoLite2 database …"
+            } else {
+                "Fetching proxy lists …"
             };
-            let stages = fetcher.stage_events();
-            let source = Box::pin(tee_recorder(fetcher, recordings.clone()));
-            if let Some(bar) = &warmup {
-                bar.set_phase("Fetching proxy lists …");
+            bar.set_phase(phase);
+        }
+        let mut fetcher = tokio::select! {
+            fetcher = ProxySource::from_fetcher(fetch_cfg) => {
+                fetcher.context("failed to start proxy fetcher")?
             }
-            // Watch the gathering phases on a side task while the validator
-            // preflights judges and consumes the stream in parallel.
-            let watcher = match (&warmup, stages) {
-                (Some(bar), Some(mut rx)) => {
-                    let bar = Arc::clone(bar);
-                    Some(tokio::spawn(async move {
-                        while let Some(stage) = rx.recv().await {
-                            let phase = match stage {
-                                FetchStage::Primary => "Fetching primary sources …",
-                                FetchStage::Fallback => "Fetching fallback sources …",
-                                FetchStage::Done => "Checking online judges …",
-                            };
-                            bar.set_phase(phase);
-                            if matches!(stage, FetchStage::Done) {
-                                break;
-                            }
+            _ = cancel.notified() => {
+                drop(warmup);
+                return Ok(RunOutcome::Cancelled);
+            }
+        };
+        let stages = fetcher.stage_events();
+        let source = Box::pin(tee_recorder(fetcher, recordings.clone()));
+        if let Some(bar) = &warmup {
+            bar.set_phase("Fetching proxy lists …");
+        }
+        // Watch the gathering phases on a side task while the validator
+        // preflights judges and consumes the stream in parallel.
+        let watcher = match (&warmup, stages) {
+            (Some(bar), Some(mut rx)) => {
+                let bar = Arc::clone(bar);
+                Some(tokio::spawn(async move {
+                    while let Some(stage) = rx.recv().await {
+                        let phase = match stage {
+                            FetchStage::Primary => "Fetching primary sources …",
+                            FetchStage::Fallback => "Fetching fallback sources …",
+                            FetchStage::Done => "Checking online judges …",
+                        };
+                        bar.set_phase(phase);
+                        if matches!(stage, FetchStage::Done) {
+                            break;
                         }
-                    }))
-                }
-                _ => None,
-            };
-            let validate = ProxyValidator::validate(source, config);
-            tokio::pin!(validate);
-            let pass = tokio::select! {
-                pass = &mut validate => pass.context("failed to start proxy validator")?,
-                _ = cancel.notified() => {
-                    if let Some(task) = watcher {
-                        task.abort();
-                        let _ = task.await;
                     }
-                    drop(warmup);
-                    return Ok(RunOutcome::Cancelled);
-                }
-            };
-            if let Some(task) = watcher {
-                task.abort();
-                let _ = task.await;
+                }))
             }
-            drop(warmup);
-            pass
+            _ => None,
+        };
+        let validate = ProxyValidator::validate(source, config);
+        tokio::pin!(validate);
+        let pass = tokio::select! {
+            pass = &mut validate => pass.context("failed to start proxy validator")?,
+            _ = cancel.notified() => {
+                if let Some(task) = watcher {
+                    task.abort();
+                    let _ = task.await;
+                }
+                drop(warmup);
+                return Ok(RunOutcome::Cancelled);
+            }
+        };
+        if let Some(task) = watcher {
+            task.abort();
+            let _ = task.await;
         }
+        drop(warmup);
+        pass
     };
     if !quiet {
         let health = pass1.judge_health();
@@ -1425,6 +1535,8 @@ fn validator_config(
         https_judge_urls: options.https_judge_urls.clone(),
         insecure: !options.verify_tls,
         probe_missed_types,
+        support_cookies: options.support_cookies,
+        support_referer: options.support_referer,
     }
 }
 
@@ -1765,6 +1877,94 @@ mod tests {
     }
 
     #[test]
+    fn support_header_flags_map_to_validator_config() {
+        let none = find_from(&["SOCKS5"]);
+        let config = validator_config(&none.validator, Vec::new(), Vec::new(), false);
+        assert!(!config.support_cookies);
+        assert!(!config.support_referer);
+
+        let both = find_from(&["SOCKS5", "--support-cookies", "--support-referer"]);
+        let config = validator_config(&both.validator, Vec::new(), Vec::new(), false);
+        assert!(config.support_cookies);
+        assert!(config.support_referer);
+    }
+
+    #[test]
+    fn levels_flag_parses_anonymity_levels() {
+        let args = find_from(&["--levels", "elite", "anonymous"]);
+        assert_eq!(
+            args.output.levels,
+            vec!["elite".to_owned(), "anonymous".to_owned()]
+        );
+        let default = find_from(&[]);
+        assert!(default.output.levels.is_empty());
+        assert!(Cli::try_parse_from(["flx", "find", "--levels", "super"]).is_err());
+    }
+
+    #[test]
+    fn levels_filter_keeps_only_matching_anonymity() {
+        let mut options = find_from(&[]).output;
+        options.levels = vec!["elite".to_owned()];
+        let filter = ProxyFilter::from_options(&options);
+
+        let mut elite = sample_proxy(1);
+        elite.proxy_types = vec![flx::proxy::models::ProxyType::new(Protocol::Http(
+            Anonymity::Elite,
+        ))];
+        let mut anonymous = sample_proxy(2);
+        anonymous.proxy_types = vec![flx::proxy::models::ProxyType::new(Protocol::Http(
+            Anonymity::Anonymous,
+        ))];
+        let mut socks = sample_proxy(3);
+        socks.proxy_types = vec![flx::proxy::models::ProxyType::new(Protocol::Socks5)];
+
+        assert!(filter.matches(&elite));
+        assert!(!filter.matches(&anonymous));
+        assert!(!filter.matches(&socks));
+    }
+
+    #[test]
+    fn levels_filter_defaults_to_no_op() {
+        let filter = ProxyFilter::from_options(&find_from(&[]).output);
+        let mut proxy = sample_proxy(1);
+        proxy.proxy_types = vec![flx::proxy::models::ProxyType::new(Protocol::Socks5)];
+        assert!(filter.matches(&proxy));
+    }
+
+    #[test]
+    fn files_flag_accepts_multiple_paths_and_file_alias() {
+        let args = find_from(&["--files", "a.txt", "b.txt", "c.txt"]);
+        assert_eq!(args.validator.files.len(), 3);
+        assert!(args.validator.files[0].ends_with("a.txt"));
+        assert!(args.validator.files[2].ends_with("c.txt"));
+
+        let aliased = find_from(&["--file", "a.txt"]);
+        assert_eq!(aliased.validator.files.len(), 1);
+        assert!(aliased.validator.files[0].ends_with("a.txt"));
+    }
+
+    #[test]
+    fn skip_version_check_flag_is_accepted() {
+        let cli = Cli::parse_from(["flx", "--skip-version-check", "find", "SOCKS5"]);
+        assert!(cli.skip_version_check);
+        let cli = Cli::parse_from(["flx", "find", "SOCKS5"]);
+        assert!(!cli.skip_version_check);
+    }
+
+    #[test]
+    fn check_version_compares_semantic_versions() {
+        assert!(check_version("0.2.4", "0.2.5"));
+        assert!(check_version("0.2.4", "0.3.0"));
+        assert!(check_version("0.2.4", "1.0.0"));
+        assert!(!check_version("0.2.5", "0.2.4"));
+        assert!(!check_version("0.3.0", "0.2.9"));
+        assert!(!check_version("0.2.4", "0.2.4"));
+        assert!(check_version("0.2.4", "0.2.4.1"));
+        assert!(check_version("0.2.4", "v0.2.5"));
+        assert!(!check_version("0.2.4", "0.2"));
+    }
+
+    #[test]
     fn cache_ttl_max_value_does_not_overflow() {
         let huge = fetch_from(&["--cache-ttl", "18446744073709551615"]);
         assert_eq!(
@@ -1807,6 +2007,7 @@ mod tests {
                 limit,
                 output_file: Some(out.clone()),
                 min_anonymity: None,
+                levels: Vec::new(),
                 min_response_time: None,
                 max_response_time: None,
                 sort: None,

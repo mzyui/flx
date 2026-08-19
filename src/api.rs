@@ -129,6 +129,18 @@ impl Flx {
         self
     }
 
+    /// Require proxies to forward cookie headers to the judge.
+    pub fn support_cookies(mut self) -> Self {
+        self.validator_config.support_cookies = true;
+        self
+    }
+
+    /// Require proxies to forward referer headers to the judge.
+    pub fn support_referer(mut self) -> Self {
+        self.validator_config.support_referer = true;
+        self
+    }
+
     /// Annotate fetched proxies with GeoIP country data.
     pub fn with_geo(mut self) -> Self {
         self.fetcher_config.enable_geo_lookup = true;
@@ -338,6 +350,17 @@ mod tests {
         let flx = Flx::fetch().with_geo();
         assert!(flx.fetcher_config.enable_geo_lookup);
         assert!(flx.fetcher_config.countries.is_empty());
+    }
+
+    #[test]
+    fn support_header_builders_touch_only_the_validator() {
+        let flx = Flx::fetch();
+        assert!(!flx.validator_config.support_cookies);
+        assert!(!flx.validator_config.support_referer);
+
+        let flx = flx.support_cookies().support_referer();
+        assert!(flx.validator_config.support_cookies);
+        assert!(flx.validator_config.support_referer);
     }
 
     #[test]

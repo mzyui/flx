@@ -101,6 +101,7 @@ impl JudgeTarget {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn support_tunnel(
     proxy: &mut Proxy,
     timeout: Duration,
@@ -108,6 +109,8 @@ pub(super) async fn support_tunnel(
     protocol: Protocol,
     pool: &JudgePool,
     insecure: bool,
+    support_cookies: bool,
+    support_referer: bool,
 ) -> anyhow::Result<Option<ProxyRuntimes<Protocol>>> {
     // HTTPS tunnels are classified by anonymity, which requires knowing our own
     // public IP to detect transparent proxies. SOCKS/CONNECT only prove tunnel
@@ -148,7 +151,15 @@ pub(super) async fn support_tunnel(
         let deadline = started + remaining.min(timeout);
         match time::timeout_at(
             deadline,
-            probe_once(proxy, &protocol, target, deadline, insecure),
+            probe_once(
+                proxy,
+                &protocol,
+                target,
+                deadline,
+                insecure,
+                support_cookies,
+                support_referer,
+            ),
         )
         .await
         {
@@ -211,6 +222,8 @@ async fn probe_once(
     target: &JudgeTarget,
     deadline: time::Instant,
     insecure: bool,
+    support_cookies: bool,
+    support_referer: bool,
 ) -> anyhow::Result<String> {
     let remaining = deadline
         .checked_duration_since(time::Instant::now())
@@ -245,9 +258,24 @@ async fn probe_once(
     probe.advance(ValidationStatus::HandshakePassed);
     let body = time::timeout_at(deadline, async {
         if target.scheme == "https" {
-            verify_tls_judge(stream.into_inner(), target, insecure, authority).await
+            verify_tls_judge(
+                stream.into_inner(),
+                target,
+                insecure,
+                authority,
+                support_cookies,
+                support_referer,
+            )
+            .await
         } else {
-            verify_judge(&mut stream, target, authority).await
+            verify_judge(
+                &mut stream,
+                target,
+                authority,
+                support_cookies,
+                support_referer,
+            )
+            .await
         }
     })
     .await
@@ -375,6 +403,8 @@ async fn verify_tls_judge(
     target: &JudgeTarget,
     insecure: bool,
     authority: &str,
+    support_cookies: bool,
+    support_referer: bool,
 ) -> anyhow::Result<String> {
     use hyper::client::conn::http1::handshake;
     use hyper_util::rt::TokioIo;
@@ -393,6 +423,8 @@ async fn verify_tls_judge(
         .header(hyper::header::HOST, authority)
         .header(hyper::header::CONNECTION, "close")
         .header("X-Fluxy-Token", &target.request_token)
+        .header(hyper::header::COOKIE, "cookie=ok")
+        .header(hyper::header::REFERER, "https://google.com/")
         .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
     let response = sender.send_request(request).await?;
     if response.status() != hyper::StatusCode::OK {
@@ -408,6 +440,12 @@ async fn verify_tls_judge(
     if !body.contains(&target.response_marker) {
         anyhow::bail!("response did not originate from the TLS judge");
     }
+    if support_cookies && !body.contains("HTTP_COOKIE = cookie=ok") {
+        anyhow::bail!("proxy did not forward the cookie header");
+    }
+    if support_referer && !body.contains("HTTP_REFERER = https://google.com/") {
+        anyhow::bail!("proxy did not forward the referer header");
+    }
     Ok(body.into_owned())
 }
 
@@ -415,12 +453,14 @@ async fn verify_judge(
     stream: &mut BufReader<TcpStream>,
     target: &JudgeTarget,
     authority: &str,
+    support_cookies: bool,
+    support_referer: bool,
 ) -> anyhow::Result<String> {
     let mut buf = [0u8; 2048];
     let request = write_request(
         &mut buf,
         format_args!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nX-Fluxy-Token: {}\r\nConnection: close\r\n\r\n",
+            "GET {} HTTP/1.1\r\nHost: {}\r\nX-Fluxy-Token: {}\r\nCookie: cookie=ok\r\nReferer: https://google.com/\r\nConnection: close\r\n\r\n",
             target.path_and_query, authority, target.request_token
         ),
     );
@@ -446,6 +486,12 @@ async fn verify_judge(
     let response = String::from_utf8_lossy(&response);
     if !response.contains(&target.response_marker) {
         anyhow::bail!("response did not originate from the local judge");
+    }
+    if support_cookies && !response.contains("HTTP_COOKIE = cookie=ok") {
+        anyhow::bail!("proxy did not forward the cookie header");
+    }
+    if support_referer && !response.contains("HTTP_REFERER = https://google.com/") {
+        anyhow::bail!("proxy did not forward the referer header");
     }
     Ok(response.into_owned())
 }
@@ -593,6 +639,8 @@ mod tests {
                 &target,
                 time::Instant::now() + Duration::from_secs(1),
                 false,
+                false,
+                false,
             ),
         )
         .await;
@@ -639,6 +687,8 @@ mod tests {
             Protocol::Socks5,
             &pool,
             false,
+            false,
+            false,
         )
         .await
         .unwrap();
@@ -672,6 +722,8 @@ mod tests {
             1,
             Protocol::Https(Anonymity::Unknown),
             &pool,
+            false,
+            false,
             false,
         )
         .await
@@ -718,7 +770,16 @@ mod tests {
         })
         .unwrap();
         let deadline = time::Instant::now() + Duration::from_millis(50);
-        let result = probe_once(&mut proxy, &Protocol::Connect(9), &target, deadline, false).await;
+        let result = probe_once(
+            &mut proxy,
+            &Protocol::Connect(9),
+            &target,
+            deadline,
+            false,
+            false,
+            false,
+        )
+        .await;
 
         assert!(
             result.is_err(),
@@ -751,6 +812,8 @@ mod tests {
             &Protocol::Connect(8080),
             &target,
             deadline,
+            false,
+            false,
             false,
         )
         .await;
@@ -800,6 +863,8 @@ mod tests {
             Protocol::Connect(9),
             &pool,
             false,
+            false,
+            false,
         )
         .await;
         assert!(result.is_ok());
@@ -843,6 +908,8 @@ mod tests {
             Protocol::Connect(9),
             &pool,
             false,
+            false,
+            false,
         )
         .await
         .unwrap();
@@ -853,5 +920,78 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "shared budget not honoured: {elapsed:?}"
         );
+    }
+
+    async fn serve_echoing_judge(mut stream: TcpStream, echo_cookie: bool, echo_referer: bool) {
+        let connect = read_headers(&mut stream).await.unwrap();
+        assert!(connect.starts_with(b"CONNECT 127.0.0.1:9 HTTP/1.1"));
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        let request = read_headers(&mut stream).await.unwrap();
+        assert!(request.starts_with(b"GET /fluxy-test-token HTTP/1.1"));
+        let mut body = String::from("fluxy-test-token");
+        if echo_cookie {
+            body.push_str("\nHTTP_COOKIE = cookie=ok");
+        }
+        if echo_referer {
+            body.push_str("\nHTTP_REFERER = https://google.com/");
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn probe_with_echo(
+        echo_cookie: bool,
+        echo_referer: bool,
+        support_cookies: bool,
+        support_referer: bool,
+    ) -> bool {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_echoing_judge(stream, echo_cookie, echo_referer).await;
+        });
+
+        let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), address.port());
+        let target = JudgeTarget::from_validation_target(&ValidationTarget {
+            url: JUDGE_URL.to_owned(),
+            response_marker: "fluxy-test-token".to_owned(),
+            request_token: "fluxy-test-token".to_owned(),
+        })
+        .unwrap();
+        let result = time::timeout(
+            Duration::from_secs(1),
+            probe_once(
+                &mut proxy,
+                &Protocol::Connect(9),
+                &target,
+                time::Instant::now() + Duration::from_secs(1),
+                false,
+                support_cookies,
+                support_referer,
+            ),
+        )
+        .await;
+
+        let server_result = time::timeout(Duration::from_secs(1), server).await.unwrap();
+        server_result.unwrap();
+        matches!(result, Ok(Ok(_)))
+    }
+
+    #[tokio::test]
+    async fn cookie_and_referer_echo_checks_gate_tunnel_validation() {
+        assert!(probe_with_echo(true, true, false, false).await);
+        assert!(probe_with_echo(false, false, false, false).await);
+        assert!(probe_with_echo(true, true, true, true).await);
+        assert!(!probe_with_echo(false, true, true, false).await);
+        assert!(!probe_with_echo(true, false, false, true).await);
+        assert!(!probe_with_echo(false, false, true, true).await);
     }
 }

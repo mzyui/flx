@@ -383,6 +383,8 @@ pub async fn support_http(
     max_attempts: usize,
     pool: &JudgePool,
     insecure: bool,
+    support_cookies: bool,
+    support_referer: bool,
 ) -> anyhow::Result<Option<ProxyRuntimes<Protocol>>> {
     let useragent = crate::user_agent::next_user_agent();
     // One shared end-to-end budget across every attempt and judge so a proxy
@@ -402,11 +404,15 @@ pub async fn support_http(
             let started = time::Instant::now();
             let per_request = remaining.min(timeout);
             let deadline = started + per_request;
-            let req = match Request::get(&target.url)
+            let mut request = Request::get(&target.url)
                 .header(USER_AGENT, useragent)
-                .header("X-Fluxy-Token", &target.request_token)
-                .body(Empty::<Bytes>::new())
-            {
+                .header("X-Fluxy-Token", &target.request_token);
+            // The cookie and referer headers are sent unconditionally so the
+            // judge's echo exposes whether the proxy forwards them; the check
+            // below only runs when the caller asks for it.
+            request = request.header(hyper::header::COOKIE, "cookie=ok");
+            request = request.header(hyper::header::REFERER, "https://google.com/");
+            let req = match request.body(Empty::<Bytes>::new()) {
                 Ok(req) => req,
                 Err(_e) => {
                     #[cfg(feature = "log")]
@@ -459,6 +465,20 @@ pub async fn support_http(
                 #[cfg(feature = "log")]
                 log::trace!("{}: response did not originate from the local judge", proxy);
                 pool.report_failure(&target);
+                continue;
+            }
+
+            if support_cookies && memchr::memmem::find(&body, b"HTTP_COOKIE = cookie=ok").is_none()
+            {
+                #[cfg(feature = "log")]
+                log::trace!("{}: proxy did not forward the cookie header", proxy);
+                continue;
+            }
+            if support_referer
+                && memchr::memmem::find(&body, b"HTTP_REFERER = https://google.com/").is_none()
+            {
+                #[cfg(feature = "log")]
+                log::trace!("{}: proxy did not forward the referer header", proxy);
                 continue;
             }
 
@@ -873,9 +893,17 @@ mod tests {
         ]));
         let started = Instant::now();
         let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), blackhole.port());
-        let result = support_http(&mut proxy, Duration::from_millis(300), 1, &pool, false)
-            .await
-            .unwrap();
+        let result = support_http(
+            &mut proxy,
+            Duration::from_millis(300),
+            1,
+            &pool,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         let elapsed = started.elapsed();
 
         assert!(result.is_none());
@@ -883,5 +911,79 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "shared budget not honoured: {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn cookie_and_referer_echo_checks_gate_http_validation() {
+        async fn probe(
+            echo_cookie: bool,
+            echo_referer: bool,
+            support_cookies: bool,
+            support_referer: bool,
+        ) -> bool {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let mut received = Vec::new();
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        received.extend_from_slice(&buf[..n]);
+                        if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let mut token = String::new();
+                    for line in received.split(|&b| b == b'\n') {
+                        let line = String::from_utf8_lossy(line);
+                        let (name, value) = line.split_once(':').unwrap_or(("", ""));
+                        if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
+                            token = value.trim().to_owned();
+                            break;
+                        }
+                    }
+                    let mut body = format!("HTTP_X_FLUXY_TOKEN = {token}");
+                    if echo_cookie {
+                        body.push_str("\nHTTP_COOKIE = cookie=ok");
+                    }
+                    if echo_referer {
+                        body.push_str("\nHTTP_REFERER = https://google.com/");
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+            let pool = JudgePool::from_targets(Vec::from([std::sync::Arc::new(
+                ValidationTarget::online("http://127.0.0.1:9/fluxy-test-token").unwrap(),
+            )]));
+            let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), address.port());
+            let result = support_http(
+                &mut proxy,
+                Duration::from_millis(500),
+                1,
+                &pool,
+                false,
+                support_cookies,
+                support_referer,
+            )
+            .await
+            .unwrap();
+            result.is_some()
+        }
+
+        assert!(probe(true, true, false, false).await);
+        assert!(probe(false, false, false, false).await);
+        assert!(probe(true, true, true, true).await);
+        assert!(!probe(false, true, true, false).await);
+        assert!(!probe(true, false, false, true).await);
+        assert!(!probe(false, false, true, true).await);
     }
 }

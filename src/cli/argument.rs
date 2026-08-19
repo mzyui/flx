@@ -86,6 +86,10 @@ pub struct Cli {
         ])
     )]
     pub log_level: String,
+
+    /// Skip the background check for newer flx releases.
+    #[arg(long, help_heading = "Global")]
+    pub skip_version_check: bool,
 }
 
 /// The pipeline commands available in the CLI.
@@ -170,6 +174,14 @@ pub struct OutputOptions {
         ])
     )]
     pub min_anonymity: Option<String>,
+
+    /// Only keep proxies whose anonymity is one of these levels.
+    #[arg(long, num_args(1..), help_heading = "Filtering", value_parser([
+        PossibleValue::new("transparent").help("No anonymity guarantee"),
+        PossibleValue::new("anonymous").help("Hides client IP"),
+        PossibleValue::new("elite").help("Hides proxy usage entirely"),
+    ]))]
+    pub levels: Vec<String>,
 
     /// Drop proxies slower than this many seconds.
     #[arg(long, help_heading = "Filtering")]
@@ -308,9 +320,17 @@ pub struct ValidatorArgs {
     #[arg(long, help_heading = "Validation")]
     pub verify_tls: bool,
 
-    /// Path to a file containing proxy endpoints (ip:port per line).
+    /// Require proxies to forward cookie headers to the judge.
     #[arg(long, help_heading = "Validation")]
-    pub file: Option<PathBuf>,
+    pub support_cookies: bool,
+
+    /// Require proxies to forward referer headers to the judge.
+    #[arg(long, help_heading = "Validation")]
+    pub support_referer: bool,
+
+    /// Path to a file containing proxy endpoints (ip:port per line).
+    #[arg(long, alias = "file", num_args(1..), help_heading = "Validation")]
+    pub files: Vec<PathBuf>,
 }
 
 /// `flx find`: validate proxies from a file or the built-in providers.

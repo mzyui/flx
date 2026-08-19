@@ -24,6 +24,10 @@ pub struct Config {
     pub insecure: bool,
     /// Probe requested types that the proxy's advertised set does not cover.
     pub probe_missed_types: bool,
+    /// Require the judge to echo back the request's cookie header.
+    pub support_cookies: bool,
+    /// Require the judge to echo back the request's referer header.
+    pub support_referer: bool,
 }
 
 pub const DEFAULT_CONCURRENCY_LIMIT: usize = 500;
@@ -46,6 +50,8 @@ impl Default for Config {
                 .collect(),
             insecure: false,
             probe_missed_types: false,
+            support_cookies: false,
+            support_referer: false,
         }
     }
 }
@@ -76,5 +82,13 @@ mod tests {
     #[test]
     fn default_probe_missed_types_is_disabled() {
         assert!(!Config::default().probe_missed_types);
+    }
+
+    #[test]
+    fn default_cookie_and_referer_support_are_disabled() {
+        let config = Config::default();
+
+        assert!(!config.support_cookies);
+        assert!(!config.support_referer);
     }
 }
