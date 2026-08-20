@@ -1529,7 +1529,7 @@ fn validator_config(
         request_timeout: options.timeout,
         http_judge_urls: options.http_judge_urls.clone(),
         https_judge_urls: options.https_judge_urls.clone(),
-        insecure: !options.verify_tls,
+        insecure: options.no_verify_tls,
         probe_missed_types,
         support_cookies: options.support_cookies,
         support_referer: options.support_referer,
@@ -1870,6 +1870,17 @@ mod tests {
         assert_eq!(args.output.max_response_time, Some(1.5));
         assert_eq!(args.output.min_response_time, Some(0.5));
         assert!(Cli::try_parse_from(["flx", "find", "--min-anonymity", "super"]).is_err());
+    }
+
+    #[test]
+    fn tls_verification_is_on_by_default() {
+        let plain = find_from(&["SOCKS5"]);
+        let config = validator_config(&plain.validator, Vec::new(), Vec::new(), false);
+        assert!(!config.insecure);
+
+        let opt_out = find_from(&["SOCKS5", "--no-verify-tls"]);
+        let config = validator_config(&opt_out.validator, Vec::new(), Vec::new(), false);
+        assert!(config.insecure);
     }
 
     #[test]

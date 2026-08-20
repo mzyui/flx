@@ -316,9 +316,9 @@ pub struct ValidatorArgs {
     )]
     pub https_judge_urls: Vec<String>,
 
-    /// Verify TLS certificates for HTTPS judges.
+    /// Disable TLS certificate verification for HTTPS judges.
     #[arg(long, help_heading = "Validation")]
-    pub verify_tls: bool,
+    pub no_verify_tls: bool,
 
     /// Require proxies to forward cookie headers to the judge.
     #[arg(long, help_heading = "Validation")]
