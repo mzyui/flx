@@ -358,10 +358,10 @@ fn proxy_anonymity_rank(proxy: &Proxy) -> u8 {
         .unwrap_or_else(|| Anonymity::Unknown.rank())
 }
 
-/// Sorts proxies by the requested field, honoring `--order`.
+// Sorts proxies by the requested field, honoring `--order`.
 fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
     match sort {
-        "avg-response" => proxies.sort_by(|a, b| {
+        "avg-response" | "response-time" => proxies.sort_by(|a, b| {
             a.avg_response_time()
                 .partial_cmp(&b.avg_response_time())
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -2550,6 +2550,14 @@ mod tests {
         let desc = run_sorted(&proxies, "avg-response", "desc");
         assert!(desc[0]["average_response_time"].as_f64().unwrap() > 0.5);
         assert!(desc[2]["average_response_time"].as_f64().unwrap() < 0.5);
+
+        let alias = run_sorted(&proxies, "response-time", "asc");
+        assert!(alias[0]["average_response_time"].as_f64().unwrap() < 0.5);
+        assert!(alias[2]["average_response_time"].as_f64().unwrap() > 0.5);
+
+        let alias_desc = run_sorted(&proxies, "response-time", "desc");
+        assert!(alias_desc[0]["average_response_time"].as_f64().unwrap() > 0.5);
+        assert!(alias_desc[2]["average_response_time"].as_f64().unwrap() < 0.5);
     }
 
     #[test]
