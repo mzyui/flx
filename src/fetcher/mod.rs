@@ -1,14 +1,14 @@
 mod cache;
 mod config;
+mod dedup;
+mod phase;
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
-    hash::{Hash, Hasher},
     net::Ipv4Addr,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     task::{Context as TaskContext, Poll},
     time::Duration,
@@ -16,77 +16,32 @@ use std::{
 
 use anyhow::Context;
 pub use config::{Config, DEFAULT_CACHE_TTL_MINUTES, DEFAULT_CONCURRENCY_LIMIT};
+use dedup::{protocol_hash, DedupTable};
 use futures_util::Stream;
 use hashbrown::HashSet;
 use http_body_util::Empty;
 use hyper::body::Bytes;
 use hyper_tls::HttpsConnector;
-use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
-};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+pub use phase::FetchStage;
+#[cfg(test)]
+use phase::{do_work, source_host, FetchJob};
+use phase::{spawn_phase, FetchSettings, PhaseContext, StageReporter, Throttle};
 use tokio::{
     sync::{mpsc, watch, Notify, Semaphore},
-    task::{JoinHandle, JoinSet},
+    task::JoinHandle,
     time,
 };
 
 use crate::{
     geolookup::{GeoLookup, IpType},
-    providers::{
-        all_providers, models::Source, parse_all, parsers::ParsedProxy, select_providers,
-        CustomUrlProvider, ProviderTier, ProxyProvider,
-    },
-    proxy::models::{Protocol, Proxy},
+    providers::{all_providers, select_providers, CustomUrlProvider, ProviderTier},
+    proxy::models::Proxy,
 };
 
 pub(crate) const FETCH_CHANNEL_CAPACITY: usize = 2_048;
 
 const PRIMARY_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
-
-const MAX_DEDUP_ENDPOINTS: usize = 100_000;
-
-type EndpointKey = (Ipv4Addr, u16, u64);
-
-fn protocol_hash(protocols: &[Protocol]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    protocols.hash(&mut hasher);
-    hasher.finish()
-}
-
-struct DedupTable {
-    seen: HashSet<EndpointKey>,
-    order: VecDeque<EndpointKey>,
-    capacity: usize,
-}
-
-impl DedupTable {
-    fn new() -> Self {
-        Self::with_capacity(MAX_DEDUP_ENDPOINTS)
-    }
-
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            seen: HashSet::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn insert(&mut self, endpoint: EndpointKey) -> bool {
-        if self.seen.contains(&endpoint) {
-            return false;
-        }
-        if self.seen.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.seen.remove(&oldest);
-            }
-        }
-        self.seen.insert(endpoint);
-        self.order.push_back(endpoint);
-        true
-    }
-}
 
 /// Async stream of scraped proxy candidates.
 pub struct ProxyFetcher {
@@ -107,35 +62,6 @@ pub struct ProxyFetcher {
     stop_tx: watch::Sender<bool>,
     stop_signaled: AtomicBool,
     stages: Option<mpsc::Receiver<FetchStage>>,
-}
-
-/// Fetch-phase transitions observable by a consumer of the proxy stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FetchStage {
-    /// Primary provider tier is being fetched.
-    Primary,
-    /// Fallback provider tier is being fetched.
-    Fallback,
-    /// Gathering finished or was skipped.
-    Done,
-}
-
-// Reports the current gathering phase and always closes with `Done`, even
-// when the coordinator returns early (stop signal or threshold skip).
-struct StageReporter {
-    tx: mpsc::Sender<FetchStage>,
-}
-
-impl StageReporter {
-    fn send(&self, stage: FetchStage) {
-        let _ = self.tx.try_send(stage);
-    }
-}
-
-impl Drop for StageReporter {
-    fn drop(&mut self) {
-        let _ = self.tx.try_send(FetchStage::Done);
-    }
 }
 
 impl ProxyFetcher {
@@ -402,7 +328,7 @@ impl ProxyFetcher {
 }
 
 #[cfg(test)]
-async fn finish_phase(mut handles: JoinSet<()>, timeout: Duration) -> bool {
+async fn finish_phase(mut handles: tokio::task::JoinSet<()>, timeout: Duration) -> bool {
     let drain = async { while handles.join_next().await.is_some() {} };
     if time::timeout(timeout, drain).await.is_ok() {
         return true;
@@ -410,166 +336,6 @@ async fn finish_phase(mut handles: JoinSet<()>, timeout: Duration) -> bool {
     handles.abort_all();
     while handles.join_next().await.is_some() {}
     false
-}
-
-struct FetchJob {
-    provider: Arc<dyn ProxyProvider + Send + Sync>,
-    source: Arc<Source>,
-}
-
-#[derive(Clone)]
-struct PhaseContext {
-    client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
-    sem: Arc<Semaphore>,
-    tx: mpsc::Sender<Proxy>,
-    stop_rx: watch::Receiver<bool>,
-    settings: FetchSettings,
-}
-
-fn spawn_phase(
-    tasks: Vec<(Arc<Source>, Arc<dyn ProxyProvider + Send + Sync>)>,
-    ctx: &PhaseContext,
-) -> JoinSet<()> {
-    let mut handles = JoinSet::new();
-    for (source, provider) in tasks {
-        let job = FetchJob { provider, source };
-        let ctx = ctx.clone();
-        handles.spawn(async move {
-            let url = job.source.url.to_string();
-            if let Err(e) = do_work(job, ctx).await {
-                #[cfg(feature = "log")]
-                log::error!("{}: {}", url, e);
-                let _ = (url, e);
-            }
-        });
-    }
-    handles
-}
-
-/// Fetch behaviour shared by every source task.
-#[derive(Clone)]
-struct FetchSettings {
-    fetch_cache: Option<Arc<cache::Cache>>,
-    offline: bool,
-    throttle: Arc<Throttle>,
-    fetch_delay: Option<Duration>,
-}
-
-/// Serializes network requests to the same host.
-struct Throttle {
-    last: Mutex<HashMap<String, time::Instant>>,
-}
-
-impl Throttle {
-    fn new() -> Self {
-        Self {
-            last: Mutex::new(HashMap::new()),
-        }
-    }
-
-    async fn wait(&self, host: &str, delay: Duration) {
-        let remaining = {
-            let mut last = self.last.lock().unwrap();
-            let now = time::Instant::now();
-            let remaining = last
-                .get(host)
-                .map(|prev| delay.saturating_sub(prev.elapsed()))
-                .unwrap_or_default();
-            last.insert(host.to_owned(), now);
-            remaining
-        };
-        if !remaining.is_zero() {
-            time::sleep(remaining).await;
-        }
-    }
-}
-
-fn source_host(source: &Source) -> String {
-    source
-        .url
-        .host()
-        .map(str::to_owned)
-        .unwrap_or_else(|| source.url.to_string())
-}
-
-async fn throttle_wait(settings: &FetchSettings, source: &Source) {
-    if let Some(delay) = settings.fetch_delay {
-        settings.throttle.wait(&source_host(source), delay).await;
-    }
-}
-
-async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<()> {
-    let FetchJob { provider, source } = job;
-    if *ctx.stop_rx.borrow() {
-        return Ok(());
-    }
-    let url = source.url.to_string();
-    let expected_types = Arc::clone(&source.default_types);
-
-    let rows: Vec<ParsedProxy> = match ctx.settings.fetch_cache.as_ref() {
-        Some(fetch_cache) => match fetch_cache.load_rows(&url).await {
-            Some(rows) => rows,
-            None => {
-                if ctx.settings.offline {
-                    #[cfg(feature = "log")]
-                    log::warn!("offline: no cached rows for {url}; skipping");
-                    return Ok(());
-                }
-                let _permit = ctx
-                    .sem
-                    .acquire()
-                    .await
-                    .context("fetcher semaphore closed during shutdown")?;
-                throttle_wait(&ctx.settings, &source).await;
-                let body = provider
-                    .fetch(Arc::clone(&ctx.client), &url, source.timeout)
-                    .await
-                    .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
-                let mode = source.mode.clone();
-                let rows = tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
-                    .await
-                    .context("provider parser task failed")??;
-                fetch_cache.store_rows(&url, &rows).await;
-                rows
-            }
-        },
-        None => {
-            if ctx.settings.offline {
-                #[cfg(feature = "log")]
-                log::warn!("offline: cache disabled; skipping {url}");
-                return Ok(());
-            }
-            let _permit = ctx
-                .sem
-                .acquire()
-                .await
-                .context("fetcher semaphore closed during shutdown")?;
-            throttle_wait(&ctx.settings, &source).await;
-            let body = provider
-                .fetch(Arc::clone(&ctx.client), &url, source.timeout)
-                .await
-                .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
-            let mode = source.mode.clone();
-            tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
-                .await
-                .context("provider parser task failed")??
-        }
-    };
-
-    if *ctx.stop_rx.borrow() {
-        return Ok(());
-    }
-
-    for (ip, port, protocol) in rows {
-        let proxy = match protocol {
-            Some(protocol) => Proxy::with_expected_types(ip, port, Arc::from([protocol])),
-            None => Proxy::with_expected_types(ip, port, Arc::clone(&expected_types)),
-        };
-        if ctx.tx.send(proxy).await.is_err() {
-            break;
-        }
-    }
-    Ok(())
 }
 
 impl ProxyFetcher {

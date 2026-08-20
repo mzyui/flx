@@ -1,14 +1,12 @@
 pub mod checker;
 pub mod config;
+mod progress;
 mod tunnel;
+mod work;
 
 use std::{
-    collections::HashMap,
     pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::{atomic::Ordering, Arc, Mutex},
     task::{Context as TaskContext, Poll},
     time::Duration,
     vec::Vec,
@@ -21,9 +19,16 @@ use tokio::time::Instant;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 pub use config::{Config, DEFAULT_CONCURRENCY_LIMIT};
+pub use progress::{JudgeHealthReport, ValidationProgress};
 pub use tunnel::ValidationStatus;
+use work::{
+    advertised_matches_request, aggregate_groups, do_group_work, do_work, GroupMemberJob,
+    GroupWorkResult, SingletonJob, WorkParams,
+};
+#[cfg(test)]
+use work::{group_finish, result_satisfies_request, GroupState};
 
-use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
+use crate::proxy::models::{Protocol, Proxy};
 
 pub(crate) const VALIDATOR_CHANNEL_MIN: usize = 64;
 pub(crate) const VALIDATOR_CHANNEL_MAX: usize = 4_096;
@@ -41,57 +46,6 @@ fn report_dropped(url: &str, reason: &str) {
     let _ = (url, reason);
 }
 
-/// Snapshot of judge preflight results at validator startup.
-#[derive(Debug, Clone, Default)]
-pub struct JudgeHealthReport {
-    pub candidates: usize,
-    pub healthy: usize,
-    pub failed: Vec<(String, String)>,
-}
-
-impl JudgeHealthReport {
-    fn merge(&mut self, other: &JudgeHealthReport) {
-        self.candidates += other.candidates;
-        self.healthy += other.healthy;
-        self.failed.extend(other.failed.iter().cloned());
-    }
-}
-
-/// Validation progress counters.
-#[derive(Debug, Clone, Default)]
-pub struct ValidationProgress {
-    total: Arc<AtomicUsize>,
-    done: Arc<AtomicUsize>,
-    passed: Arc<AtomicUsize>,
-}
-
-impl ValidationProgress {
-    pub fn total(&self) -> usize {
-        self.total.load(Ordering::Relaxed)
-    }
-
-    pub fn done(&self) -> usize {
-        self.done.load(Ordering::Relaxed)
-    }
-
-    pub fn passed(&self) -> usize {
-        self.passed.load(Ordering::Relaxed)
-    }
-
-    pub fn remaining(&self) -> usize {
-        self.total().saturating_sub(self.done())
-    }
-
-    pub fn fraction(&self) -> f64 {
-        let total = self.total();
-        if total == 0 {
-            0.0
-        } else {
-            self.done() as f64 / total as f64
-        }
-    }
-}
-
 /// Validates proxy candidates against online judges.
 pub struct ProxyValidator {
     receiver: mpsc::Receiver<Proxy>,
@@ -107,215 +61,6 @@ pub struct ProxyValidator {
 struct JudgeTargets {
     http: Arc<checker::JudgePool>,
     tunnel: Arc<checker::JudgePool>,
-}
-
-pub(crate) struct WorkParams {
-    max_attempts: usize,
-    request_timeout: Duration,
-    insecure: bool,
-    support_cookies: bool,
-    support_referer: bool,
-}
-
-struct SingletonJob {
-    proxy: Arc<Proxy>,
-    protocol: Protocol,
-    requested: Protocol,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct GroupKey {
-    proxy: usize,
-    group_idx: usize,
-}
-
-struct GroupWorkResult {
-    key: GroupKey,
-    slot: usize,
-    group_len: usize,
-    proxy: Option<Proxy>,
-}
-
-struct GroupState {
-    remaining: usize,
-    results: Vec<Option<Proxy>>,
-}
-
-fn protocol_matches<F>(a: &Protocol, b: &Protocol, on_http_https: F) -> bool
-where
-    F: FnOnce(&Anonymity, &Anonymity) -> bool,
-{
-    match (a, b) {
-        (Protocol::Http(left), Protocol::Http(right))
-        | (Protocol::Https(left), Protocol::Https(right)) => on_http_https(left, right),
-        (Protocol::Connect(left), Protocol::Connect(right)) => left == right,
-        _ => a == b,
-    }
-}
-
-fn advertised_matches_request(advertised: &Protocol, requested: &Protocol) -> bool {
-    protocol_matches(advertised, requested, |left, right| {
-        matches!(left, Anonymity::Unknown) || matches!(right, Anonymity::Unknown) || left == right
-    })
-}
-
-fn result_satisfies_request(result: &Protocol, requested: &Protocol) -> bool {
-    protocol_matches(result, requested, |actual, required| {
-        matches!(required, Anonymity::Unknown) || actual == required
-    })
-}
-
-async fn run_probe(
-    proxy: &mut Proxy,
-    protocol: Protocol,
-    requested: Protocol,
-    targets: &JudgeTargets,
-    params: &WorkParams,
-) -> anyhow::Result<Option<ProxyType>> {
-    if let Protocol::Http(_) = protocol {
-        // The judge request performs its own connect and negotiation; avoid a
-        // redundant TCP preflight for every HTTP proxy.
-        let result = checker::support_http(proxy, &targets.http, params)
-            .await
-            .with_context(|| format!("{}: HTTP check failed", proxy.as_text()))?;
-        if let Some(result) =
-            result.filter(|result| result_satisfies_request(&result.inner, &requested))
-        {
-            result.apply(proxy);
-            Ok(Some(ProxyType::checked(result.inner)))
-        } else {
-            Ok(None)
-        }
-    } else {
-        let result = tunnel::support_tunnel(proxy, protocol, &targets.tunnel, params)
-            .await
-            .with_context(|| format!("{}: tunnel check failed", proxy.as_text()))?;
-        if let Some(result) =
-            result.filter(|result| result_satisfies_request(&result.inner, &requested))
-        {
-            result.apply(proxy);
-            Ok(Some(ProxyType::checked(result.inner)))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-async fn do_work(
-    job: SingletonJob,
-    sender: mpsc::Sender<Proxy>,
-    counters: ValidationProgress,
-    targets: JudgeTargets,
-    params: &WorkParams,
-) -> anyhow::Result<()> {
-    let SingletonJob {
-        proxy,
-        protocol,
-        requested,
-    } = job;
-    let mut proxy = proxy.validation_probe();
-    let result = run_probe(&mut proxy, protocol, requested, &targets, params).await;
-    counters.done.fetch_add(1, Ordering::Relaxed);
-    if let Some(proxy_type) = result? {
-        proxy.proxy_types.push(proxy_type);
-        counters.passed.fetch_add(1, Ordering::Relaxed);
-        let _ = sender.send(proxy).await;
-    }
-    Ok(())
-}
-
-struct GroupMemberJob {
-    proxy: Arc<Proxy>,
-    protocol: Protocol,
-    group_idx: usize,
-    slot: usize,
-    group_len: usize,
-}
-
-async fn do_group_work(
-    member: GroupMemberJob,
-    group_tx: mpsc::Sender<GroupWorkResult>,
-    targets: JudgeTargets,
-    params: &WorkParams,
-) -> anyhow::Result<()> {
-    let GroupMemberJob {
-        proxy,
-        protocol,
-        group_idx,
-        slot,
-        group_len,
-    } = member;
-    let mut probe = proxy.validation_probe();
-    let result = match run_probe(&mut probe, protocol, protocol, &targets, params).await {
-        Ok(Some(proxy_type)) => {
-            probe.proxy_types.push(proxy_type);
-            Some(probe)
-        }
-        Ok(None) | Err(_) => None,
-    };
-    let _ = group_tx
-        .send(GroupWorkResult {
-            key: GroupKey {
-                proxy: Arc::as_ptr(&proxy) as usize,
-                group_idx,
-            },
-            slot,
-            group_len,
-            proxy: result,
-        })
-        .await;
-    Ok(())
-}
-
-fn group_finish(state: GroupState) -> Option<Proxy> {
-    let slots: Vec<Proxy> = if state.results.iter().all(Option::is_some) {
-        state.results.into_iter().flatten().collect()
-    } else {
-        return None;
-    };
-    let mut merged = slots[0].clone();
-    merged.proxy_types = slots
-        .iter()
-        .filter_map(|proxy| proxy.proxy_types.first().cloned())
-        .collect();
-    // Combine the per-protocol latencies into one aggregate: each slot carries
-    // a single aggregated sample (matching `ProxyRuntimes::apply`), so they
-    // merge as one sample per passing protocol.
-    merged.runtimes = RuntimeStats::default();
-    for slot in &slots {
-        let avg = slot.runtimes.avg();
-        if avg > 0.0 {
-            merged.runtimes.record(avg);
-        }
-    }
-    Some(merged)
-}
-
-async fn aggregate_groups(
-    mut group_rx: mpsc::Receiver<GroupWorkResult>,
-    aggregate_sender: mpsc::Sender<Proxy>,
-    aggregate_progress: ValidationProgress,
-) {
-    let mut states: HashMap<GroupKey, GroupState> = HashMap::new();
-    while let Some(msg) = group_rx.recv().await {
-        let entry = states.entry(msg.key).or_insert_with(|| GroupState {
-            remaining: msg.group_len,
-            results: vec![None; msg.group_len],
-        });
-        entry.results[msg.slot] = msg.proxy;
-        entry.remaining -= 1;
-        if entry.remaining == 0 {
-            let finished = states
-                .remove(&msg.key)
-                .expect("current group state was pushed above");
-            aggregate_progress.done.fetch_add(1, Ordering::Relaxed);
-            if let Some(proxy) = group_finish(finished) {
-                aggregate_progress.passed.fetch_add(1, Ordering::Relaxed);
-                // A closed receiver simply means the consumer stopped early.
-                let _ = aggregate_sender.send(proxy).await;
-            }
-        }
-    }
 }
 
 // Builds a judge pool, retrying the whole preflight once after a short delay
