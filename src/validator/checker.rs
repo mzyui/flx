@@ -442,18 +442,20 @@ pub(crate) async fn support_http(
                 }
             };
 
-            if !response.inner.status().is_success() {
+            let ProxyRuntimes {
+                inner,
+                runtimes: _,
+                driver,
+            } = response;
+
+            if !inner.status().is_success() {
                 #[cfg(feature = "log")]
-                log::trace!(
-                    "{}: local judge returned status {}",
-                    proxy,
-                    response.inner.status()
-                );
+                log::trace!("{}: local judge returned status {}", proxy, inner.status());
                 pool.report_failure(&target);
                 continue;
             }
 
-            let body = match to_raw_response(response.inner, deadline).await {
+            let body = match to_raw_response(inner, deadline).await {
                 Ok(body) => body,
                 Err(_e) => {
                     #[cfg(feature = "log")]
@@ -495,7 +497,7 @@ pub(crate) async fn support_http(
             return Ok(Some(ProxyRuntimes {
                 inner: Protocol::Http(anonymity),
                 runtimes: end_to_end_runtime(started.elapsed()),
-                driver: None,
+                driver,
             }));
         }
     }
@@ -980,5 +982,65 @@ mod tests {
         assert!(!probe(false, true, true, false).await);
         assert!(!probe(true, false, false, true).await);
         assert!(!probe(false, false, true, true).await);
+    }
+
+    #[tokio::test]
+    async fn http_result_carries_the_connection_driver() {
+        // Regression: the driver from `send_request` must survive into the
+        // validation result instead of being dropped with the raw response, so
+        // the connection lingers instead of being torn down right away.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let mut received = Vec::new();
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    received.extend_from_slice(&buf[..n]);
+                    if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let mut token = String::new();
+                for line in received.split(|&b| b == b'\n') {
+                    let line = String::from_utf8_lossy(line);
+                    let (name, value) = line.split_once(':').unwrap_or(("", ""));
+                    if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
+                        token = value.trim().to_owned();
+                        break;
+                    }
+                }
+                let body = format!("HTTP_X_FLUXY_TOKEN = {token}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let pool = JudgePool::from_targets(Vec::from([std::sync::Arc::new(
+            ValidationTarget::online("http://127.0.0.1:9/fluxy-test-token").unwrap(),
+        )]));
+        let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), address.port());
+        let params = super::super::WorkParams {
+            max_attempts: 1,
+            request_timeout: Duration::from_millis(500),
+            insecure: false,
+            support_cookies: false,
+            support_referer: false,
+        };
+
+        let result = support_http(&mut proxy, &pool, &params)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(result.driver.is_some());
+        server.await.unwrap();
     }
 }

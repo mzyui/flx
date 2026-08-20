@@ -15,7 +15,7 @@ use tokio::{
 
 use super::checker::{classify_anonymity, read_bounded_body, JudgePool, ValidationTarget};
 use crate::proxy::{
-    client::{spawn_connection_driver, ProxyClient, ProxyRuntimes},
+    client::{spawn_connection_driver, ConnectionDriver, ProxyClient, ProxyRuntimes},
     models::{Protocol, Proxy, RuntimeStats},
 };
 use crate::resolver::my_ip;
@@ -152,7 +152,7 @@ pub(super) async fn support_tunnel(
         )
         .await
         {
-            Ok(Ok(body)) => {
+            Ok(Ok((body, driver))) => {
                 let mut runtimes = RuntimeStats::default();
                 // The lookup runs under its own fixed budget (`MY_IP_LOOKUP_TIMEOUT`)
                 // rather than the leftover probe deadline, so a tunnel that
@@ -171,7 +171,7 @@ pub(super) async fn support_tunnel(
                 return Ok(Some(ProxyRuntimes {
                     inner: protocol,
                     runtimes,
-                    driver: None,
+                    driver,
                 }));
             }
             Ok(Err(_error)) => {
@@ -211,7 +211,7 @@ async fn probe_once(
     target: &JudgeTarget,
     deadline: time::Instant,
     params: &super::WorkParams,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<ConnectionDriver>)> {
     let remaining = deadline
         .checked_duration_since(time::Instant::now())
         .context("tunnel validation timed out before TCP connect")?;
@@ -243,18 +243,19 @@ async fn probe_once(
     .await
     .context("proxy tunnel handshake timed out")??;
     probe.advance(ValidationStatus::HandshakePassed);
-    let body = time::timeout_at(deadline, async {
+    let (body, driver) = time::timeout_at(deadline, async {
         if target.scheme == "https" {
             verify_tls_judge(stream.into_inner(), target, authority, params).await
         } else {
-            verify_judge(&mut stream, target, authority, params).await
+            let body = verify_judge(&mut stream, target, authority, params).await?;
+            Ok((body, None))
         }
     })
     .await
     .context("judge probe timed out")??;
     probe.advance(ValidationStatus::EndToEndPassed);
     debug_assert_eq!(probe.status, ValidationStatus::EndToEndPassed);
-    Ok(body)
+    Ok((body, driver))
 }
 
 async fn negotiate_http_connect(
@@ -375,7 +376,7 @@ async fn verify_tls_judge(
     target: &JudgeTarget,
     authority: &str,
     params: &super::WorkParams,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<ConnectionDriver>)> {
     let insecure = params.insecure;
     let support_cookies = params.support_cookies;
     let support_referer = params.support_referer;
@@ -390,8 +391,7 @@ async fn verify_tls_judge(
     let (mut sender, connection) = handshake(TokioIo::new(tls_stream))
         .await
         .context("HTTP handshake with TLS judge failed")?;
-    let _driver =
-        spawn_connection_driver(connection, Arc::from(authority), Duration::from_secs(30));
+    let driver = spawn_connection_driver(connection, Arc::from(authority), Duration::from_secs(30));
     let request = hyper::Request::get(&target.path_and_query)
         .header(hyper::header::HOST, authority)
         .header(hyper::header::CONNECTION, "close")
@@ -419,7 +419,7 @@ async fn verify_tls_judge(
     if support_referer && !body.contains("HTTP_REFERER = https://google.com/") {
         anyhow::bail!("proxy did not forward the referer header");
     }
-    Ok(body.into_owned())
+    Ok((body.into_owned(), Some(driver)))
 }
 
 async fn verify_judge(
