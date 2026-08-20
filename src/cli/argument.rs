@@ -284,6 +284,10 @@ pub struct FetcherArgs {
     /// Disable deduplication of identical endpoints across sources.
     #[arg(long, help_heading = "Fetching")]
     pub no_dedup: bool,
+
+    /// Override the per-source fetch timeout in seconds (0 = provider default).
+    #[arg(long, default_value_t = 0, help_heading = "Fetching")]
+    pub provider_timeout: u64,
 }
 
 /// `flx grab`: scrape proxies from the built-in providers and print them.
@@ -310,6 +314,10 @@ pub struct ValidatorArgs {
     /// Maximum number of attempts to validate a proxy.
     #[arg(long, default_value = "1", value_parser = parse_positive_usize, help_heading = "Validation")]
     pub max_attempts: usize,
+
+    /// Delay in milliseconds between validation attempts of the same proxy.
+    #[arg(long, default_value_t = 0, help_heading = "Validation")]
+    pub retry_delay_ms: u64,
 
     /// Timeout duration in seconds before giving up.
     #[arg(long, default_value_t = 3, help_heading = "Validation")]
@@ -344,6 +352,10 @@ pub struct ValidatorArgs {
     /// Require proxies to forward referer headers to the judge.
     #[arg(long, help_heading = "Validation")]
     pub support_referer: bool,
+
+    /// Write a machine-readable JSON-lines report of failed proxies to this path.
+    #[arg(long, help_heading = "Validation")]
+    pub report_failures: Option<PathBuf>,
 
     /// Path to a file containing proxy endpoints (ip:port per line).
     #[arg(long, alias = "file", num_args(1..), help_heading = "Validation")]

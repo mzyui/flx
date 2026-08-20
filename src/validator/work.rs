@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use super::progress::ValidationProgress;
@@ -13,6 +14,16 @@ pub(crate) struct WorkParams {
     pub(crate) insecure: bool,
     pub(crate) support_cookies: bool,
     pub(crate) support_referer: bool,
+    pub(crate) retry_delay: Duration,
+}
+
+/// Machine-readable record for a proxy that failed validation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProxyFailure {
+    pub ip: std::net::Ipv4Addr,
+    pub port: u16,
+    pub protocol: Protocol,
+    pub reason: String,
 }
 
 pub(crate) struct SingletonJob {
@@ -99,12 +110,47 @@ async fn run_probe(
     }
 }
 
+fn classify_failure(error: &anyhow::Error, protocol: Protocol) -> String {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    if text.contains("timed out") {
+        "timeout".to_owned()
+    } else if text.contains("did not originate")
+        || text.contains("returned status")
+        || text.contains("rejected request")
+        || text.contains("did not accept")
+        || text.contains("did not forward")
+    {
+        "rejected".to_owned()
+    } else if text.contains("cannot determine anonymity") {
+        "anonymity-unavailable".to_owned()
+    } else {
+        format!("error ({}): {}", protocol, text)
+    }
+}
+
+fn report_failure(
+    sender: &Option<mpsc::Sender<ProxyFailure>>,
+    proxy: &Proxy,
+    protocol: Protocol,
+    reason: String,
+) {
+    if let Some(sender) = sender {
+        let _ = sender.try_send(ProxyFailure {
+            ip: proxy.ip,
+            port: proxy.port,
+            protocol,
+            reason,
+        });
+    }
+}
+
 pub(crate) async fn do_work(
     job: SingletonJob,
     sender: mpsc::Sender<Proxy>,
     counters: ValidationProgress,
     targets: JudgeTargets,
     params: &WorkParams,
+    failures: Option<mpsc::Sender<ProxyFailure>>,
 ) -> anyhow::Result<()> {
     let SingletonJob {
         proxy,
@@ -116,12 +162,21 @@ pub(crate) async fn do_work(
     counters
         .done
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Some(proxy_type) = result? {
-        proxy.proxy_types.push(proxy_type);
-        counters
-            .passed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = sender.send(proxy).await;
+    match result {
+        Ok(Some(proxy_type)) => {
+            proxy.proxy_types.push(proxy_type);
+            counters
+                .passed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = sender.send(proxy).await;
+        }
+        Ok(None) => report_failure(&failures, &proxy, protocol, "unsatisfied".to_owned()),
+        Err(error) => report_failure(
+            &failures,
+            &proxy,
+            protocol,
+            classify_failure(&error, protocol),
+        ),
     }
     Ok(())
 }
@@ -139,6 +194,7 @@ pub(crate) async fn do_group_work(
     group_tx: mpsc::Sender<GroupWorkResult>,
     targets: JudgeTargets,
     params: &WorkParams,
+    failures: Option<mpsc::Sender<ProxyFailure>>,
 ) -> anyhow::Result<()> {
     let GroupMemberJob {
         proxy,
@@ -153,7 +209,19 @@ pub(crate) async fn do_group_work(
             probe.proxy_types.push(proxy_type);
             Some(probe)
         }
-        Ok(None) | Err(_) => None,
+        Ok(None) => {
+            report_failure(&failures, &probe, protocol, "unsatisfied".to_owned());
+            None
+        }
+        Err(error) => {
+            report_failure(
+                &failures,
+                &probe,
+                protocol,
+                classify_failure(&error, protocol),
+            );
+            None
+        }
     };
     let _ = group_tx
         .send(GroupWorkResult {

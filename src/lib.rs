@@ -55,7 +55,7 @@ pub use providers::models::{ProviderTier, ScrapeMode, Source};
 pub use providers::ProxyProvider;
 pub use proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
 pub use validator::{
-    Config as ValidatorConfig, JudgeHealthReport, ProxyValidator, ValidationProgress,
+    Config as ValidatorConfig, JudgeHealthReport, ProxyFailure, ProxyValidator, ValidationProgress,
     ValidationStatus,
 };
 
@@ -63,8 +63,8 @@ pub use validator::{
 pub mod prelude {
     pub use crate::{
         all_providers, sync_database, Anonymity, FetcherConfig, Flx, FlxError, GeoData, GeoLookup,
-        IpType, JudgeHealthReport, Protocol, Proxy, ProxyFetcher, ProxyParseError, ProxySource,
-        ProxyType, ProxyValidator, RuntimeStats, ScrapeMode, Source, SyncOutcome,
+        IpType, JudgeHealthReport, Protocol, Proxy, ProxyFailure, ProxyFetcher, ProxyParseError,
+        ProxySource, ProxyType, ProxyValidator, RuntimeStats, ScrapeMode, Source, SyncOutcome,
         ValidationProgress, ValidatorConfig,
     };
 }

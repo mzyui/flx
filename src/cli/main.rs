@@ -262,6 +262,8 @@ fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
         fallback_threshold: options.fallback_threshold,
         fallback_phase_timeout: (options.fetch_phase_timeout > 0)
             .then(|| std::time::Duration::from_secs(options.fetch_phase_timeout)),
+        provider_timeout: (options.provider_timeout > 0)
+            .then(|| std::time::Duration::from_secs(options.provider_timeout)),
     }
 }
 
@@ -495,7 +497,7 @@ async fn run_find(
     let warmup = make_warmup(quiet, no_color, download, false);
     let config = validator_config(&find.validator, protocols.clone(), groups.clone(), false);
 
-    let pass1 = if !find.validator.files.is_empty() {
+    let mut pass1 = if !find.validator.files.is_empty() {
         if let Some(bar) = &warmup {
             bar.set_phase("Checking online judges …");
         }
@@ -579,6 +581,14 @@ async fn run_find(
         drop(warmup);
         pass
     };
+    let mut failure_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(path) = find.validator.report_failures.clone() {
+        if let Some(rx) = pass1.take_failures() {
+            failure_tasks.push(tokio::spawn(async move {
+                write_failures(rx, &path, true).await;
+            }));
+        }
+    }
     if !quiet {
         let health = pass1.judge_health();
         if !health.failed.is_empty() {
@@ -671,6 +681,14 @@ async fn run_find(
         )
         .await
         .context("failed to start proxy validator")?;
+        let mut pass2 = pass2;
+        if let Some(path) = find.validator.report_failures.clone() {
+            if let Some(rx) = pass2.take_failures() {
+                failure_tasks.push(tokio::spawn(async move {
+                    write_failures(rx, &path, false).await;
+                }));
+            }
+        }
         let progress2 = pass2.progress();
         let guard2 = make_guard(progress2.clone(), quiet, no_color);
         let outcome2 = process_result(
@@ -710,6 +728,9 @@ async fn run_find(
             dst.as_deref(),
             quiet,
         );
+        for task in failure_tasks {
+            let _ = task.await;
+        }
         return Ok(RunOutcome::Finished);
     }
 
@@ -723,7 +744,39 @@ async fn run_find(
         dst.as_deref(),
         quiet,
     );
+    for task in failure_tasks {
+        let _ = task.await;
+    }
     outcome1
+}
+
+async fn write_failures(
+    mut rx: tokio::sync::mpsc::Receiver<flx::ProxyFailure>,
+    path: &std::path::Path,
+    truncate: bool,
+) {
+    use std::io::Write;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(truncate)
+        .append(!truncate)
+        .open(path);
+    let mut file = match file {
+        Ok(file) => file,
+        Err(error) => {
+            #[cfg(feature = "log")]
+            log::error!("cannot open failure report `{}`: {error:#}", path.display());
+            let _ = error;
+            return;
+        }
+    };
+    while let Some(failure) = rx.recv().await {
+        let line = serde_json::to_string(&failure).unwrap_or_default();
+        if !line.is_empty() {
+            let _ = writeln!(file, "{line}");
+        }
+    }
 }
 
 fn format_judge_health(report: &flx::JudgeHealthReport) -> String {
@@ -843,5 +896,7 @@ fn validator_config(
         probe_missed_types,
         support_cookies: options.support_cookies,
         support_referer: options.support_referer,
+        retry_delay: std::time::Duration::from_millis(options.retry_delay_ms),
+        report_failures: options.report_failures.is_some(),
     }
 }

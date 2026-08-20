@@ -113,6 +113,9 @@ pub(super) async fn support_tunnel(
     let budget = timeout.saturating_mul(max_attempts as u32);
 
     for offset in 0..total_attempts {
+        if offset > 0 && offset % candidates.len() == 0 && !params.retry_delay.is_zero() {
+            time::sleep(params.retry_delay).await;
+        }
         let remaining = budget
             .checked_sub(budget_started.elapsed())
             .unwrap_or_default();
@@ -259,6 +262,7 @@ mod tests {
             insecure: false,
             support_cookies: false,
             support_referer: false,
+            retry_delay: std::time::Duration::ZERO,
         }
     }
 
@@ -666,6 +670,7 @@ mod tests {
                     insecure: false,
                     support_cookies,
                     support_referer,
+                    retry_delay: std::time::Duration::ZERO,
                 },
             ),
         )

@@ -20,6 +20,7 @@ pub struct Config {
     pub custom_sources: Arc<[String]>,
     pub offline: bool,
     pub fetch_delay: Option<Duration>,
+    pub provider_timeout: Option<Duration>,
 }
 
 impl Config {
@@ -65,6 +66,7 @@ impl Default for Config {
             custom_sources: Arc::from(Vec::new()),
             offline: false,
             fetch_delay: None,
+            provider_timeout: None,
         }
     }
 }
@@ -132,5 +134,10 @@ mod tests {
     #[test]
     fn fallback_phase_timeout_is_disabled_by_default() {
         assert_eq!(Config::default().fallback_phase_timeout, None);
+    }
+
+    #[test]
+    fn provider_timeout_is_disabled_by_default() {
+        assert_eq!(Config::default().provider_timeout, None);
     }
 }

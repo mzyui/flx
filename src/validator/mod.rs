@@ -21,6 +21,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 pub use config::{Config, DEFAULT_CONCURRENCY_LIMIT};
 pub use progress::{JudgeHealthReport, ValidationProgress};
 pub use tunnel::ValidationStatus;
+pub use work::ProxyFailure;
 use work::{
     advertised_matches_request, aggregate_groups, do_group_work, do_work, GroupMemberJob,
     GroupWorkResult, SingletonJob, WorkParams,
@@ -55,6 +56,7 @@ pub struct ProxyValidator {
     timer: Instant,
     task_handle: JoinHandle<()>,
     group_task: JoinHandle<()>,
+    failures: Option<mpsc::Receiver<work::ProxyFailure>>,
 }
 
 #[derive(Clone)]
@@ -155,6 +157,12 @@ impl ProxyValidator {
 
         let (sender, receiver) =
             mpsc::channel(validator_channel_capacity(config.concurrency_limit));
+        let (failure_tx, failure_rx) = if config.report_failures {
+            let (tx, rx) = mpsc::channel(validator_channel_capacity(config.concurrency_limit));
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let progress = ValidationProgress::default();
         let manager_total = Arc::clone(&progress.total);
         let manager_done = Arc::clone(&progress.done);
@@ -449,17 +457,20 @@ impl ProxyValidator {
             });
 
             let worker_group_tx = group_tx.clone();
+            let worker_failures = failure_tx.clone();
             jobs.for_each_concurrent(concurrency_limit, move |job| {
                 let sender = sender.clone();
                 let counters = worker_counters.clone();
                 let targets = targets.clone();
                 let group_tx = worker_group_tx.clone();
+                let failures = worker_failures.clone();
                 let params = WorkParams {
                     max_attempts,
                     request_timeout: Duration::from_secs(request_timeout),
                     insecure,
                     support_cookies,
                     support_referer,
+                    retry_delay: config.retry_delay,
                 };
                 async move {
                     match job {
@@ -478,6 +489,7 @@ impl ProxyValidator {
                                 counters,
                                 targets,
                                 &params,
+                                failures,
                             )
                             .await
                             {
@@ -503,6 +515,7 @@ impl ProxyValidator {
                                 group_tx,
                                 targets,
                                 &params,
+                                failures,
                             )
                             .await
                             {
@@ -527,6 +540,7 @@ impl ProxyValidator {
             timer: Instant::now(),
             task_handle: manager,
             group_task: group_aggregator,
+            failures: failure_rx,
         })
     }
 
@@ -537,6 +551,11 @@ impl ProxyValidator {
 
     pub fn progress(&self) -> ValidationProgress {
         self.progress.clone()
+    }
+
+    /// Takes the receiver for machine-readable probe failures, when enabled.
+    pub fn take_failures(&mut self) -> Option<mpsc::Receiver<work::ProxyFailure>> {
+        self.failures.take()
     }
 
     pub async fn get_one(&mut self) -> Option<Proxy> {
@@ -708,6 +727,56 @@ mod tests {
         assert_eq!(progress.passed(), 0);
         assert_eq!(progress.remaining(), 0);
         assert_eq!(progress.fraction(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn failure_report_emits_one_reason_per_failed_probe() {
+        // Offline-safe: the judge echoes the token during preflight, while
+        // every candidate points at a closed local port, so each probe fails
+        // fast with a classified reason.
+        let judge = spawn_echo_judge().await;
+        let config = Config {
+            types: vec![Protocol::Http(Anonymity::Unknown)],
+            http_judge_urls: vec![judge],
+            https_judge_urls: vec![],
+            report_failures: true,
+            ..Config::default()
+        };
+        let candidates = (1u16..=3).map(|port| {
+            Proxy::with_expected_types(
+                std::net::Ipv4Addr::LOCALHOST,
+                port,
+                std::sync::Arc::from([Protocol::Http(Anonymity::Unknown)]),
+            )
+        });
+        let mut validator =
+            ProxyValidator::validate(futures_util::stream::iter(candidates), config)
+                .await
+                .unwrap();
+        let mut failures = validator.take_failures().expect("failures enabled");
+
+        while validator.get_one().await.is_some() {}
+
+        let mut reasons = Vec::new();
+        while let Some(failure) = failures.recv().await {
+            reasons.push(failure.reason);
+        }
+        assert_eq!(reasons.len(), 3);
+        assert!(reasons
+            .iter()
+            .all(|reason| reason == "unsatisfied" || reason.starts_with("error (")));
+    }
+
+    #[tokio::test]
+    async fn failure_report_is_absent_when_disabled() {
+        let config = Config {
+            types: vec![Protocol::Socks5],
+            ..Config::default()
+        };
+        let mut validator = ProxyValidator::validate(futures_util::stream::empty(), config)
+            .await
+            .unwrap();
+        assert!(validator.take_failures().is_none());
     }
 
     #[tokio::test]

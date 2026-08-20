@@ -178,6 +178,42 @@ fn fetch_phase_timeout_flag_lands_in_fetcher_config() {
 }
 
 #[test]
+fn provider_timeout_flag_lands_in_fetcher_config() {
+    let set = fetch_from(&["--provider-timeout", "7"]);
+    assert_eq!(
+        fetcher_config(&set.fetcher).provider_timeout,
+        Some(std::time::Duration::from_secs(7))
+    );
+
+    let default = fetch_from(&[]);
+    assert_eq!(fetcher_config(&default.fetcher).provider_timeout, None);
+}
+
+#[test]
+fn retry_delay_flag_lands_in_validator_config() {
+    let set = find_from(&["--retry-delay-ms", "250"]);
+    assert_eq!(
+        validator_config(&set.validator, vec![], Vec::new(), false).retry_delay,
+        std::time::Duration::from_millis(250)
+    );
+
+    let default = find_from(&[]);
+    assert_eq!(
+        validator_config(&default.validator, vec![], Vec::new(), false).retry_delay,
+        std::time::Duration::ZERO
+    );
+}
+
+#[test]
+fn report_failures_flag_lands_in_validator_config() {
+    let set = find_from(&["--report-failures", "failures.jsonl"]);
+    assert!(validator_config(&set.validator, vec![], Vec::new(), false).report_failures);
+
+    let default = find_from(&[]);
+    assert!(!validator_config(&default.validator, vec![], Vec::new(), false).report_failures);
+}
+
+#[test]
 fn needs_missed_probe_mirrors_validator_gating() {
     let http = Proxy::with_expected_types(
         std::net::Ipv4Addr::LOCALHOST,

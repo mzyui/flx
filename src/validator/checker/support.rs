@@ -202,7 +202,10 @@ pub(crate) async fn support_http(
     let budget_started = time::Instant::now();
     let budget = timeout.saturating_mul(max_attempts as u32);
 
-    for _ in 0..max_attempts {
+    for attempt in 0..max_attempts {
+        if attempt > 0 && !params.retry_delay.is_zero() {
+            time::sleep(params.retry_delay).await;
+        }
         for target in pool.candidates() {
             let remaining = budget
                 .checked_sub(budget_started.elapsed())
@@ -710,6 +713,7 @@ mod tests {
             insecure: false,
             support_cookies: false,
             support_referer: false,
+            retry_delay: std::time::Duration::ZERO,
         };
         let result = support_http(&mut proxy, &pool, &params).await.unwrap();
         let elapsed = started.elapsed();
@@ -779,6 +783,7 @@ mod tests {
                 insecure: false,
                 support_cookies,
                 support_referer,
+                retry_delay: std::time::Duration::ZERO,
             };
             let result = support_http(&mut proxy, &pool, &params).await.unwrap();
             result.is_some()
@@ -841,6 +846,7 @@ mod tests {
             insecure: false,
             support_cookies: false,
             support_referer: false,
+            retry_delay: std::time::Duration::ZERO,
         };
 
         let result = support_http(&mut proxy, &pool, &params)

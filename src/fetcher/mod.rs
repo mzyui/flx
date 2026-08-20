@@ -137,6 +137,10 @@ impl ProxyFetcher {
                 ProviderTier::Fallback => &mut fallback,
             };
             for source in provider.sources() {
+                let source = match config.provider_timeout {
+                    Some(timeout) => source.with_timeout(timeout),
+                    None => source,
+                };
                 bucket.push((Arc::new(source), Arc::clone(provider)));
             }
         }

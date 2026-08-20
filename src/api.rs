@@ -123,6 +123,18 @@ impl Flx {
         self
     }
 
+    /// Pause in milliseconds between validation attempts of the same proxy.
+    pub fn retry_delay(mut self, milliseconds: u64) -> Self {
+        self.validator_config.retry_delay = Duration::from_millis(milliseconds);
+        self
+    }
+
+    /// Emit a machine-readable record for every failed probe.
+    pub fn report_failures(mut self) -> Self {
+        self.validator_config.report_failures = true;
+        self
+    }
+
     /// Disable TLS certificate validation for judge connections.
     pub fn insecure(mut self, insecure: bool) -> Self {
         self.validator_config.insecure = insecure;
@@ -193,6 +205,12 @@ impl Flx {
     pub fn fetch_delay(mut self, milliseconds: u64) -> Self {
         self.fetcher_config.fetch_delay =
             (milliseconds > 0).then(|| Duration::from_millis(milliseconds));
+        self
+    }
+
+    /// Override the per-source fetch timeout in seconds.
+    pub fn provider_timeout(mut self, seconds: u64) -> Self {
+        self.fetcher_config.provider_timeout = (seconds > 0).then(|| Duration::from_secs(seconds));
         self
     }
 
