@@ -14,7 +14,7 @@ cargo install --git https://github.com/mzyui/flx
 
 Live recording of a real run against the built-in providers.
 
-![flx demo](demo.gif)
+![flx demo](assets/demo.gif)
 
 ## Scrape
 
