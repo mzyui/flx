@@ -191,6 +191,18 @@ pub struct OutputOptions {
     /// Drop proxies faster than this many seconds.
     #[arg(long, help_heading = "Filtering")]
     pub min_response_time: Option<f64>,
+
+    /// Skip proxies supporting one of these protocol types.
+    #[arg(long, num_args(1..), value_parser = TypesValueParser, help_heading = "Filtering")]
+    pub exclude_type: Vec<String>,
+
+    /// Randomize the order of the results.
+    #[arg(long, help_heading = "Output")]
+    pub shuffle: bool,
+
+    /// Append to the output file instead of truncating it.
+    #[arg(long, help_heading = "Output")]
+    pub append: bool,
 }
 
 /// Options controlling how proxies are scraped from the built-in providers.
@@ -199,6 +211,10 @@ pub struct FetcherArgs {
     /// List of ISO country codes to filter proxies by location.
     #[arg(short = 'c', long, num_args(1..), help_heading = "Fetching")]
     pub countries: Vec<String>,
+
+    /// Skip proxies located in these ISO country codes.
+    #[arg(long, num_args(1..), help_heading = "Fetching")]
+    pub exclude_country: Vec<String>,
 
     /// Enable GeoIP lookup without filtering by location.
     #[arg(short = 'g', long, help_heading = "Fetching")]

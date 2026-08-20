@@ -84,7 +84,7 @@ pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
 /// File-backed proxy source. Scheme-prefixed lines pin their own protocol;
 /// bare `ip:port` lines inherit the file's default protocol set.
 pub struct ProxySource {
-    lines: Lines<BufReader<File>>,
+    lines: Lines<Box<dyn BufRead + Send>>,
     default_proxy_types: Arc<[Protocol]>,
 }
 
@@ -124,8 +124,12 @@ impl ProxySource {
         let file = anyhow::Context::with_context(File::open(&filepath), || {
             format!("failed to open proxy file {}", filepath.display())
         })?;
-        let buffered_reader = BufReader::new(file);
-        let lines = buffered_reader.lines();
+        Self::from_reader(BufReader::new(file))
+    }
+
+    /// Reads proxies from any buffered reader.
+    pub fn from_reader<R: BufRead + Send + 'static>(reader: R) -> anyhow::Result<Self> {
+        let lines = (Box::new(reader) as Box<dyn BufRead + Send>).lines();
 
         let default_proxy_types = Arc::clone(&FILE_DEFAULT_PROTOCOLS);
 
@@ -133,6 +137,11 @@ impl ProxySource {
             lines,
             default_proxy_types,
         })
+    }
+
+    /// Reads proxies from standard input.
+    pub fn from_stdin() -> anyhow::Result<Self> {
+        Self::from_reader(std::io::BufReader::new(std::io::stdin()))
     }
 }
 
@@ -240,6 +249,19 @@ mod tests {
 
         assert_eq!(proxies.len(), 2);
         assert_eq!(proxies[0].expected_types.as_ref(), &[Protocol::Socks5]);
+        assert_eq!(proxies[1].expected_types, *FILE_DEFAULT_PROTOCOLS);
+    }
+
+    #[test]
+    fn from_reader_parses_like_from_file() {
+        let source = ProxySource::from_reader(std::io::Cursor::new(
+            "socks4://1.2.3.4:1080\n5.6.7.8:8080\n",
+        ))
+        .unwrap();
+        let proxies: Vec<Proxy> = source.collect();
+
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].expected_types.as_ref(), &[Protocol::Socks4]);
         assert_eq!(proxies[1].expected_types, *FILE_DEFAULT_PROTOCOLS);
     }
 }

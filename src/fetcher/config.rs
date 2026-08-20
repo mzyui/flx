@@ -10,6 +10,7 @@ pub struct Config {
     pub enable_ip_type: bool,
     pub ip_type_filter: Option<IpType>,
     pub countries: Arc<[String]>,
+    pub excluded_countries: Arc<[String]>,
     pub fallback_threshold: Option<usize>,
     pub fallback_phase_timeout: Option<Duration>,
     pub cache_ttl: Option<Duration>,
@@ -24,6 +25,14 @@ pub struct Config {
 impl Config {
     pub fn normalized_countries(&self) -> hashbrown::HashSet<String> {
         self.countries
+            .iter()
+            .map(|country| country.trim().to_ascii_uppercase())
+            .filter(|country| !country.is_empty())
+            .collect()
+    }
+
+    pub fn normalized_excluded_countries(&self) -> hashbrown::HashSet<String> {
+        self.excluded_countries
             .iter()
             .map(|country| country.trim().to_ascii_uppercase())
             .filter(|country| !country.is_empty())
@@ -44,6 +53,7 @@ impl Default for Config {
             enable_ip_type: false,
             ip_type_filter: None,
             countries: Arc::from(Vec::new()),
+            excluded_countries: Arc::from(Vec::new()),
             fallback_threshold: None,
             fallback_phase_timeout: None,
             cache_ttl: Some(Duration::from_secs(
@@ -88,6 +98,30 @@ mod tests {
         assert!(countries.contains("ID"));
         assert!(countries.contains("US"));
         assert_eq!(countries.len(), 2);
+    }
+
+    #[test]
+    fn excluded_countries_are_normalized_and_deduplicated() {
+        let config = Config {
+            excluded_countries: Arc::from(vec![
+                "cn".to_owned(),
+                "CN".to_owned(),
+                " ru ".to_owned(),
+                String::new(),
+            ]),
+            ..Config::default()
+        };
+
+        let countries = config.normalized_excluded_countries();
+
+        assert!(countries.contains("CN"));
+        assert!(countries.contains("RU"));
+        assert_eq!(countries.len(), 2);
+    }
+
+    #[test]
+    fn excluded_countries_are_empty_by_default() {
+        assert!(Config::default().normalized_excluded_countries().is_empty());
     }
 
     #[test]

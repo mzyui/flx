@@ -375,12 +375,23 @@ fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
     }
 }
 
+// Maps any protocol to the anonymity-agnostic form of its family, so an
+// `--exclude-type HTTP` filter also drops `HTTP:Elite` results.
+fn protocol_family(protocol: Protocol) -> Protocol {
+    match protocol {
+        Protocol::Http(_) => Protocol::Http(Anonymity::Unknown),
+        Protocol::Https(_) => Protocol::Https(Anonymity::Unknown),
+        other => other,
+    }
+}
+
 /// Post-validation filters applied before a proxy is rendered.
 struct ProxyFilter {
     min_anonymity_rank: Option<u8>,
     levels: Vec<Anonymity>,
     min_response_time: Option<f64>,
     max_response_time: Option<f64>,
+    exclude_types: Vec<Protocol>,
 }
 
 impl ProxyFilter {
@@ -397,6 +408,11 @@ impl ProxyFilter {
                 .collect(),
             min_response_time: options.min_response_time,
             max_response_time: options.max_response_time,
+            exclude_types: options
+                .exclude_type
+                .iter()
+                .filter_map(|type_str| Protocol::from_str(type_str).ok())
+                .collect(),
         }
     }
 
@@ -425,6 +441,25 @@ impl ProxyFilter {
         }
         if let Some(max_time) = self.max_response_time {
             if response_time > max_time {
+                return false;
+            }
+        }
+        if !self.exclude_types.is_empty() {
+            let advertised = proxy.proxy_types.is_empty();
+            let types: Vec<Protocol> = if advertised {
+                proxy.expected_types.to_vec()
+            } else {
+                proxy
+                    .proxy_types
+                    .iter()
+                    .map(|proxy_type| proxy_type.protocol)
+                    .collect()
+            };
+            if types.iter().any(|protocol| {
+                self.exclude_types
+                    .iter()
+                    .any(|excluded| protocol_family(*excluded) == protocol_family(*protocol))
+            }) {
                 return false;
             }
         }
@@ -472,6 +507,29 @@ fn render_pac(proxies: &[Proxy]) -> String {
     out
 }
 
+// Simple deterministic-free Fisher-Yates shuffle: a xorshift64 PRNG seeded
+// from wall-clock time avoids pulling in a `rand` dependency for one flag.
+fn shuffle_proxies(proxies: &mut [Proxy]) {
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e3779b97f4a7c15)
+        ^ u64::from(std::process::id());
+    if state == 0 {
+        state = 0x9e3779b97f4a7c15;
+    }
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for i in (1..proxies.len()).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        proxies.swap(i, j);
+    }
+}
+
 async fn process_result<S>(
     source: S,
     options: OutputOptions,
@@ -487,27 +545,43 @@ where
         options.output_file.as_deref(),
         std::io::stdout().is_terminal(),
     );
+    if options.append && matches!(format, "json" | "pretty-json") {
+        anyhow::bail!("--append cannot be combined with the {format} format");
+    }
     let mut output_file = match options.output_file.as_ref() {
-        Some(file_path) => Some(tokio::io::BufWriter::new(
-            tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
+        Some(file_path) => {
+            let mut open = tokio::fs::OpenOptions::new();
+            open.write(true).create(true);
+            if options.append {
+                open.append(true);
+            } else {
+                open.truncate(true);
+            }
+            let file = open
                 .open(file_path)
                 .await
-                .with_context(|| format!("failed to open output file {}", file_path.display()))?,
-        )),
+                .with_context(|| format!("failed to open output file {}", file_path.display()))?;
+            Some(tokio::io::BufWriter::new(file))
+        }
         None => None,
     };
+    let appending_to_existing = options.append
+        && matches!(options.output_file.as_ref(), Some(file_path)
+            if matches!(tokio::fs::metadata(file_path).await, Ok(metadata) if metadata.len() > 0));
 
     let json = matches!(format, "json" | "pretty-json");
     let _csv = format == "csv";
     let mut found_proxy = false;
     let mut cancelled = false;
     let filter = Arc::new(ProxyFilter::from_options(&options));
-    let source: BoxStream = if let Some(sort) = options.sort.as_deref() {
+    let source: BoxStream = if options.sort.is_some() || options.shuffle {
         let mut proxies: Vec<Proxy> = source.collect().await;
-        sort_proxies(&mut proxies, sort, Some(options.order.as_str()));
+        if options.shuffle {
+            shuffle_proxies(&mut proxies);
+        }
+        if let Some(sort) = options.sort.as_deref() {
+            sort_proxies(&mut proxies, sort, Some(options.order.as_str()));
+        }
         Box::pin(futures_util::stream::iter(proxies))
     } else {
         Box::pin(source)
@@ -581,7 +655,7 @@ where
 
     // Emit the CSV header once before the stream starts so the output is
     // always valid even when the stream is empty.
-    if _csv && finalize.emit_csv_header {
+    if _csv && finalize.emit_csv_header && !appending_to_existing {
         buf.extend_from_slice(b"ip,port,type,response_time,country,ip_type\n");
         if let Some(ref mut file) = output_file {
             if let Err(error) = file.write_all(&buf).await {
@@ -815,11 +889,13 @@ fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
         concurrency_limit: options.fetch_concurrency,
         enable_geo_lookup: options.with_geo
             || !options.countries.is_empty()
+            || !options.exclude_country.is_empty()
             || options.with_ip_type
             || options.ip_type.is_some(),
         enable_ip_type: options.with_ip_type || options.ip_type.is_some(),
         ip_type_filter: ip_type,
         countries: Arc::from(options.countries.as_slice()),
+        excluded_countries: Arc::from(options.exclude_country.as_slice()),
         cache_ttl: (options.cache_ttl > 0)
             .then(|| std::time::Duration::from_secs(options.cache_ttl.saturating_mul(60))),
         refresh_cache: options.refresh_cache,
@@ -856,9 +932,13 @@ async fn file_source(paths: &[std::path::PathBuf]) -> anyhow::Result<BoxStream> 
     let proxies = tokio::task::spawn_blocking(move || {
         let mut proxies = Vec::new();
         for path in paths {
-            let parsed = ProxySource::from_file(path.clone())
-                .with_context(|| format!("failed to read proxies from {}", path.display()))?
-                .collect::<Vec<_>>();
+            let parsed = if path.as_os_str() == "-" {
+                ProxySource::from_stdin().context("failed to read proxies from stdin")?
+            } else {
+                ProxySource::from_file(path.clone())
+                    .with_context(|| format!("failed to read proxies from {}", path.display()))?
+            };
+            let parsed = parsed.collect::<Vec<_>>();
             proxies.extend(parsed);
         }
         Ok::<_, anyhow::Error>(proxies)
@@ -2031,6 +2111,9 @@ mod tests {
                 max_response_time: None,
                 sort: None,
                 order: "asc".to_owned(),
+                exclude_type: Vec::new(),
+                shuffle: false,
+                append: false,
             },
             out,
         )
@@ -2774,5 +2857,182 @@ mod tests {
         let proxies: Vec<_> = (1..=5).map(sample_proxy).collect();
         let out = run_pac(&proxies, 3);
         assert_eq!(out.matches("PROXY").count(), 3);
+    }
+
+    #[test]
+    fn exclude_country_flag_lands_in_fetcher_config() {
+        let args = fetch_from(&["--exclude-country", "CN", "RU"]);
+        let config = fetcher_config(&args.fetcher);
+        assert_eq!(
+            config.excluded_countries.as_ref(),
+            ["CN".to_owned(), "RU".to_owned()]
+        );
+        assert!(config.enable_geo_lookup);
+
+        let default = fetch_from(&[]);
+        let config = fetcher_config(&default.fetcher);
+        assert!(config.excluded_countries.is_empty());
+        assert!(!config.enable_geo_lookup);
+    }
+
+    #[test]
+    fn exclude_type_flag_parses_and_validates() {
+        let args = find_from(&["--exclude-type", "SOCKS4", "HTTP:Elite"]);
+        assert_eq!(
+            args.output.exclude_type,
+            vec!["SOCKS4".to_owned(), "HTTP:Elite".to_owned()]
+        );
+        assert!(Cli::try_parse_from(["flx", "find", "--exclude-type", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn exclude_type_filter_drops_matching_families() {
+        let mut options = find_from(&[]).output;
+        options.exclude_type = vec!["HTTP".to_owned()];
+        let filter = ProxyFilter::from_options(&options);
+
+        let mut elite = sample_proxy(1);
+        elite.proxy_types = vec![flx::proxy::models::ProxyType::new(Protocol::Http(
+            Anonymity::Elite,
+        ))];
+        let mut socks5 = sample_proxy(2);
+        socks5.proxy_types = vec![flx::proxy::models::ProxyType::new(Protocol::Socks5)];
+
+        assert!(
+            !filter.matches(&elite),
+            "HTTP:Elite must match exclude HTTP"
+        );
+        assert!(filter.matches(&socks5));
+    }
+
+    #[test]
+    fn exclude_type_filter_uses_advertised_types_when_unvalidated() {
+        let mut options = find_from(&[]).output;
+        options.exclude_type = vec!["SOCKS4".to_owned()];
+        let filter = ProxyFilter::from_options(&options);
+
+        let socks4 = Proxy::with_expected_types(
+            std::net::Ipv4Addr::LOCALHOST,
+            1111,
+            std::sync::Arc::from([Protocol::Socks4]),
+        );
+        let http = Proxy::with_expected_types(
+            std::net::Ipv4Addr::LOCALHOST,
+            1112,
+            std::sync::Arc::from([Protocol::Http(Anonymity::Unknown)]),
+        );
+
+        assert!(!filter.matches(&socks4));
+        assert!(filter.matches(&http));
+    }
+
+    #[test]
+    fn shuffle_flag_is_accepted_and_preserves_the_set() {
+        let proxies: Vec<_> = (1..=10).map(sample_proxy).collect();
+        let mut shuffled = proxies.clone();
+        shuffle_proxies(&mut shuffled);
+
+        let mut expected: Vec<u8> = proxies.iter().map(|p| p.ip.octets()[3]).collect();
+        expected.sort_unstable();
+        let mut actual: Vec<u8> = shuffled.iter().map(|p| p.ip.octets()[3]).collect();
+        actual.sort_unstable();
+        assert_eq!(expected, actual, "shuffle must be a permutation");
+
+        let args = fetch_from(&["--shuffle"]);
+        assert!(args.output.shuffle);
+        assert!(!fetch_from(&[]).output.shuffle);
+    }
+
+    fn run_text(proxies: &[Proxy], append: bool, existing: Option<&str>) -> String {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("text", 0);
+        let options = OutputOptions { append, ..options };
+        if let Some(content) = existing {
+            std::fs::write(&path, content).unwrap();
+        }
+        rt.block_on(async {
+            let s = stream::iter(proxies.to_vec());
+            process_result(
+                s,
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        content
+    }
+
+    #[test]
+    fn append_flag_appends_to_existing_output_file() {
+        let first = run_text(&[sample_proxy(1)], false, None);
+        assert_eq!(first, "192.168.0.1:8081\n");
+
+        let combined = run_text(&[sample_proxy(2)], true, Some(&first));
+        assert_eq!(combined, "192.168.0.1:8081\n192.168.0.2:8082\n");
+    }
+
+    #[test]
+    fn append_without_existing_file_creates_it() {
+        let out = run_text(&[sample_proxy(1)], true, None);
+        assert_eq!(out, "192.168.0.1:8081\n");
+    }
+
+    #[test]
+    fn append_rejects_json_formats() {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("json", 0);
+        let options = OutputOptions {
+            append: true,
+            ..options
+        };
+        let result = rt.block_on(async {
+            process_result(
+                stream::iter(Vec::<Proxy>::new()),
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+        });
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn append_csv_skips_duplicate_header() {
+        let rt = runtime::Builder::new_current_thread().build().unwrap();
+        let (options, path) = output_options("csv", 0);
+        let options = OutputOptions {
+            append: true,
+            ..options
+        };
+        std::fs::write(
+            &path,
+            "ip,port,type,response_time,country,ip_type\n1.2.3.4,80,,\n",
+        )
+        .unwrap();
+        rt.block_on(async {
+            process_result(
+                stream::iter(vec![sample_proxy(1)]),
+                options,
+                Arc::new(tokio::sync::Notify::new()),
+                &NoopGuard,
+                FinalizeOpts::default(),
+            )
+            .await
+            .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            content,
+            "ip,port,type,response_time,country,ip_type\n1.2.3.4,80,,\n192.168.0.1,8081,,0.00,,unknown\n"
+        );
     }
 }

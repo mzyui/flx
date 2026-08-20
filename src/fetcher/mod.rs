@@ -96,6 +96,7 @@ pub struct ProxyFetcher {
     elapsed: Option<Duration>,       // Duration of the fetcher operation.
     geolookup: Option<GeoLookup>,    // Optional GeoIP instance for location lookups.
     countries: HashSet<String>,      // Normalized ISO country filter.
+    excluded_countries: HashSet<String>, // Normalized ISO country exclusion filter.
     ip_type_filter: Option<IpType>,  // Optional IP-type filter.
     unique_ips: DedupTable,
     coordinator: JoinHandle<()>,
@@ -144,7 +145,9 @@ impl ProxyFetcher {
         }
         // A country filter is meaningless without GeoIP lookup, so reject the
         // combination up front instead of silently dropping every proxy.
-        if !config.countries.is_empty() && !config.enable_geo_lookup {
+        if (!config.countries.is_empty() || !config.excluded_countries.is_empty())
+            && !config.enable_geo_lookup
+        {
             anyhow::bail!(
                 "country filter requires enable_geo_lookup=true (GeoIP lookup is currently disabled)"
             );
@@ -197,6 +200,7 @@ impl ProxyFetcher {
         }
 
         let countries = config.normalized_countries();
+        let excluded_countries = config.normalized_excluded_countries();
         let accepted = Arc::new(AtomicUsize::new(0));
 
         let mut primary = vec![];
@@ -384,6 +388,7 @@ impl ProxyFetcher {
             unique_ips: DedupTable::new(),
             geolookup,
             countries,
+            excluded_countries,
             ip_type_filter: config.ip_type_filter,
             config,
             accepted,
@@ -618,6 +623,7 @@ impl ProxyFetcher {
             unique_ips: &mut self.unique_ips,
             enforce_unique_ip: self.config.enforce_unique_ip,
             countries: &self.countries,
+            excluded_countries: &self.excluded_countries,
             ip_type_filter: self.ip_type_filter.as_ref(),
             counter: &mut self.counter,
             accepted: &self.accepted,
@@ -650,6 +656,7 @@ struct AcceptContext<'a> {
     unique_ips: &'a mut DedupTable,
     enforce_unique_ip: bool,
     countries: &'a HashSet<String>,
+    excluded_countries: &'a HashSet<String>,
     ip_type_filter: Option<&'a IpType>,
     counter: &'a mut usize,
     accepted: &'a AtomicUsize,
@@ -676,6 +683,17 @@ where
                 .iso_code
                 .as_ref()
                 .map(|code| ctx.countries.contains(code.as_ref()))
+                .unwrap_or(false)
+        {
+            return None;
+        }
+
+        if !ctx.excluded_countries.is_empty()
+            && proxy
+                .geo
+                .iso_code
+                .as_ref()
+                .map(|code| ctx.excluded_countries.contains(code.as_ref()))
                 .unwrap_or(false)
         {
             return None;
@@ -813,6 +831,7 @@ mod tests {
         let mut unique_ips = DedupTable::new();
         let config = Config::default();
         let countries = hashbrown::HashSet::new();
+        let excluded_countries = hashbrown::HashSet::new();
         let mut counter = 0;
         let accepted = AtomicUsize::new(0);
         let lookups = Arc::new(AtomicUsize::new(0));
@@ -823,6 +842,7 @@ mod tests {
                 unique_ips: &mut unique_ips,
                 enforce_unique_ip: config.enforce_unique_ip,
                 countries: &countries,
+                excluded_countries: &excluded_countries,
                 ip_type_filter: None,
                 counter: &mut counter,
                 accepted: &accepted,
@@ -839,6 +859,7 @@ mod tests {
                 unique_ips: &mut unique_ips,
                 enforce_unique_ip: config.enforce_unique_ip,
                 countries: &countries,
+                excluded_countries: &excluded_countries,
                 ip_type_filter: None,
                 counter: &mut counter,
                 accepted: &accepted,
@@ -857,6 +878,7 @@ mod tests {
     fn same_endpoint_preserves_different_advertised_protocols() {
         let mut unique_ips = DedupTable::new();
         let countries = hashbrown::HashSet::new();
+        let excluded_countries = hashbrown::HashSet::new();
         let mut counter = 0;
         let accepted = AtomicUsize::new(0);
         let ip = Ipv4Addr::new(192, 0, 2, 10);
@@ -868,6 +890,7 @@ mod tests {
             unique_ips: &mut unique_ips,
             enforce_unique_ip: true,
             countries: &countries,
+            excluded_countries: &excluded_countries,
             ip_type_filter: None,
             counter: &mut counter,
             accepted: &accepted,
@@ -929,6 +952,7 @@ mod tests {
             .into_iter()
             .map(|country| country.to_ascii_uppercase())
             .collect();
+        let excluded_countries = hashbrown::HashSet::new();
         let mut counter = 0;
         let accepted = AtomicUsize::new(0);
         let proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 2), 8080);
@@ -938,6 +962,7 @@ mod tests {
                 unique_ips: &mut unique_ips,
                 enforce_unique_ip: true,
                 countries: &countries,
+                excluded_countries: &excluded_countries,
                 ip_type_filter: None,
                 counter: &mut counter,
                 accepted: &accepted,
@@ -955,9 +980,50 @@ mod tests {
     }
 
     #[test]
+    fn excluded_country_filter_drops_only_matching_proxies() {
+        let mut unique_ips = DedupTable::new();
+        let countries = hashbrown::HashSet::new();
+        let excluded_countries = ["cn".to_owned()]
+            .into_iter()
+            .map(|country| country.to_ascii_uppercase())
+            .collect();
+        let mut counter = 0;
+        let accepted = AtomicUsize::new(0);
+        let blocked = Proxy::new(Ipv4Addr::new(192, 0, 2, 5), 8080);
+        let allowed = Proxy::new(Ipv4Addr::new(192, 0, 2, 6), 8081);
+
+        let mut ctx = AcceptContext {
+            unique_ips: &mut unique_ips,
+            enforce_unique_ip: true,
+            countries: &countries,
+            excluded_countries: &excluded_countries,
+            ip_type_filter: None,
+            counter: &mut counter,
+            accepted: &accepted,
+        };
+        let rejected = accept_proxy(&mut ctx, blocked, |_| {
+            Some(GeoData {
+                iso_code: Some("CN".into()),
+                ..GeoData::default()
+            })
+        });
+        let kept = accept_proxy(&mut ctx, allowed, |_| {
+            Some(GeoData {
+                iso_code: Some("US".into()),
+                ..GeoData::default()
+            })
+        });
+
+        assert!(rejected.is_none());
+        assert!(kept.is_some());
+        assert_eq!(counter, 1);
+    }
+
+    #[test]
     fn ip_type_filter_keeps_only_matching_proxies() {
         let mut unique_ips = DedupTable::new();
         let countries = hashbrown::HashSet::new();
+        let excluded_countries = hashbrown::HashSet::new();
         let mut counter = 0;
         let accepted = AtomicUsize::new(0);
         let residential = Proxy::new(Ipv4Addr::new(192, 0, 2, 3), 8080);
@@ -968,6 +1034,7 @@ mod tests {
             unique_ips: &mut unique_ips,
             enforce_unique_ip: true,
             countries: &countries,
+            excluded_countries: &excluded_countries,
             ip_type_filter: Some(&want),
             counter: &mut counter,
             accepted: &accepted,
@@ -1009,6 +1076,19 @@ mod tests {
         // is disabled must fail fast instead of silently dropping every proxy.
         let config = Config {
             countries: Arc::from(vec!["ID".to_owned()]),
+            enable_geo_lookup: false,
+            ..Config::default()
+        };
+        let result = ProxyFetcher::gather(config).await;
+        assert!(result.is_err());
+        let err = result.err().expect("already asserted is_err");
+        assert!(format!("{:#}", err).contains("enable_geo_lookup"));
+    }
+
+    #[tokio::test]
+    async fn gather_rejects_excluded_country_filter_without_geo_lookup() {
+        let config = Config {
+            excluded_countries: Arc::from(vec!["CN".to_owned()]),
             enable_geo_lookup: false,
             ..Config::default()
         };
