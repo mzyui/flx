@@ -253,12 +253,10 @@ impl Display for WarmupFrame {
             } else {
                 0.0
             };
-            let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
-            let text = format!("{phase} Gathered {n} proxies ({rate:.0}/s)");
             if self.color {
-                text.bold().cyan().to_string()
+                format!("{} {n} proxies ({rate:.0}/s)", "Gathering".cyan().bold())
             } else {
-                text
+                format!("Gathering {n} proxies ({rate:.0}/s)")
             }
         } else {
             let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
@@ -409,9 +407,7 @@ mod tests {
         );
 
         let rendered = frame.to_string();
-        assert!(rendered.contains("Fetching primary sources"));
-        assert!(rendered.contains("Gathered 12 proxies"));
-        assert!(rendered.contains("(3/s)"));
+        assert_eq!(rendered, "Gathering 12 proxies (3/s)");
     }
 
     #[test]

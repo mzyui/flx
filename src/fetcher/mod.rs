@@ -950,8 +950,11 @@ mod tests {
 
     #[tokio::test]
     async fn stage_events_report_phases_then_done() {
+        // `cache_ttl: None` keeps the run fully offline (no cached rows can
+        // stall the coordinator on the drain wait the test never performs).
         let mut fetcher = ProxyFetcher::gather(Config {
             offline: true,
+            cache_ttl: None,
             ..Config::default()
         })
         .await
