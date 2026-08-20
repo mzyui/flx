@@ -180,6 +180,7 @@ pub struct OutputOptions {
         PossibleValue::new("transparent").help("No anonymity guarantee"),
         PossibleValue::new("anonymous").help("Hides client IP"),
         PossibleValue::new("elite").help("Hides proxy usage entirely"),
+        PossibleValue::new("unknown").help("Anonymity could not be determined"),
     ]))]
     pub levels: Vec<String>,
 

@@ -340,6 +340,7 @@ fn anonymity_from_name(name: &str) -> Option<Anonymity> {
         "transparent" => Some(Anonymity::Transparent),
         "anonymous" => Some(Anonymity::Anonymous),
         "elite" => Some(Anonymity::Elite),
+        "unknown" => Some(Anonymity::Unknown),
         _ => None,
     }
 }
@@ -1903,6 +1904,8 @@ mod tests {
             args.output.levels,
             vec!["elite".to_owned(), "anonymous".to_owned()]
         );
+        let unknown = find_from(&["--levels", "unknown"]);
+        assert_eq!(unknown.output.levels, vec!["unknown".to_owned()]);
         let default = find_from(&[]);
         assert!(default.output.levels.is_empty());
         assert!(Cli::try_parse_from(["flx", "find", "--levels", "super"]).is_err());
@@ -1928,6 +1931,15 @@ mod tests {
         assert!(filter.matches(&elite));
         assert!(!filter.matches(&anonymous));
         assert!(!filter.matches(&socks));
+
+        options.levels = vec!["unknown".to_owned()];
+        let filter = ProxyFilter::from_options(&options);
+        let mut unknown = sample_proxy(4);
+        unknown.proxy_types = vec![flx::proxy::models::ProxyType::new(Protocol::Http(
+            Anonymity::Unknown,
+        ))];
+        assert!(filter.matches(&unknown));
+        assert!(!filter.matches(&elite));
     }
 
     #[test]
