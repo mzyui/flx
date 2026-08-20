@@ -4,14 +4,12 @@ use anyhow::Context;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    time::Instant,
 };
 
 use async_trait::async_trait;
 use hyper::Uri;
 
 use super::NegotiatorTrait;
-use crate::proxy::models::RuntimeStats;
 
 pub struct Socks4Negotiator;
 
@@ -63,7 +61,6 @@ impl NegotiatorTrait for Socks4Negotiator {
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        runtimes: &mut RuntimeStats,
         _proxy_host: &str,
         uri: &Uri,
     ) -> anyhow::Result<()> {
@@ -85,14 +82,10 @@ impl NegotiatorTrait for Socks4Negotiator {
         let packet = Self::build_connect_request(&mut packet_buf, host, port);
 
         // Transmit the request, then read the 8-byte reply.
-        let start_time = Instant::now();
         stream.write_all(&packet).await?;
-        runtimes.record(start_time.elapsed().as_secs_f64());
 
         let mut response = [0u8; 8];
-        let start_time = Instant::now();
         stream.read_exact(&mut response).await?;
-        runtimes.record(start_time.elapsed().as_secs_f64());
 
         // The reply is [VN, CD, DST.PORT, DST.IP] with CD signalling success.
         let mut response_slice = &response[..];

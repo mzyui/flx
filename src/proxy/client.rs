@@ -91,8 +91,8 @@ pub struct ProxyRuntimes<T> {
 
 impl<T> ProxyRuntimes<T> {
     pub fn apply(&self, proxy: &mut Proxy) {
-        // RuntimeStats is not additive across independent connect/negotiate/…
-        // phases, so we record the aggregate instead of individual samples.
+        // The runtimes carry a single end-to-end sample recorded by the
+        // validator, so recording its average folds it into the proxy's stats.
         let avg = self.runtimes.avg();
         if avg > 0.0 {
             proxy.runtimes.record(avg);
@@ -123,12 +123,9 @@ pub trait ProxyClient {
         let elapsed_time = start_time.elapsed().as_secs_f64();
         self.log_trace(format!("Connected in {:.3}s", elapsed_time));
 
-        let mut runtimes = RuntimeStats::default();
-        runtimes.record(elapsed_time);
-
         Ok(ProxyRuntimes {
             inner: tcp_stream,
-            runtimes,
+            runtimes: RuntimeStats::default(),
             driver: None,
         })
     }
@@ -156,7 +153,6 @@ pub trait ProxyClient {
             .context("proxy request timed out before TCP connect")?;
         let tcp = self.connect_timeout(remaining).await?;
         let mut stream = tcp.inner;
-        let mut runtimes = tcp.runtimes;
 
         let mut use_tls = false;
 
@@ -167,7 +163,7 @@ pub trait ProxyClient {
                 .with_context(|| format!("proxy negotiation with {} timed out", proxy_host))?;
             time::timeout(
                 remaining,
-                negotiator.negotiate(&mut stream, &mut runtimes, &proxy_host, req.uri()),
+                negotiator.negotiate(&mut stream, &proxy_host, req.uri()),
             )
             .await
             .with_context(|| format!("proxy negotiation with {} timed out", proxy_host))?
@@ -184,7 +180,6 @@ pub trait ProxyClient {
                 self.send_via_conn(
                     req,
                     stream,
-                    runtimes,
                     SendOptions {
                         tls: true,
                         insecure,
@@ -199,7 +194,6 @@ pub trait ProxyClient {
                 self.send_via_conn(
                     req,
                     stream,
-                    runtimes,
                     SendOptions {
                         tls: false,
                         insecure,
@@ -215,7 +209,6 @@ pub trait ProxyClient {
         &mut self,
         req: Request<B>,
         stream: TcpStream,
-        mut runtimes: RuntimeStats,
         opts: SendOptions,
     ) -> anyhow::Result<ProxyRuntimes<Response<Incoming>>>
     where
@@ -227,7 +220,6 @@ pub trait ProxyClient {
 
         if opts.tls {
             self.log_trace("Starting TLS connection");
-            let start_time = time::Instant::now();
 
             let connector = tls_connector(opts.insecure);
             let sni_host = req
@@ -241,49 +233,40 @@ pub trait ProxyClient {
                 .connect(sni_host, stream)
                 .await
                 .with_context(|| format!("TLS handshake with {} failed", host))?;
-            runtimes.record(start_time.elapsed().as_secs_f64());
             self.log_trace("TLS connection established successfully");
 
-            let start_time = time::Instant::now();
             let io = TokioIo::new(tls_stream);
             let (mut sender, conn) = handshake(io)
                 .await
                 .context("HTTP/1 handshake over TLS failed")?;
-            runtimes.record(start_time.elapsed().as_secs_f64());
             let driver = spawn_connection_driver(conn, self.host_arc(), CONNECTION_LINGER);
 
             self.log_trace(format!("Sending request: {:?}", req));
-            let start_time = time::Instant::now();
             let response = sender
                 .send_request(req)
                 .await
                 .context("failed to send request over TLS connection")?;
-            runtimes.record(start_time.elapsed().as_secs_f64());
 
             return Ok(ProxyRuntimes {
                 inner: response,
-                runtimes,
+                runtimes: RuntimeStats::default(),
                 driver: Some(driver),
             });
         }
 
-        let start_time = time::Instant::now();
         let io = TokioIo::new(stream);
         let (mut sender, conn) = handshake(io).await.context("HTTP/1 handshake failed")?;
-        runtimes.record(start_time.elapsed().as_secs_f64());
         let driver = spawn_connection_driver(conn, self.host_arc(), CONNECTION_LINGER);
 
         self.log_trace(format!("Sending request: {:?}", req));
-        let start_time = time::Instant::now();
         let response = sender
             .send_request(req)
             .await
             .context("failed to send request to proxy")?;
-        runtimes.record(start_time.elapsed().as_secs_f64());
 
         Ok(ProxyRuntimes {
             inner: response,
-            runtimes,
+            runtimes: RuntimeStats::default(),
             driver: Some(driver),
         })
     }

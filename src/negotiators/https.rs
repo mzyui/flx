@@ -5,11 +5,9 @@ use hyper::Uri;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     net::TcpStream,
-    time,
 };
 
 use super::NegotiatorTrait;
-use crate::proxy::models::RuntimeStats;
 
 pub struct HttpsNegotiator;
 
@@ -38,7 +36,6 @@ impl NegotiatorTrait for HttpsNegotiator {
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        runtimes: &mut RuntimeStats,
         proxy_host: &str,
         uri: &Uri,
     ) -> anyhow::Result<()> {
@@ -59,7 +56,6 @@ impl NegotiatorTrait for HttpsNegotiator {
                 proxy_host,
                 format_args!("Sending a connection request to {}", host),
             );
-            let start_time = time::Instant::now();
             stream.write_all(connect_request.as_bytes()).await?;
 
             let mut reader = tokio::io::BufReader::new(&mut *stream);
@@ -97,7 +93,6 @@ impl NegotiatorTrait for HttpsNegotiator {
                 );
             }
             self.log_trace(proxy_host, "Connection successfully established");
-            runtimes.record(start_time.elapsed().as_secs_f64());
         }
         Ok(())
     }

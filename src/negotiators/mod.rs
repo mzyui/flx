@@ -15,15 +15,12 @@ pub use socks4::Socks4Negotiator;
 pub use socks5::Socks5Negotiator;
 use tokio::net::TcpStream;
 
-use crate::proxy::models::RuntimeStats;
-
 /// Handshake behaviour for a proxy protocol.
 #[async_trait]
 pub trait NegotiatorTrait {
     async fn negotiate(
         &self,
         _stream: &mut TcpStream,
-        _runtimes: &mut RuntimeStats,
         _proxy_host: &str,
         _uri: &Uri,
     ) -> anyhow::Result<()> {

@@ -5,11 +5,9 @@ use async_trait::async_trait;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    time::Instant,
 };
 
 use super::NegotiatorTrait;
-use crate::proxy::models::RuntimeStats;
 
 pub struct Socks5Negotiator;
 
@@ -57,22 +55,17 @@ impl NegotiatorTrait for Socks5Negotiator {
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        runtimes: &mut RuntimeStats,
         _proxy_host: &str,
         uri: &hyper::Uri,
     ) -> anyhow::Result<()> {
         // Method selection: VER=5, NMETHODS=1, METHOD=0 (no authentication).
         let handshake_packet = [5, 1, 0];
 
-        let start_time = Instant::now();
         stream.write_all(&handshake_packet).await?;
-        runtimes.record(start_time.elapsed().as_secs_f64());
 
         // Reply is a two-byte [VER, METHOD] selection.
         let mut response_buf = [0; 2];
-        let start_time = Instant::now();
         stream.read_exact(&mut response_buf).await?;
-        runtimes.record(start_time.elapsed().as_secs_f64());
 
         if response_buf[0] != 0x05 {
             anyhow::bail!("InvalidData: invalid response version");
@@ -98,16 +91,12 @@ impl NegotiatorTrait for Socks5Negotiator {
         let mut packet_buf = [0u8; 512];
         let connection_packet = Self::build_connect_request(&mut packet_buf, host, port)?;
 
-        let start_time = Instant::now();
         stream.write_all(&connection_packet).await?;
-        runtimes.record(start_time.elapsed().as_secs_f64());
 
         // Parse the reply header [VER, REP, RSV, ATYP], then discard the
         // variable-length bound address and trailing port.
         let mut response_buf = [0; 4];
-        let start_time = Instant::now();
         stream.read_exact(&mut response_buf).await?;
-        runtimes.record(start_time.elapsed().as_secs_f64());
 
         if response_buf[0] != 0x05 {
             anyhow::bail!("InvalidData: invalid response version");
