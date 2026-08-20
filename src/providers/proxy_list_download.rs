@@ -30,7 +30,7 @@ impl ProxyProvider for ProxyListDownloadProvider {
                     Source::typed(&url, *protocol).map(|source| {
                         source
                             .with_mode(ScrapeMode::JsonStringArray)
-                            .with_timeout(Duration::from_secs(15))
+                            .with_timeout(Duration::from_secs(10))
                     })
                 })
                 .collect(),

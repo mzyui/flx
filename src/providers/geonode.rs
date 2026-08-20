@@ -29,7 +29,7 @@ impl ProxyProvider for GeonodeProvider {
                     Source::all(&url).map(|source| {
                         source
                             .with_mode(ScrapeMode::GeonodeJson)
-                            .with_timeout(Duration::from_secs(20))
+                            .with_timeout(Duration::from_secs(8))
                     })
                 })
                 .collect(),

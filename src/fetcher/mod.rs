@@ -22,7 +22,10 @@ use hashbrown::HashSet;
 use http_body_util::Empty;
 use hyper::body::Bytes;
 use hyper_tls::HttpsConnector;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::TokioExecutor,
+};
 pub use phase::FetchStage;
 #[cfg(test)]
 use phase::{do_work, source_host, FetchJob};
@@ -152,9 +155,18 @@ impl ProxyFetcher {
             fallback.len(),
         );
 
-        let client = Arc::new(
-            Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new()),
-        );
+        let client = {
+            let mut http = HttpConnector::new();
+            // Dead hosts hang on TCP connect far longer than the per-source
+            // deadline would wait; cap the connect phase so blocked providers
+            // fail in seconds instead of burning their full fetch timeout.
+            http.set_connect_timeout(Some(Duration::from_secs(6)));
+            http.enforce_http(false);
+            Arc::new(
+                Client::builder(TokioExecutor::new())
+                    .build::<_, Empty<Bytes>>(HttpsConnector::new_with_connector(http)),
+            )
+        };
         let concurrency_limit = config.concurrency_limit;
         let fallback_threshold = config.fallback_threshold;
         let fallback_phase_timeout = config.fallback_phase_timeout;

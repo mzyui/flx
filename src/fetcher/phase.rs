@@ -76,7 +76,7 @@ pub(crate) fn spawn_phase(
             let url = job.source.url.to_string();
             if let Err(e) = do_work(job, ctx).await {
                 #[cfg(feature = "log")]
-                log::error!("{}: {}", url, e);
+                log::error!("{}: {:#}", url, e);
                 let _ = (url, e);
             }
         });

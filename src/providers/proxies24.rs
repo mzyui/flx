@@ -21,7 +21,7 @@ impl ProxyProvider for Proxies24Provider {
                     Source::all(url).map(|source| {
                         source
                             .with_mode(ScrapeMode::HtmlTable)
-                            .with_timeout(Duration::from_secs(15))
+                            .with_timeout(Duration::from_secs(10))
                     })
                 })
                 .collect(),
