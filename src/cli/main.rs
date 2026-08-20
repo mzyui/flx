@@ -394,8 +394,9 @@ async fn run_grab(
     // The grab bar clashes with the proxies streamed to stdout, so only show it
     // when output is redirected (a file via `-o` or a piped stdout).
     let show_bar = !quiet && (grab.output.output_file.is_some() || stdout_is_pipe());
+    let (gather_tx, gather_rx) = tokio::sync::watch::channel(0usize);
     let warmup = if show_bar {
-        make_warmup(quiet, no_color, download, show_bar)
+        make_warmup(quiet, no_color, download, show_bar, Some(gather_rx))
     } else {
         None
     };
@@ -421,6 +422,20 @@ async fn run_grab(
     if let Some(bar) = &warmup {
         bar.set_phase("Fetching proxy lists …");
     }
+    // Repaint the bar on a fixed cadence so the gathered count stays live even
+    // while the source stream is quiet.
+    let ticker = warmup.as_ref().map(|bar| {
+        let bar = Arc::clone(bar);
+        let accepted = Arc::clone(&accepted);
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        tokio::spawn(async move {
+            loop {
+                interval.tick().await;
+                let _ = gather_tx.send_replace(accepted.load(std::sync::atomic::Ordering::Relaxed));
+                bar.refresh();
+            }
+        })
+    });
     let watcher = match (&warmup, stages) {
         (Some(bar), Some(mut rx)) => {
             let bar = Arc::clone(bar);
@@ -453,6 +468,10 @@ async fn run_grab(
     let outcome =
         process_result(fetcher, grab.output, cancel, guard, FinalizeOpts::default()).await;
     if let Some(task) = watcher {
+        task.abort();
+        let _ = task.await;
+    }
+    if let Some(task) = ticker {
         task.abort();
         let _ = task.await;
     }
@@ -494,7 +513,7 @@ async fn run_find(
     // Candidates are recorded while pass 1 streams so the fallback pass can
     // re-validate the same set without re-fetching.
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
-    let warmup = make_warmup(quiet, no_color, download, false);
+    let warmup = make_warmup(quiet, no_color, download, false, None);
     let config = validator_config(&find.validator, protocols.clone(), groups.clone(), false);
 
     let mut pass1 = if !find.validator.files.is_empty() {
@@ -853,7 +872,7 @@ async fn run_geo_update(
     no_color: bool,
     cancel: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<RunOutcome> {
-    let warmup = make_warmup(quiet, no_color, download, false);
+    let warmup = make_warmup(quiet, no_color, download, false, None);
     if let Some(bar) = &warmup {
         bar.set_phase("Syncing GeoLite2 databases …");
     }

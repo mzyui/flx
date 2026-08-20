@@ -225,6 +225,8 @@ pub struct WarmupBar {
 struct WarmupFrame {
     phase: Arc<Mutex<&'static str>>,
     download: watch::Receiver<Option<DownloadProgress>>,
+    gathered: Option<watch::Receiver<usize>>,
+    started: Instant,
     color: bool,
 }
 
@@ -238,6 +240,21 @@ impl Display for WarmupFrame {
                 let mb = dl.downloaded as f64 / (1024.0 * 1024.0);
                 format!("Fetching {} … {mb:.1} MB", dl.name)
             };
+            if self.color {
+                text.bold().cyan().to_string()
+            } else {
+                text
+            }
+        } else if let Some(gathered) = &self.gathered {
+            let n = *gathered.borrow();
+            let elapsed = self.started.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                n as f64 / elapsed
+            } else {
+                0.0
+            };
+            let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
+            let text = format!("{phase} Gathered {n} proxies ({rate:.0}/s)");
             if self.color {
                 text.bold().cyan().to_string()
             } else {
@@ -262,6 +279,7 @@ impl WarmupBar {
         stdout_is_pipe: bool,
         allow_piped: bool,
         download: watch::Receiver<Option<DownloadProgress>>,
+        gathered: Option<watch::Receiver<usize>>,
     ) -> Option<Self> {
         use std::io::IsTerminal as _;
 
@@ -277,6 +295,8 @@ impl WarmupBar {
         let frame = WarmupFrame {
             phase: Arc::clone(&phase),
             download,
+            gathered,
+            started: Instant::now(),
             color: use_color(no_color),
         };
         let status = StatusLine::with_options(frame, status_line::Options::default());
@@ -285,6 +305,10 @@ impl WarmupBar {
 
     pub fn set_phase(&self, phase: &'static str) {
         *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase;
+    }
+
+    pub fn refresh(&self) {
+        self.status.refresh();
     }
 }
 
@@ -303,6 +327,7 @@ mod tests {
     use super::{fit_terminal, show_progress, use_color, visible_len, Frame, WarmupFrame};
     use flx::{DownloadProgress, ValidationProgress};
     use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
     use tokio::sync::watch;
 
     // `colored`'s color decision is a process-global override, so the tests
@@ -321,14 +346,25 @@ mod tests {
         result
     }
 
+    fn frame(
+        phase: &'static str,
+        download: watch::Receiver<Option<DownloadProgress>>,
+        gathered: Option<watch::Receiver<usize>>,
+        color: bool,
+    ) -> WarmupFrame {
+        WarmupFrame {
+            phase: Arc::new(Mutex::new(phase)),
+            download,
+            gathered,
+            started: Instant::now() - Duration::from_secs(4),
+            color,
+        }
+    }
+
     #[test]
     fn warmup_frame_renders_current_phase() {
         let (_, download) = watch::channel(None);
-        let frame = WarmupFrame {
-            phase: Arc::new(Mutex::new("Fetching primary sources …")),
-            download,
-            color: false,
-        };
+        let frame = frame("Fetching primary sources …", download, None, false);
         assert!(frame.to_string().contains("Fetching primary sources"));
     }
 
@@ -340,11 +376,7 @@ mod tests {
             downloaded: 400,
             total: 1000,
         }));
-        let frame = WarmupFrame {
-            phase: Arc::new(Mutex::new("Fetching proxy lists …")),
-            download,
-            color: false,
-        };
+        let frame = frame("Fetching proxy lists …", download, None, false);
         let rendered = frame.to_string();
         assert!(rendered.contains("GeoLite2-City.mmdb"));
         assert!(rendered.contains("40.00%"));
@@ -358,14 +390,50 @@ mod tests {
             downloaded: 400,
             total: 1000,
         }));
-        let frame = WarmupFrame {
-            phase: Arc::new(Mutex::new("Fetching primary sources …")),
-            download,
-            color: true,
-        };
+        let frame = frame("Fetching primary sources …", download, None, true);
         let rendered = with_color(|| frame.to_string());
         assert!(rendered.contains("\x1b[1;36mFetching GeoLite2-City.mmdb"));
         assert!(rendered.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn warmup_frame_renders_gathered_count_and_rate() {
+        let (_, download) = watch::channel(None);
+        let (tx, gathered) = watch::channel(0usize);
+        tx.send_replace(12);
+        let frame = frame(
+            "Fetching primary sources …",
+            download,
+            Some(gathered),
+            false,
+        );
+
+        let rendered = frame.to_string();
+        assert!(rendered.contains("Fetching primary sources"));
+        assert!(rendered.contains("Gathered 12 proxies"));
+        assert!(rendered.contains("(3/s)"));
+    }
+
+    #[test]
+    fn warmup_frame_download_line_wins_over_gathered() {
+        let (dl_tx, download) = watch::channel(None);
+        dl_tx.send_replace(Some(DownloadProgress {
+            name: "GeoLite2-City.mmdb",
+            downloaded: 400,
+            total: 1000,
+        }));
+        let (gather_tx, gathered) = watch::channel(0usize);
+        gather_tx.send_replace(12);
+        let frame = frame(
+            "Fetching primary sources …",
+            download,
+            Some(gathered),
+            false,
+        );
+
+        let rendered = frame.to_string();
+        assert!(rendered.contains("GeoLite2-City.mmdb"));
+        assert!(!rendered.contains("Gathered"));
     }
 
     #[test]

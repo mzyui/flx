@@ -87,6 +87,7 @@ pub fn make_warmup(
     no_color: bool,
     download: &watch::Receiver<Option<DownloadProgress>>,
     allow_piped: bool,
+    gathered: Option<watch::Receiver<usize>>,
 ) -> Option<Arc<progress::WarmupBar>> {
     progress::WarmupBar::new(
         quiet,
@@ -94,6 +95,7 @@ pub fn make_warmup(
         stdout_is_pipe(),
         allow_piped,
         download.clone(),
+        gathered,
     )
     .map(Arc::new)
 }
@@ -104,6 +106,7 @@ pub fn make_warmup(
     _no_color: bool,
     _download: &watch::Receiver<Option<DownloadProgress>>,
     _allow_piped: bool,
+    _gathered: Option<watch::Receiver<usize>>,
 ) -> Option<Arc<WarmupBar>> {
     None
 }
