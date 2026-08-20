@@ -23,6 +23,8 @@ pub enum ScrapeMode {
     HtmlTable,
     RegexPairs,
     Base64Rows,
+    JsonStringArray,
+    GatherProxyJs,
 }
 
 /// Priority tier of a proxy provider.

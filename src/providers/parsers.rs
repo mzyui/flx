@@ -170,6 +170,10 @@ static RE_IP_PORT_PAIR: LazyLock<Regex> =
 static RE_PROXY_CALL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Proxy\('([A-Za-z0-9+/=]+)'\)").unwrap());
 
+static RE_GATHERPROXY_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""ip"\s*:\s*"((?:\d{1,3}\.){3}\d{1,3})"\s*,\s*"port"\s*:\s*"(\d{1,5})""#).unwrap()
+});
+
 static TABLE_SELECTOR: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("table").expect("static table selector is valid"));
 static ROW_SELECTOR: LazyLock<Selector> =
@@ -366,6 +370,20 @@ fn find_column(by_text: &HashMap<&str, usize>, lower: &[String], names: &[&str])
         .position(|cell| names.iter().any(|name| cell.contains(name)))
 }
 
+/// Parses a port cell, falling back to its last whitespace token when the
+/// full text fails (proxydb hides a numeric prefix in a `display:none` div).
+fn parse_port(text: &str) -> Result<u16, std::num::ParseIntError> {
+    let trimmed = text.trim();
+    match trimmed.parse::<u16>() {
+        Ok(port) => Ok(port),
+        Err(error) => trimmed
+            .split_whitespace()
+            .last()
+            .and_then(|token| token.trim().parse::<u16>().ok())
+            .ok_or(error),
+    }
+}
+
 fn is_simple_text(text: &str) -> bool {
     let mut previous_space = false;
     for ch in text.chars() {
@@ -461,10 +479,8 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
             else {
                 continue;
             };
-            let (Ok(ip), Ok(port)) = (
-                ip_cell.trim().parse::<Ipv4Addr>(),
-                port_cell.trim().parse::<u16>(),
-            ) else {
+            let (Ok(ip), Ok(port)) = (ip_cell.trim().parse::<Ipv4Addr>(), parse_port(port_cell))
+            else {
                 continue;
             };
 
@@ -507,6 +523,65 @@ pub fn visit_base64_rows(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool)
         let decoded = BASE64.decode(caps.get(1)?.as_str()).ok()?;
         let text = String::from_utf8(decoded).ok()?;
         let (ip, port) = parse_pair(&text)?;
+        Some((ip, port, None))
+    }) {
+        if !visit(row) {
+            break;
+        }
+    }
+}
+
+pub fn visit_json_strings(
+    body: &str,
+    mut visit: impl FnMut(ParsedProxy) -> bool,
+) -> anyhow::Result<()> {
+    let stopped = Cell::new(false);
+
+    struct RowsVisitor<'a> {
+        visit: &'a mut dyn FnMut(ParsedProxy) -> bool,
+        stopped: &'a Cell<bool>,
+    }
+
+    impl<'de> Visitor<'de> for RowsVisitor<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON array of proxy strings")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while let Some(row) = seq.next_element::<String>()? {
+                let Some((ip, port)) = parse_pair(&row) else {
+                    continue;
+                };
+                if !(self.visit)((ip, port, None)) {
+                    self.stopped.set(true);
+                    return Err(A::Error::custom(VISITOR_STOPPED));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let result = deserializer.deserialize_seq(RowsVisitor {
+        visit: &mut visit,
+        stopped: &stopped,
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(_error) if stopped.get() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn visit_gatherproxy(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
+    for row in RE_GATHERPROXY_ROW.captures_iter(body).filter_map(|caps| {
+        let ip = caps.get(1)?.as_str().parse::<Ipv4Addr>().ok()?;
+        let port = caps.get(2)?.as_str().parse::<u16>().ok()?;
         Some((ip, port, None))
     }) {
         if !visit(row) {
@@ -563,6 +638,21 @@ fn parse_regex_pairs(body: &str) -> Vec<ParsedProxy> {
 #[cfg(test)]
 fn parse_base64_rows(body: &str) -> Vec<ParsedProxy> {
     collect_rows(|visit| visit_base64_rows(body, visit))
+}
+
+#[cfg(test)]
+fn parse_json_strings(body: &str) -> anyhow::Result<Vec<ParsedProxy>> {
+    let mut rows = Vec::new();
+    visit_json_strings(body, |row| {
+        rows.push(row);
+        true
+    })?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+fn parse_gatherproxy(body: &str) -> Vec<ParsedProxy> {
+    collect_rows(|visit| visit_gatherproxy(body, visit))
 }
 
 #[cfg(test)]
@@ -700,5 +790,61 @@ mod tests {
     fn regex_pairs_extract_from_free_form_html() {
         let body = "<div>1.2.3.4:8080#US</div><div>5.6.7.8:3128#DE</div>";
         assert_eq!(parse_regex_pairs(body).len(), 2);
+    }
+
+    #[test]
+    fn json_string_array_parses_bare_and_prefixed_rows() {
+        let body = r#"["1.2.3.4:8080","http://5.6.7.8:3128","garbage","9.10.11.12:1080"]"#;
+        let parsed = parse_json_strings(body).unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|(ip, port, _)| (ip.to_string(), *port))
+                .collect::<Vec<_>>(),
+            vec![
+                ("1.2.3.4".into(), 8080),
+                ("5.6.7.8".into(), 3128),
+                ("9.10.11.12".into(), 1080),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_string_array_stops_deserializing_after_visitor_closes() {
+        let body = r#"["1.2.3.4:8080",INVALID]"#;
+        let mut visited = 0;
+
+        visit_json_strings(body, |_| {
+            visited += 1;
+            false
+        })
+        .unwrap();
+
+        assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn gatherproxy_js_extracts_ip_port_pairs() {
+        let body = r#"<script>gp.insertPrx({"t": "HTTP", "ip": "1.2.3.4", "port": "8080", "country": "US"});</script>
+            <script>gp.insertPrx({"ip": "5.6.7.8","port":"3128","type":"HTTPS"});</script>
+            <script>gp.insertPrx({"ip": "not-an-ip","port":"99999"});</script>"#;
+        let parsed = parse_gatherproxy(body);
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|(ip, port, _)| (ip.to_string(), *port))
+                .collect::<Vec<_>>(),
+            vec![("1.2.3.4".into(), 8080), ("5.6.7.8".into(), 3128)]
+        );
+    }
+
+    #[test]
+    fn html_table_port_cell_falls_back_to_last_token() {
+        let body = r#"<table><tr><th>IP</th><th>Port</th></tr>
+            <tr><td>1.2.3.4</td><td><div style="display:none">12</div>80</td></tr></table>"#;
+        let parsed = parse_html_table(body);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.to_string(), "1.2.3.4");
+        assert_eq!(parsed[0].1, 80);
     }
 }

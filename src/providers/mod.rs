@@ -19,27 +19,43 @@ const MAX_REDIRECTS: usize = 10;
 
 use crate::proxy::models::{Protocol, Proxy};
 
+mod free_proxy_cz;
 mod free_proxy_list;
 mod freeproxy_world;
+mod gatherproxy;
 mod geonode;
 mod github;
+mod hide_my_name;
+mod hproxy;
 pub mod models;
 mod my_proxy;
 mod openproxylist;
 pub mod parsers;
+mod proxies24;
+mod proxy_db;
+mod proxy_list_download;
 mod proxylist_org;
 mod proxynova;
 mod proxyscrape;
+mod spys_one;
 
+pub use free_proxy_cz::FreeProxyCzProvider;
 pub use free_proxy_list::FreeProxyListProvider;
 pub use freeproxy_world::FreeProxyWorldProvider;
+pub use gatherproxy::GatherProxyProvider;
 pub use geonode::GeonodeProvider;
 pub use github::GithubRepoProvider;
+pub use hide_my_name::HideMyNameProvider;
+pub use hproxy::HProxyProvider;
 pub use my_proxy::MyProxyProvider;
 pub use openproxylist::OpenProxyListProvider;
+pub use proxies24::Proxies24Provider;
+pub use proxy_db::ProxyDbProvider;
+pub use proxy_list_download::ProxyListDownloadProvider;
 pub use proxylist_org::ProxyListOrgProvider;
 pub use proxynova::ProxyNovaProvider;
 pub use proxyscrape::ProxyscrapeProvider;
+pub use spys_one::SpysOneProvider;
 
 pub use models::ProviderTier;
 
@@ -54,6 +70,14 @@ pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
         std::sync::Arc::new(ProxyListOrgProvider),
         std::sync::Arc::new(MyProxyProvider),
         std::sync::Arc::new(ProxyNovaProvider),
+        std::sync::Arc::new(HProxyProvider),
+        std::sync::Arc::new(ProxyListDownloadProvider),
+        std::sync::Arc::new(ProxyDbProvider),
+        std::sync::Arc::new(HideMyNameProvider),
+        std::sync::Arc::new(SpysOneProvider),
+        std::sync::Arc::new(FreeProxyCzProvider),
+        std::sync::Arc::new(Proxies24Provider),
+        std::sync::Arc::new(GatherProxyProvider),
         // Fallback: aggregated GitHub mirrors.
         std::sync::Arc::new(GithubRepoProvider),
     ]
@@ -241,6 +265,8 @@ pub trait ProxyProvider {
                 ScrapeMode::HtmlTable => parsers::visit_html_table(&body, &mut forward),
                 ScrapeMode::RegexPairs => parsers::visit_regex_pairs(&body, &mut forward),
                 ScrapeMode::Base64Rows => parsers::visit_base64_rows(&body, &mut forward),
+                ScrapeMode::JsonStringArray => parsers::visit_json_strings(&body, &mut forward)?,
+                ScrapeMode::GatherProxyJs => parsers::visit_gatherproxy(&body, &mut forward),
             }
             Ok::<(), anyhow::Error>(())
         })
@@ -266,6 +292,8 @@ pub(crate) fn parse_all(
         ScrapeMode::HtmlTable => parsers::visit_html_table(body, &mut collect),
         ScrapeMode::RegexPairs => parsers::visit_regex_pairs(body, &mut collect),
         ScrapeMode::Base64Rows => parsers::visit_base64_rows(body, &mut collect),
+        ScrapeMode::JsonStringArray => parsers::visit_json_strings(body, &mut collect)?,
+        ScrapeMode::GatherProxyJs => parsers::visit_gatherproxy(body, &mut collect),
     }
     Ok(rows)
 }
@@ -649,5 +677,22 @@ mod tests {
             provider.sources()[0].url.to_string(),
             "http://127.0.0.1:9999/list"
         );
+    }
+
+    #[test]
+    fn all_providers_includes_new_sources() {
+        let names = provider_names(&super::all_providers());
+        for name in [
+            "hproxy",
+            "proxy-list-download",
+            "proxydb",
+            "hidemy.name",
+            "spys.one",
+            "free-proxy.cz",
+            "proxies24",
+            "gatherproxy",
+        ] {
+            assert!(names.contains(&name), "missing provider {name}");
+        }
     }
 }
