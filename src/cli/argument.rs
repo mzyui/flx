@@ -257,6 +257,10 @@ pub struct FetcherArgs {
     #[arg(long, help_heading = "Fetching")]
     pub dry_run: bool,
 
+    /// List the available proxy providers and their sources, then exit.
+    #[arg(long, help_heading = "Fetching")]
+    pub list_providers: bool,
+
     /// Maximum number of proxy sources fetched concurrently.
     #[arg(long, default_value_t = 25, help_heading = "Fetching")]
     pub fetch_concurrency: usize,

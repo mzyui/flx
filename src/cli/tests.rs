@@ -296,6 +296,12 @@ fn dry_run_flag_is_accepted() {
 }
 
 #[test]
+fn list_providers_flag_is_accepted() {
+    assert!(fetch_from(&["--list-providers"]).fetcher.list_providers);
+    assert!(!fetch_from(&[]).fetcher.list_providers);
+}
+
+#[test]
 fn validation_filter_flags_are_accepted() {
     let args = find_from(&[
         "--min-anonymity",

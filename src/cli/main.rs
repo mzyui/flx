@@ -386,7 +386,7 @@ async fn run_grab(
     download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
     cancel: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<RunOutcome> {
-    if grab.fetcher.dry_run {
+    if grab.fetcher.dry_run || grab.fetcher.list_providers {
         list_sources();
         return Ok(RunOutcome::Finished);
     }
@@ -480,7 +480,7 @@ async fn run_find(
     download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
     cancel: Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<RunOutcome> {
-    if find.fetcher.dry_run {
+    if find.fetcher.dry_run || find.fetcher.list_providers {
         list_sources();
         return Ok(RunOutcome::Finished);
     }
