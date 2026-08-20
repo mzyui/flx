@@ -57,7 +57,7 @@ impl TypedValueParser for TypesValueParser {
     name = "flx",
     version,
     about = "Proxy scraper and validator",
-    after_help = "Suggestions and bug reports: https://github.com/zevtyardt/flx/issues"
+    after_help = "Suggestions and bug reports: https://github.com/mzyui/flx/issues"
 )]
 pub struct Cli {
     #[command(subcommand)]
