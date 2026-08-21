@@ -1,2 +1,0 @@
-{"version": 2, "width": 80, "height": 24, "timestamp": 1787290602, "env": {"SHELL": "/usr/bin/fish", "TERM": "xterm-256color"}}
-[0.0137, "o", "$ flx find --max-response-time 5 -s response-time --order desc -l 2\r\n"]

@@ -1,2 +1,0 @@
-{"version": 2, "width": 80, "height": 24, "timestamp": 1787290684, "env": {"SHELL": "/usr/bin/fish", "TERM": "xterm-256color"}}
-[0.013091, "o", "$ flx find --ip-type residential --with-ip-type -l 2\r\n"]
