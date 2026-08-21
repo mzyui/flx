@@ -18,6 +18,8 @@ Live recording of a real run against the built-in providers.
 
 ## Scrape
 
+![scrape demo](assets/scrape.gif)
+
 Scrape without validating, or render the results straight to a file. `-o` infers the format from the file extension.
 
 ```bash
@@ -26,6 +28,8 @@ flx grab -f json -o proxies.json
 ```
 
 ## Validate
+
+![validate demo](assets/validate.gif)
 
 Validate proxies scraped from the providers, read from a file, or piped in from stdin (`--files`, `-` reads stdin). Plain `flx find` defaults to HTTP checks.
 
@@ -37,6 +41,8 @@ cat list.txt | flx find -f -
 
 ## Protocol types
 
+![protocols demo](assets/protocols.gif)
+
 Pick the types to validate: HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT:80, CONNECT:25. Combine types with `+` and annotate anonymity with a colon (HTTP:Elite).
 
 ```bash
@@ -45,6 +51,8 @@ flx find HTTP+HTTPS HTTP:Elite
 ```
 
 ## Output formats
+
+![formats demo](assets/formats.gif)
 
 Nine formats: `text`, `json`, `json-lines`, `pretty-json`, `csv`, `prefix`, `pac`, `proxychains`, and the human-readable default.
 
@@ -57,6 +65,8 @@ flx find -l 5 -f pac -o proxy.pac
 
 ## Filters and sorting
 
+![filters demo](assets/filters.gif)
+
 Keep only the proxies that fit: minimum anonymity, response-time windows, excluded types, or a sort order.
 
 ```bash
@@ -66,6 +76,8 @@ flx find -s response-time --order desc --shuffle
 ```
 
 ## GeoIP and IP type
+
+![geoip demo](assets/geoip.gif)
 
 `-c` filters by country and `-g` annotates without filtering; `geo-update` refreshes the GeoLite2 database. Classify endpoints as residential, datacenter, or mobile.
 
@@ -77,6 +89,8 @@ flx find --ip-type residential --with-ip-type
 
 ## Providers and cache
 
+![providers demo](assets/providers.gif)
+
 Choose or skip providers, add your own plaintext source, or run entirely from the local cache.
 
 ```bash
@@ -87,6 +101,8 @@ flx find --offline --cache-ttl 30 --refresh-cache
 ```
 
 ## Tuning and strict checks
+
+![tuning demo](assets/tuning.gif)
 
 Tune the validation throughput, require cookie/referer forwarding, disable TLS verification, and log every failure to a JSON-lines report.
 
