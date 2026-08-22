@@ -40,6 +40,18 @@ fn validator_channel_capacity(concurrency_limit: usize) -> usize {
         .clamp(VALIDATOR_CHANNEL_MIN, VALIDATOR_CHANNEL_MAX)
 }
 
+struct BufferedProxyStream {
+    rx: mpsc::Receiver<Proxy>,
+}
+
+impl Stream for BufferedProxyStream {
+    type Item = Proxy;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().rx.poll_recv(cx)
+    }
+}
+
 fn report_dropped(url: &str, reason: &str) {
     #[cfg(feature = "log")]
     log::warn!("warning: judge `{url}` failed preflight and was dropped: {reason}");
@@ -218,6 +230,23 @@ impl ProxyValidator {
             .iter()
             .chain(groups.iter().flatten())
             .any(|protocol| !matches!(protocol, Protocol::Http(_)));
+
+        // Buffer the proxy source while judge preflights run so the fetcher
+        // never stalls on a full channel. The buffer drains into the manager
+        // stream as soon as preflights complete, preserving backpressure after.
+        let (buf_tx, buf_rx) = mpsc::channel(validator_channel_capacity(concurrency_limit));
+        let proxy_source: Pin<Box<dyn Stream<Item = Proxy> + Send>> = {
+            let mut src: Pin<Box<dyn Stream<Item = Proxy> + Send>> = Box::pin(proxy_source);
+            let tx = buf_tx;
+            tokio::spawn(async move {
+                while let Some(proxy) = src.next().await {
+                    if tx.send(proxy).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Box::pin(BufferedProxyStream { rx: buf_rx })
+        };
 
         let http_preflight = async {
             if !need_http {
