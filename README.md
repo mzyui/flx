@@ -2,7 +2,6 @@
   <img src="https://socialify.git.ci/mzyui/flx/image?description=1&font=Source+Code+Pro&forks=1&issues=1&language=1&name=1&owner=1&pattern=Plus&pulls=1&stargazers=1&theme=Auto"></img>
 </div>
 
-Flx is a Rust proxy scraper and validator. It pulls candidates from 17 sources (16 primary sites plus a GitHub mirror fallback), verifies them against online judges that must echo a unique token, and lets you filter the results by protocol, anonymity, country, IP type, and response time before exporting them in one of nine formats.
 
 ## Install
 
@@ -12,9 +11,7 @@ cargo install --git https://github.com/mzyui/flx
 
 ## Demo
 
-Live recording of a real run against the built-in providers.
-
-![flx demo](assets/demo.gif)
+![demo](https://vhs.charm.sh/vhs-3tm46j5tEl6LYWePbsAuOw.gif)
 
 ## Scrape
 
