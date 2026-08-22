@@ -20,6 +20,9 @@ target/
 .claude/
 .opencode
 
+# local documentation, never committed
+docs/
+
 # local agent instructions, never committed
 AGENTS.md
 
