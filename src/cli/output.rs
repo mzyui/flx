@@ -119,6 +119,19 @@ fn proxychains_type(proxy: &Proxy) -> &'static str {
     "http"
 }
 
+/// Maps a proxy's best protocol to the URI scheme used by the `prefix`
+/// format, with the same SOCKS-over-HTTP preference as `proxychains_type`.
+fn prefix_scheme(proxy: &Proxy) -> &'static str {
+    for pt in &proxy.proxy_types {
+        match pt.protocol {
+            Protocol::Socks5 => return "socks5",
+            Protocol::Socks4 => return "socks4",
+            _ => {}
+        }
+    }
+    "http"
+}
+
 /// Renders a PAC `FindProxyForURL` function from a list of proxies.
 fn render_pac(proxies: &[Proxy]) -> String {
     let mut out = String::from("function FindProxyForURL(url, host) {\n    return \"");
@@ -342,7 +355,14 @@ where
                         buf.push(b'\n');
                     }
                     "prefix" => {
-                        write!(&mut buf, "socks5://{}:{}", proxy.ip, proxy.port).unwrap();
+                        write!(
+                            &mut buf,
+                            "{}://{}:{}",
+                            prefix_scheme(&proxy),
+                            proxy.ip,
+                            proxy.port
+                        )
+                        .unwrap();
                         buf.push(b'\n');
                     }
                      _ => writeln!(&mut buf, "{}", proxy).expect("writing to a Vec cannot fail"),

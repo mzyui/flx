@@ -1177,20 +1177,38 @@ fn proxychains_falls_back_to_http_for_http_proxy() {
 }
 
 #[test]
-fn prefix_renders_socks5_url() {
-    let proxy = sample_proxy(3);
+fn prefix_defaults_to_http_scheme_without_types() {
+    // A bare proxy carries no validated type; the URI must not claim SOCKS.
+    let out = run_prefix(&[sample_proxy(3)], 0);
+    assert_eq!(out, "http://192.168.0.3:8083\n");
+}
+
+#[test]
+fn prefix_renders_socks5_url_for_socks5_proxy() {
+    let mut proxy = sample_proxy(3);
+    proxy
+        .proxy_types
+        .push(flx::proxy::models::ProxyType::checked(Protocol::Socks5));
     let out = run_prefix(&[proxy], 0);
     assert_eq!(out, "socks5://192.168.0.3:8083\n");
 }
 
 #[test]
-fn prefix_multiple_proxies() {
-    let proxies: Vec<_> = (1..=3).map(sample_proxy).collect();
-    let out = run_prefix(&proxies, 0);
+fn prefix_multiple_proxies_match_each_type() {
+    let mut socks4 = sample_proxy(2);
+    socks4
+        .proxy_types
+        .push(flx::proxy::models::ProxyType::checked(Protocol::Socks4));
+    let mut socks5 = sample_proxy(3);
+    socks5
+        .proxy_types
+        .push(flx::proxy::models::ProxyType::checked(Protocol::Socks5));
+
+    let out = run_prefix(&[sample_proxy(1), socks4, socks5], 0);
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0], "socks5://192.168.0.1:8081");
-    assert_eq!(lines[1], "socks5://192.168.0.2:8082");
+    assert_eq!(lines[0], "http://192.168.0.1:8081");
+    assert_eq!(lines[1], "socks4://192.168.0.2:8082");
     assert_eq!(lines[2], "socks5://192.168.0.3:8083");
 }
 
