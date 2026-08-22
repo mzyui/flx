@@ -2,11 +2,29 @@
   <img src="https://socialify.git.ci/mzyui/flx/image?description=1&font=Source+Code+Pro&forks=1&issues=1&language=1&name=1&owner=1&pattern=Plus&pulls=1&stargazers=1&theme=Auto"></img>
 </div>
 
+flx is a fast proxy scraper & validator written in Rust. It collects free proxies from 13 sources, validates them against online judges (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT), filters by anonymity / country / IP type / response time, and exports in 9 formats. It ships as both a CLI (`flx`) and a Rust library.
+
+## Features
+
+- **Scrape** from 12 primary providers + GitHub raw mirrors, or plug in your own plaintext source
+- **Validate** with end-to-end deadlines over hand-rolled hyper + native-tls networking — anti-replay judge tokens keep fake judges out
+- **Filter & sort** by protocol, anonymity level, country, IP type (residential / datacenter / mobile), and response time
+- **GeoIP** via GeoLite2 City + ASN, with a one-command database sync
+- **9 output formats** including JSON, CSV, PAC, and proxychains config
+- **Streaming-first pipeline** with backpressure, atomic parse cache, and graceful Ctrl+C finalization
 
 ## Install
 
 ```bash
 cargo install --git https://github.com/mzyui/flx
+```
+
+Or build from source (requires `pkg-config` and `libssl-dev`):
+
+```bash
+git clone https://github.com/mzyui/flx
+cd flx
+cargo install --path .
 ```
 
 ## Demo
@@ -92,3 +110,47 @@ flx find -m 1000 --timeout 5 --max-attempts 3
 flx find --support-cookies --support-referer --no-verify-tls
 flx find --report-failures failures.jsonl
 ```
+
+## Library usage
+
+flx is also a library. The `Flx` builder mirrors the CLI defaults:
+
+```rust
+use flx::{Anonymity, Flx, Protocol};
+
+let proxies = Flx::fetch()
+    .types([Protocol::Http(Anonymity::Elite)])
+    .countries(["US", "DE"])
+    .limit(20)
+    .collect()
+    .await?;
+```
+
+More examples live in [`examples/`](examples/): plain fetching, fetch + validate, and validating a file.
+
+## Development
+
+Requires a Rust toolchain (edition 2021) plus `pkg-config` and `libssl-dev` for native-tls.
+
+```bash
+cargo build                              # build library + binary
+cargo test                               # run the test suite (~283 tests)
+cargo clippy --all-targets --all-features
+cargo fmt
+cargo bench                              # criterion benchmarks (parsers, proxy)
+```
+
+## Contributing
+
+PRs and issue reports are welcome. Before submitting a PR, make sure:
+
+- `cargo test` passes (the suite needs `pkg-config` and `libssl-dev`)
+- `cargo clippy --all-targets --all-features` is warning-free
+- `cargo fmt --check` is clean
+
+A few conventions to keep in mind: name constants instead of magic numbers, keep per-source/per-proxy failures non-fatal (log and continue), compile regexes/selectors once in statics, and add offline tests (`TcpListener` on port 0, no external network) for any new or changed behavior.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
