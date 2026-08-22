@@ -19,10 +19,8 @@ const MAX_REDIRECTS: usize = 10;
 
 use crate::proxy::models::{Protocol, Proxy};
 
-mod free_proxy_cz;
 mod free_proxy_list;
 mod freeproxy_world;
-mod gatherproxy;
 mod geonode;
 mod github;
 mod hide_my_name;
@@ -31,27 +29,21 @@ pub mod models;
 mod my_proxy;
 mod openproxylist;
 pub mod parsers;
-mod proxies24;
 mod proxy_db;
-mod proxy_list_download;
 mod proxylist_org;
 mod proxynova;
 mod proxyscrape;
 mod spys_one;
 
-pub use free_proxy_cz::FreeProxyCzProvider;
 pub use free_proxy_list::FreeProxyListProvider;
 pub use freeproxy_world::FreeProxyWorldProvider;
-pub use gatherproxy::GatherProxyProvider;
 pub use geonode::GeonodeProvider;
 pub use github::GithubRepoProvider;
 pub use hide_my_name::HideMyNameProvider;
 pub use hproxy::HProxyProvider;
 pub use my_proxy::MyProxyProvider;
 pub use openproxylist::OpenProxyListProvider;
-pub use proxies24::Proxies24Provider;
 pub use proxy_db::ProxyDbProvider;
-pub use proxy_list_download::ProxyListDownloadProvider;
 pub use proxylist_org::ProxyListOrgProvider;
 pub use proxynova::ProxyNovaProvider;
 pub use proxyscrape::ProxyscrapeProvider;
@@ -71,13 +63,9 @@ pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
         std::sync::Arc::new(MyProxyProvider),
         std::sync::Arc::new(ProxyNovaProvider),
         std::sync::Arc::new(HProxyProvider),
-        std::sync::Arc::new(ProxyListDownloadProvider),
         std::sync::Arc::new(ProxyDbProvider),
         std::sync::Arc::new(HideMyNameProvider),
         std::sync::Arc::new(SpysOneProvider),
-        std::sync::Arc::new(FreeProxyCzProvider),
-        std::sync::Arc::new(Proxies24Provider),
-        std::sync::Arc::new(GatherProxyProvider),
         // Fallback: aggregated GitHub mirrors.
         std::sync::Arc::new(GithubRepoProvider),
     ]
@@ -190,6 +178,11 @@ pub trait ProxyProvider {
                     urls.push_back((redirect, Some(url)));
                     continue;
                 }
+            }
+
+            let status = response.status();
+            if !status.is_success() {
+                anyhow::bail!("{} returned HTTP {}", url, status);
             }
 
             // Read the response frames, bounded by the same deadline as the
@@ -406,6 +399,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(body, "A€B");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_non_success_status_instead_of_parsing_error_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/broken");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 16\r\nConnection: close\r\n\r\nerror code: 502",
+                )
+                .await
+                .unwrap();
+        });
+
+        let error = TestProvider
+            .fetch(test_client(), &url, Duration::from_secs(1))
+            .await
+            .expect_err("non-success status must fail the fetch");
+
+        assert!(
+            error.to_string().contains("returned HTTP 502 Bad Gateway"),
+            "unexpected error: {error:#}"
+        );
         server.await.unwrap();
     }
 
@@ -682,16 +703,7 @@ mod tests {
     #[test]
     fn all_providers_includes_new_sources() {
         let names = provider_names(&super::all_providers());
-        for name in [
-            "hproxy",
-            "proxy-list-download",
-            "proxydb",
-            "hidemy.name",
-            "spys.one",
-            "free-proxy.cz",
-            "proxies24",
-            "gatherproxy",
-        ] {
+        for name in ["hproxy", "proxydb", "hidemy.name", "spys.one"] {
             assert!(names.contains(&name), "missing provider {name}");
         }
     }

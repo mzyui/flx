@@ -249,6 +249,7 @@ pub trait ProxyClient {
                 .send_request(req)
                 .await
                 .context("failed to send request over TLS connection")?;
+            self.log_response_head(&response);
 
             return Ok(ProxyRuntimes {
                 inner: response,
@@ -266,6 +267,7 @@ pub trait ProxyClient {
             .send_request(req)
             .await
             .context("failed to send request to proxy")?;
+        self.log_response_head(&response);
 
         Ok(ProxyRuntimes {
             inner: response,
@@ -280,6 +282,20 @@ pub trait ProxyClient {
     {
         #[cfg(feature = "log")]
         log::trace!("{}: {}", self.host(), _msg);
+    }
+
+    fn log_response_head(&self, response: &Response<Incoming>) {
+        let content_length = response
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown");
+        self.log_trace(format!(
+            "Received response: {:?} {}, content-length: {}",
+            response.version(),
+            response.status(),
+            content_length
+        ));
     }
 
     fn log_error<S>(&self, _msg: S)
