@@ -200,14 +200,31 @@ where
     let filter = Arc::new(ProxyFilter::from_options(&options));
     let source: std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>> =
         if options.sort.is_some() || options.shuffle {
-            let mut proxies: Vec<Proxy> = source.collect().await;
+            // Sorted/shuffled output cannot stream, so collection must stay
+            // interruptible: without this select a Ctrl+C pressed during the
+            // whole upstream run (fetch+validate) would be swallowed until
+            // every item had arrived. A cancel keeps what already arrived.
+            let mut buffered: Vec<Proxy> = Vec::new();
+            let mut src = std::pin::pin!(source);
+            loop {
+                tokio::select! {
+                    _ = cancel.notified(), if !cancelled => {
+                        cancelled = true;
+                        break;
+                    }
+                    item = src.next() => {
+                        let Some(proxy) = item else { break };
+                        buffered.push(proxy);
+                    }
+                }
+            }
             if options.shuffle {
-                shuffle_proxies(&mut proxies);
+                shuffle_proxies(&mut buffered);
             }
             if let Some(sort) = options.sort.as_deref() {
-                sort_proxies(&mut proxies, sort, Some(options.order.as_str()));
+                sort_proxies(&mut buffered, sort, Some(options.order.as_str()));
             }
-            Box::pin(futures_util::stream::iter(proxies))
+            Box::pin(futures_util::stream::iter(buffered))
         } else {
             Box::pin(source)
         };
@@ -223,7 +240,7 @@ where
         let mut proxies: Vec<Proxy> = Vec::new();
         loop {
             tokio::select! {
-                _ = cancel.notified() => {
+                _ = cancel.notified(), if !cancelled => {
                     cancelled = true;
                     break;
                 }
@@ -299,7 +316,7 @@ where
 
     loop {
         tokio::select! {
-            _ = cancel.notified() => {
+            _ = cancel.notified(), if !cancelled => {
                 cancelled = true;
                 break;
             }

@@ -11,7 +11,9 @@ use flx::{
     FetchStage, IpType, ProxySource, ProxyValidator,
 };
 use futures_util::{Stream, StreamExt};
+use std::io::Write as _;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::runtime;
 
@@ -86,10 +88,22 @@ fn format_gathered_stats(
 
 #[cfg(unix)]
 mod quiet_signal_echo {
-    pub struct QuietSignalEcho {
-        fd: libc::c_int,
-        original: libc::termios,
+    use std::sync::Mutex;
+
+    // Saved by `install` so a forced exit (which skips destructors) can
+    // still hand back the original terminal settings.
+    static ORIGINAL: Mutex<Option<(libc::c_int, libc::termios)>> = Mutex::new(None);
+
+    /// Restores the saved settings at most once; harmless to call again.
+    pub fn restore() {
+        if let Some((fd, original)) = ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            unsafe {
+                libc::tcsetattr(fd, libc::TCSANOW, &original);
+            }
+        }
     }
+
+    pub struct QuietSignalEcho;
 
     impl QuietSignalEcho {
         pub fn install() -> Option<Self> {
@@ -108,15 +122,15 @@ mod quiet_signal_echo {
                 return None;
             }
 
-            Some(Self { fd, original })
+            *ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()) = Some((fd, original));
+
+            Some(Self)
         }
     }
 
     impl Drop for QuietSignalEcho {
         fn drop(&mut self) {
-            unsafe {
-                libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
-            }
+            restore();
         }
     }
 }
@@ -130,6 +144,8 @@ mod quiet_signal_echo {
             None
         }
     }
+
+    pub fn restore() {}
 }
 
 use quiet_signal_echo::QuietSignalEcho;
@@ -141,12 +157,34 @@ enum RunOutcome {
     NoCommand,
 }
 
+// Conventional shell status for a process killed by SIGINT (128 + 2).
+const SIGINT_EXIT_CODE: u8 = 130;
+// The first Ctrl+C shuts down gracefully (finalizing output documents); a
+// second press force-quits so flx can always be stopped, even from a phase
+// that never reaches a cancellation checkpoint.
+const FORCE_EXIT_AFTER_PRESSES: usize = 2;
+
+fn should_force_exit(press_count: usize) -> bool {
+    press_count >= FORCE_EXIT_AFTER_PRESSES
+}
+
+// A forced exit skips every destructor, so the state they would hand back —
+// buffered output, a hidden cursor, the saved termios — is restored here.
+fn restore_terminal_and_exit() -> ! {
+    let _ = std::io::stdout().lock().flush();
+    #[cfg(feature = "progress_bar")]
+    progress::force_show_cursor();
+    let _ = std::io::stderr().lock().flush();
+    quiet_signal_echo::restore();
+    std::process::exit(i32::from(SIGINT_EXIT_CODE))
+}
+
 fn main() -> std::process::ExitCode {
     // Restore the terminal settings before the process leaves, on every path.
     let _quiet = QuietSignalEcho::install();
     match run_application() {
         Ok(RunOutcome::Finished) => std::process::ExitCode::SUCCESS,
-        Ok(RunOutcome::Cancelled) => std::process::ExitCode::from(130),
+        Ok(RunOutcome::Cancelled) => std::process::ExitCode::from(SIGINT_EXIT_CODE),
         Ok(RunOutcome::NoCommand) => std::process::ExitCode::from(2),
         Err(e) => {
             #[cfg(feature = "log")]
@@ -362,12 +400,22 @@ fn run_application() -> anyhow::Result<RunOutcome> {
             });
         }
         let notify = Arc::clone(&cancel);
+        // Re-arm on every SIGINT: the first press hands a permit to the
+        // graceful path (`notify_one` stores one even with no waiter yet,
+        // so a press during the warmup phases is not lost before
+        // `process_result` polls it); further presses force-quit so the
+        // process is always stoppable.
+        let presses = Arc::new(AtomicUsize::new(0));
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            // `notify_one` stores a permit even when nothing is waiting yet,
-            // so a SIGINT pressed during the warmup phases (geolite download,
-            // judge preflight) is not lost before `process_result` polls it.
-            notify.notify_one();
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                notify.notify_one();
+                if should_force_exit(presses.fetch_add(1, Ordering::Relaxed) + 1) {
+                    restore_terminal_and_exit();
+                }
+            }
         });
         match command {
             Command::Grab(grab) => run_grab(grab, cli.quiet, cli.no_color, &download, cancel).await,
@@ -520,10 +568,16 @@ async fn run_find(
         if let Some(bar) = &warmup {
             bar.set_phase("Checking online judges …");
         }
-        let source = Box::pin(tee_recorder(
-            file_source(&find.validator.files).await?,
-            recordings.clone(),
-        ));
+        // Opening the sources is I/O and must stay interruptible like every
+        // other phase of the run.
+        let files = tokio::select! {
+            files = file_source(&find.validator.files) => files?,
+            _ = cancel.notified() => {
+                drop(warmup);
+                return Ok(RunOutcome::Cancelled);
+            }
+        };
+        let source = Box::pin(tee_recorder(files, recordings.clone()));
         let validate = ProxyValidator::validate(source, config);
         tokio::pin!(validate);
         let pass = tokio::select! {
@@ -694,13 +748,29 @@ async fn run_find(
             return Ok(RunOutcome::Finished);
         }
 
-        let pass2 = ProxyValidator::validate(
+        // The fallback pass re-runs the judge preflight, so its startup is
+        // raced against cancel exactly like the first pass.
+        let validate2 = ProxyValidator::validate(
             futures_util::stream::iter(candidates),
             validator_config(&find.validator, requested, Vec::new(), true),
-        )
-        .await
-        .context("failed to start proxy validator")?;
-        let mut pass2 = pass2;
+        );
+        tokio::pin!(validate2);
+        let mut pass2 = tokio::select! {
+            pass = &mut validate2 => pass.context("failed to start proxy validator")?,
+            _ = cancel.notified() => {
+                report_validation_summary(
+                    ValidationStats {
+                        passed: p1_passed,
+                        done: progress1.done(),
+                        total: progress1.total(),
+                        elapsed: started.elapsed(),
+                    },
+                    dst.as_deref(),
+                    quiet,
+                );
+                return Ok(RunOutcome::Cancelled);
+            }
+        };
         if let Some(path) = find.validator.report_failures.clone() {
             if let Some(rx) = pass2.take_failures() {
                 failure_tasks.push(tokio::spawn(async move {

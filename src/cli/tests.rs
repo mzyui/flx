@@ -1416,3 +1416,121 @@ fn append_csv_skips_duplicate_header() {
         "ip,port,type,response_time,country,ip_type\n1.2.3.4,80,,\n192.168.0.1,8081,,0.00,,unknown\n"
     );
 }
+
+// Yields its items, fires the graceful-cancel permit once they are done,
+// and never completes afterwards — the shape of an upstream run that keeps
+// going after Ctrl+C was pressed.
+struct CancelAfterStream {
+    items: std::vec::IntoIter<Proxy>,
+    cancel: Arc<tokio::sync::Notify>,
+    fired: bool,
+}
+
+impl CancelAfterStream {
+    fn new(items: Vec<Proxy>, cancel: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            items: items.into_iter(),
+            cancel,
+            fired: false,
+        }
+    }
+}
+
+impl futures_util::Stream for CancelAfterStream {
+    type Item = Proxy;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Proxy>> {
+        if let Some(proxy) = self.items.next() {
+            return std::task::Poll::Ready(Some(proxy));
+        }
+        if !self.fired {
+            self.fired = true;
+            // Like the SIGINT task: a stored permit survives until polled.
+            self.cancel.notify_one();
+            cx.waker().wake_by_ref();
+        }
+        std::task::Poll::Pending
+    }
+}
+
+#[test]
+fn process_result_cancel_during_sorted_collect_keeps_partial_sorted_output() {
+    let proxies = vec![
+        validated_proxy(1, "HTTP:Anonymous", 0.9),
+        validated_proxy(2, "HTTP:Anonymous", 0.1),
+    ];
+    let (options, path) = output_options("json-lines", 0);
+    let options = OutputOptions {
+        sort: Some("avg-response".to_owned()),
+        order: "asc".to_owned(),
+        ..options
+    };
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let source = CancelAfterStream::new(proxies, Arc::clone(&cancel));
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let outcome = rt.block_on(async {
+        process_result(source, options, cancel, &NoopGuard, FinalizeOpts::default())
+            .await
+            .unwrap()
+    });
+    assert_eq!(outcome, RunOutcome::Cancelled);
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let rows = parse_json_lines(&content);
+    assert_eq!(
+        rows.len(),
+        2,
+        "every proxy collected before the cancel must be emitted"
+    );
+    let first = rows[0]["average_response_time"].as_f64().unwrap();
+    let second = rows[1]["average_response_time"].as_f64().unwrap();
+    assert!(first <= second, "the partial output must stay sorted");
+}
+
+#[test]
+fn process_result_cancel_during_shuffle_collect_preserves_the_set() {
+    let proxies = vec![sample_proxy(1), sample_proxy(2), sample_proxy(3)];
+    let (options, path) = output_options("json-lines", 0);
+    let options = OutputOptions {
+        shuffle: true,
+        ..options
+    };
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let source = CancelAfterStream::new(proxies, Arc::clone(&cancel));
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let outcome = rt.block_on(async {
+        process_result(source, options, cancel, &NoopGuard, FinalizeOpts::default())
+            .await
+            .unwrap()
+    });
+    assert_eq!(outcome, RunOutcome::Cancelled);
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let mut got: Vec<String> = parse_json_lines(&content)
+        .iter()
+        .map(|row| row["ip"].as_str().unwrap().to_owned())
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "192.168.0.1".to_owned(),
+            "192.168.0.2".to_owned(),
+            "192.168.0.3".to_owned()
+        ],
+        "shuffle under cancel must remain a permutation"
+    );
+}
+
+#[test]
+fn second_ctrl_c_press_forces_the_exit() {
+    // One press stays on the graceful path; another press must quit.
+    assert!(!should_force_exit(1));
+    assert!(should_force_exit(2));
+    assert!(should_force_exit(3));
+}

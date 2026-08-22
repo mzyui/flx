@@ -62,6 +62,15 @@ fn apply_cursor_escape(escape: Option<&'static str>) {
     }
 }
 
+/// A forced exit skips the `CursorHider` destructors, so the cursor must be
+/// un-hidden manually before the process leaves.
+pub(crate) fn force_show_cursor() {
+    use std::io::{IsTerminal as _, Write as _};
+    if LIVE_CURSOR_HIDERS.load(Ordering::Acquire) > 0 && std::io::stderr().is_terminal() {
+        let _ = std::io::stderr().lock().write_all(SHOW_CURSOR.as_bytes());
+    }
+}
+
 /// Refcounted RAII hiding the terminal cursor while any status bar lives.
 /// Escapes are idempotent, so racing drops may repeat them harmlessly.
 struct CursorHider;
