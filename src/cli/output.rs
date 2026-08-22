@@ -214,7 +214,15 @@ where
                     }
                     item = src.next() => {
                         let Some(proxy) = item else { break };
-                        buffered.push(proxy);
+                        // The limit counts filtered results, so the filter has
+                        // to run here too — otherwise buffering would keep the
+                        // upstream running long after enough results existed.
+                        if filter.matches(&proxy) {
+                            buffered.push(proxy);
+                            if options.limit > 0 && buffered.len() >= options.limit {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -228,6 +236,8 @@ where
         } else {
             Box::pin(source)
         };
+    // The filter runs twice on the sorted/shuffled path (above and here); it
+    // is a pure predicate, so the second pass is a no-op on kept items.
     let mut source = std::pin::pin!(source
         .filter_map(move |proxy| {
             let filter = Arc::clone(&filter);

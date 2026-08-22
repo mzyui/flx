@@ -1534,3 +1534,128 @@ fn second_ctrl_c_press_forces_the_exit() {
     assert!(should_force_exit(2));
     assert!(should_force_exit(3));
 }
+
+// Yields its items in order and records whether any item past `allowed`
+// ever left the stream — the marker of an upstream that kept running after
+// the output limit had already been satisfied.
+struct EarlyStopProbe {
+    items: std::vec::IntoIter<Proxy>,
+    allowed: usize,
+    yielded: usize,
+    over_limit_polled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl EarlyStopProbe {
+    fn new(items: Vec<Proxy>, allowed: usize) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                items: items.into_iter(),
+                allowed,
+                yielded: 0,
+                over_limit_polled: Arc::clone(&flag),
+            },
+            flag,
+        )
+    }
+}
+
+impl futures_util::Stream for EarlyStopProbe {
+    type Item = Proxy;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Proxy>> {
+        match self.items.next() {
+            Some(proxy) => {
+                self.yielded += 1;
+                if self.yielded > self.allowed {
+                    self.over_limit_polled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                std::task::Poll::Ready(Some(proxy))
+            }
+            None => std::task::Poll::Ready(None),
+        }
+    }
+}
+
+#[test]
+fn process_result_sort_stops_collecting_once_the_limit_is_reached() {
+    let proxies = vec![
+        validated_proxy(1, "HTTP:Anonymous", 0.9),
+        validated_proxy(2, "HTTP:Anonymous", 0.1),
+        validated_proxy(3, "HTTP:Anonymous", 0.7),
+        validated_proxy(4, "HTTP:Anonymous", 0.2),
+        validated_proxy(5, "HTTP:Anonymous", 0.8),
+    ];
+    let (options, path) = output_options("json-lines", 3);
+    let options = OutputOptions {
+        sort: Some("avg-response".to_owned()),
+        order: "asc".to_owned(),
+        ..options
+    };
+    let (source, over_limit_polled) = EarlyStopProbe::new(proxies, options.limit);
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let outcome = rt.block_on(async {
+        process_result(
+            source,
+            options,
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts::default(),
+        )
+        .await
+        .unwrap()
+    });
+    assert_eq!(outcome, RunOutcome::Finished);
+
+    assert!(
+        !over_limit_polled.load(std::sync::atomic::Ordering::Relaxed),
+        "the upstream must be dropped once enough results exist"
+    );
+
+    // First-arrival semantics: the first three matches are kept and sorted
+    // among themselves — a global best-of-three would be [0.1, 0.2, 0.7].
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let rows = parse_json_lines(&content);
+    assert_eq!(rows.len(), 3);
+    let times: Vec<f64> = rows
+        .iter()
+        .map(|row| row["average_response_time"].as_f64().unwrap())
+        .collect();
+    assert_eq!(times, vec![0.1, 0.7, 0.9]);
+}
+
+#[test]
+fn process_result_shuffle_stops_collecting_once_the_limit_is_reached() {
+    let proxies = vec![sample_proxy(1), sample_proxy(2), sample_proxy(3)];
+    let (options, path) = output_options("json-lines", 2);
+    let options = OutputOptions {
+        shuffle: true,
+        ..options
+    };
+    let (source, over_limit_polled) = EarlyStopProbe::new(proxies, options.limit);
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let outcome = rt.block_on(async {
+        process_result(
+            source,
+            options,
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts::default(),
+        )
+        .await
+        .unwrap()
+    });
+    assert_eq!(outcome, RunOutcome::Finished);
+    assert!(
+        !over_limit_polled.load(std::sync::atomic::Ordering::Relaxed),
+        "shuffle must not keep the upstream running past the limit"
+    );
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(parse_json_lines(&content).len(), 2);
+}
