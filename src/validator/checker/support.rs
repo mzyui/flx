@@ -185,6 +185,66 @@ async fn to_raw_response(
     Ok(content)
 }
 
+async fn to_raw_response_early_exit(
+    response: Response<Incoming>,
+    deadline: time::Instant,
+    token_marker: &[u8],
+    my_ip: &str,
+    need_cookie: bool,
+    need_referer: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let mut content: Vec<u8> = Vec::with_capacity(2048);
+    for (k, v) in response.headers() {
+        for &b in k.as_str().as_bytes() {
+            content.push(b.to_ascii_uppercase());
+        }
+        content.extend_from_slice(b": ");
+        content.extend_from_slice(
+            v.to_str()
+                .with_context(|| format!("response header `{}` is not valid utf-8", k))?
+                .as_bytes(),
+        );
+        content.push(b'\n');
+    }
+    content.extend_from_slice(b"\n\n");
+    let header_len = content.len();
+    let mut body = response.into_body();
+    use http_body_util::BodyExt as _;
+    // Early exit is only safe when a positive leak is proven: token plus all
+    // required header echos plus the real IP in the same buffer means the
+    // anonymity decision is fixed to Transparent and no later byte can change it.
+    let should_stop = |buf: &[u8], token: &[u8], ip: &str, cookie: bool, referer: bool| {
+        if memchr::memmem::find(buf, token).is_none() {
+            return false;
+        }
+        if cookie && memchr::memmem::find(buf, b"HTTP_COOKIE = cookie=ok").is_none() {
+            return false;
+        }
+        if referer && memchr::memmem::find(buf, b"HTTP_REFERER = https://google.com/").is_none() {
+            return false;
+        }
+        memchr::memmem::find(buf, ip.as_bytes()).is_some()
+    };
+    while let Some(frame) = time::timeout_at(deadline, body.frame())
+        .await
+        .context("judge response body timed out")?
+    {
+        let chunk = frame
+            .map_err(|e| anyhow::anyhow!("judge body stream error: {e}"))?
+            .into_data()
+            .unwrap_or_default();
+        let body_len = content.len().saturating_sub(header_len);
+        if body_len.saturating_add(chunk.len()) > MAX_JUDGE_BODY_BYTES {
+            anyhow::bail!("judge response body exceeds {MAX_JUDGE_BODY_BYTES} bytes");
+        }
+        content.extend_from_slice(&chunk);
+        if should_stop(&content, token_marker, my_ip, need_cookie, need_referer) {
+            break;
+        }
+    }
+    Ok(content)
+}
+
 pub(crate) async fn support_http(
     proxy: &mut Proxy,
     pool: &JudgePool,
@@ -266,44 +326,91 @@ pub(crate) async fn support_http(
                 continue;
             }
 
-            let body = match to_raw_response(inner, deadline).await {
-                Ok(body) => body,
-                Err(_e) => {
+            // If the public IP is already cached (warmed during validator
+            // startup), stream the body with an early exit for the transparent
+            // case so a huge/slow body does not need to be fully downloaded.
+            let cached_ip = crate::resolver::cached_my_ip();
+            let (body, my_ip) = if let Some(cached) = cached_ip {
+                let body = match to_raw_response_early_exit(
+                    inner,
+                    deadline,
+                    target.response_marker.as_bytes(),
+                    &cached,
+                    support_cookies,
+                    support_referer,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(_e) => {
+                        #[cfg(feature = "log")]
+                        log::trace!("{}: failed to read local judge response: {:#}", proxy, _e);
+                        continue;
+                    }
+                };
+                // token/cookie/referer checks are already satisfied when the
+                // early exit fires, but still verify for the non-transparent path.
+                if memchr::memmem::find(&body, target.response_marker.as_bytes()).is_none() {
                     #[cfg(feature = "log")]
-                    log::trace!("{}: failed to read local judge response: {:#}", proxy, _e);
+                    log::trace!("{}: response did not originate from the local judge", proxy);
+                    pool.report_failure(&target);
                     continue;
                 }
+                if support_cookies
+                    && memchr::memmem::find(&body, b"HTTP_COOKIE = cookie=ok").is_none()
+                {
+                    #[cfg(feature = "log")]
+                    log::trace!("{}: proxy did not forward the cookie header", proxy);
+                    continue;
+                }
+                if support_referer
+                    && memchr::memmem::find(&body, b"HTTP_REFERER = https://google.com/").is_none()
+                {
+                    #[cfg(feature = "log")]
+                    log::trace!("{}: proxy did not forward the referer header", proxy);
+                    continue;
+                }
+                (body, cached)
+            } else {
+                let body = match to_raw_response(inner, deadline).await {
+                    Ok(body) => body,
+                    Err(_e) => {
+                        #[cfg(feature = "log")]
+                        log::trace!("{}: failed to read local judge response: {:#}", proxy, _e);
+                        continue;
+                    }
+                };
+                if memchr::memmem::find(&body, target.response_marker.as_bytes()).is_none() {
+                    #[cfg(feature = "log")]
+                    log::trace!("{}: response did not originate from the local judge", proxy);
+                    pool.report_failure(&target);
+                    continue;
+                }
+                if support_cookies
+                    && memchr::memmem::find(&body, b"HTTP_COOKIE = cookie=ok").is_none()
+                {
+                    #[cfg(feature = "log")]
+                    log::trace!("{}: proxy did not forward the cookie header", proxy);
+                    continue;
+                }
+                if support_referer
+                    && memchr::memmem::find(&body, b"HTTP_REFERER = https://google.com/").is_none()
+                {
+                    #[cfg(feature = "log")]
+                    log::trace!("{}: proxy did not forward the referer header", proxy);
+                    continue;
+                }
+                // The lookup runs under its own fixed budget (`MY_IP_LOOKUP_TIMEOUT`)
+                // rather than the leftover probe deadline, so a proxy that answers
+                // just before its deadline is not rejected for a slow my-IP fetch.
+                let my_ip = my_ip().await.context(
+                    "cannot determine anonymity level without knowing our own public IP",
+                )?;
+                (body, my_ip)
             };
-
-            if memchr::memmem::find(&body, target.response_marker.as_bytes()).is_none() {
-                #[cfg(feature = "log")]
-                log::trace!("{}: response did not originate from the local judge", proxy);
-                pool.report_failure(&target);
-                continue;
-            }
-
-            if support_cookies && memchr::memmem::find(&body, b"HTTP_COOKIE = cookie=ok").is_none()
-            {
-                #[cfg(feature = "log")]
-                log::trace!("{}: proxy did not forward the cookie header", proxy);
-                continue;
-            }
-            if support_referer
-                && memchr::memmem::find(&body, b"HTTP_REFERER = https://google.com/").is_none()
-            {
-                #[cfg(feature = "log")]
-                log::trace!("{}: proxy did not forward the referer header", proxy);
-                continue;
-            }
-
-            // The lookup runs under its own fixed budget (`MY_IP_LOOKUP_TIMEOUT`)
-            // rather than the leftover probe deadline, so a proxy that answers
-            // just before its deadline is not rejected for a slow my-IP fetch.
-            let my_ip = my_ip()
-                .await
-                .context("cannot determine anonymity level without knowing our own public IP")?;
             let body = String::from_utf8_lossy(&body);
             let anonymity = classify_anonymity(&body, &my_ip);
+            pool.report_success(&target, started.elapsed());
 
             return Ok(Some(ProxyRuntimes {
                 inner: Protocol::Http(anonymity),

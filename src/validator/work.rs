@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use serde::Serialize;
@@ -189,12 +196,15 @@ pub(crate) struct GroupMemberJob {
     pub(crate) group_len: usize,
 }
 
+pub(crate) type GroupDeadMap = Arc<Mutex<HashMap<GroupKey, Arc<AtomicBool>>>>;
+
 pub(crate) async fn do_group_work(
     member: GroupMemberJob,
     group_tx: mpsc::Sender<GroupWorkResult>,
     targets: JudgeTargets,
     params: &WorkParams,
     failures: Option<mpsc::Sender<ProxyFailure>>,
+    dead_map: Option<GroupDeadMap>,
 ) -> anyhow::Result<()> {
     let GroupMemberJob {
         proxy,
@@ -203,6 +213,34 @@ pub(crate) async fn do_group_work(
         slot,
         group_len,
     } = member;
+    let key = GroupKey {
+        proxy: Arc::as_ptr(&proxy) as usize,
+        group_idx,
+    };
+    if let Some(map) = dead_map.as_ref() {
+        let dead = {
+            let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
+        if dead.load(Ordering::Relaxed) {
+            // A sibling already failed, so the all-or-nothing group is dead;
+            // skip the probe and report a cheap failure.
+            let probe = proxy.validation_probe();
+            report_failure(&failures, &probe, protocol, "group-dead".to_owned());
+            let _ = group_tx
+                .send(GroupWorkResult {
+                    key,
+                    slot,
+                    group_len,
+                    proxy: None,
+                })
+                .await;
+            return Ok(());
+        }
+    }
     let mut probe = proxy.validation_probe();
     let result = match run_probe(&mut probe, protocol, protocol, &targets, params).await {
         Ok(Some(proxy_type)) => {
@@ -223,12 +261,16 @@ pub(crate) async fn do_group_work(
             None
         }
     };
+    if result.is_none() {
+        if let Some(map) = dead_map.as_ref() {
+            if let Some(dead) = map.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+                dead.store(true, Ordering::Relaxed);
+            }
+        }
+    }
     let _ = group_tx
         .send(GroupWorkResult {
-            key: GroupKey {
-                proxy: Arc::as_ptr(&proxy) as usize,
-                group_idx,
-            },
+            key,
             slot,
             group_len,
             proxy: result,

@@ -23,10 +23,14 @@ pub struct JudgePool {
 struct PoolInner {
     judges: Vec<Arc<ValidationTarget>>,
     cooldown_until_ms: Vec<PaddedCooldown>,
+    rtt_ema_ms: Vec<PaddedRtt>,
 }
 
 #[repr(align(64))]
 struct PaddedCooldown(AtomicU64);
+
+#[repr(align(64))]
+struct PaddedRtt(AtomicU64);
 
 impl JudgePool {
     pub async fn build<F>(
@@ -121,20 +125,30 @@ impl JudgePool {
     }
 
     pub(crate) fn candidates(&self) -> Vec<Arc<ValidationTarget>> {
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut candidates = Vec::with_capacity(inner.judges.len());
-        for offset in 0..inner.judges.len() {
-            let index = (start + offset) % inner.judges.len();
+        let mut candidates: Vec<(usize, Arc<ValidationTarget>)> =
+            Vec::with_capacity(inner.judges.len());
+        for index in 0..inner.judges.len() {
             if inner.cooldown_until_ms[index].0.load(Ordering::Relaxed) <= now_ms {
-                candidates.push(Arc::clone(&inner.judges[index]));
+                candidates.push((index, Arc::clone(&inner.judges[index])));
             }
         }
-        if candidates.is_empty() {
-            candidates.push(Arc::clone(&inner.judges[start % inner.judges.len()]));
+        if candidates.is_empty() && !inner.judges.is_empty() {
+            let start = self.cursor.fetch_add(1, Ordering::Relaxed) % inner.judges.len();
+            candidates.push((start, Arc::clone(&inner.judges[start])));
         }
-        candidates
+        // Fastest judges first so each proxy pays the minimal RTT. Unknown
+        // judges (EMA 0) are treated as slow and sink to the end.
+        candidates.sort_by_key(|(idx, _)| {
+            let ema = inner.rtt_ema_ms[*idx].0.load(Ordering::Relaxed);
+            if ema == 0 {
+                u64::MAX
+            } else {
+                ema
+            }
+        });
+        candidates.into_iter().map(|(_, target)| target).collect()
     }
 
     pub fn report_failure(&self, target: &ValidationTarget) {
@@ -155,6 +169,29 @@ impl JudgePool {
         }
     }
 
+    pub(crate) fn report_success(&self, target: &ValidationTarget, elapsed: Duration) {
+        let elapsed_ms = elapsed.as_millis() as u64;
+        if elapsed_ms == 0 {
+            return;
+        }
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = inner
+            .judges
+            .iter()
+            .position(|judge| judge.url == target.url)
+        {
+            let ema = &inner.rtt_ema_ms[index].0;
+            let prev = ema.load(Ordering::Relaxed);
+            let next = if prev == 0 {
+                elapsed_ms
+            } else {
+                // EMA with alpha 0.3: ema = ema*0.7 + sample*0.3
+                (prev * 7 + elapsed_ms * 3) / 10
+            };
+            ema.store(next, Ordering::Relaxed);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner
             .lock()
@@ -172,6 +209,7 @@ impl JudgePool {
             inner: Mutex::new(PoolInner {
                 judges: Vec::new(),
                 cooldown_until_ms: Vec::new(),
+                rtt_ema_ms: Vec::new(),
             }),
             cursor: AtomicUsize::new(0),
             epoch: time::Instant::now(),
@@ -184,16 +222,21 @@ impl JudgePool {
         inner
             .cooldown_until_ms
             .push(PaddedCooldown(AtomicU64::new(0)));
+        inner.rtt_ema_ms.push(PaddedRtt(AtomicU64::new(0)));
     }
 
     pub(crate) fn from_targets(targets: Vec<Arc<ValidationTarget>>) -> Self {
         let cooldown_until_ms = (0..targets.len())
             .map(|_| PaddedCooldown(AtomicU64::new(0)))
             .collect();
+        let rtt_ema_ms = (0..targets.len())
+            .map(|_| PaddedRtt(AtomicU64::new(0)))
+            .collect();
         Self {
             inner: Mutex::new(PoolInner {
                 judges: targets,
                 cooldown_until_ms,
+                rtt_ema_ms,
             }),
             cursor: AtomicUsize::new(0),
             epoch: time::Instant::now(),

@@ -135,6 +135,7 @@ pub(super) async fn support_tunnel(
         .await
         {
             Ok(Ok((body, driver))) => {
+                pool.report_success(validation_target, started.elapsed());
                 let mut runtimes = RuntimeStats::default();
                 // The lookup runs under its own fixed budget (`MY_IP_LOOKUP_TIMEOUT`)
                 // rather than the leftover probe deadline, so a tunnel that

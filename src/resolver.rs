@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
-use futures_util::{stream::FuturesUnordered, StreamExt};
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use hickory_resolver::{
     config::{LookupIpStrategy, NameServerConfig, ResolverConfig, ResolverOpts},
     net::runtime::TokioRuntimeProvider,
@@ -190,12 +190,17 @@ async fn my_ip_via_https() -> anyhow::Result<String> {
     anyhow::bail!("all HTTPS IP endpoints failed: {}", errors.join("; "))
 }
 
+static MY_IP_CACHE: OnceCell<String> = OnceCell::const_new();
+
+pub fn cached_my_ip() -> Option<String> {
+    MY_IP_CACHE.get().cloned()
+}
+
 pub async fn my_ip() -> anyhow::Result<String> {
     // Cache the first successful resolution for the lifetime of the process.
     // Failures are not stored, so a transient outage can be retried. Replaces
     // the `cached` crate with a single `OnceCell`.
-    static CACHE: OnceCell<String> = OnceCell::const_new();
-    CACHE
+    MY_IP_CACHE
         .get_or_try_init(|| async {
             time::timeout(MY_IP_LOOKUP_TIMEOUT, resolve_public_ip())
                 .await
@@ -208,45 +213,35 @@ pub async fn my_ip() -> anyhow::Result<String> {
 async fn resolve_public_ip() -> anyhow::Result<String> {
     let start_time = Instant::now();
 
-    if let Some(path) = public_ip_cache_path() {
-        if let Some(ip) = load_cached_public_ip(&path).await {
-            #[cfg(feature = "log")]
-            log::debug!("My IP: {ip} (loaded from cache)");
-            return Ok(ip);
-        }
-    }
-
-    let ip = match my_ip_via_dns().await {
+    // Race the live sources concurrently so the lookup finishes as soon as the
+    // fastest one succeeds, hiding at most one RTT behind the validator
+    // preflight. The disk cache is consulted only as a last resort so a stale
+    // entry never silently corrupts the anonymity label.
+    let live = race_live_ip_sources().await;
+    let ip = match live {
         Ok(ip) => {
             #[cfg(feature = "log")]
             log::debug!(
-                "My IP: {} (resolved via DNS in {:?})",
+                "My IP: {} (resolved via live sources in {:?})",
                 ip,
                 start_time.elapsed()
             );
             ip
         }
-        Err(dns_error) => {
-            #[cfg(feature = "log")]
-            log::debug!("DNS lookup failed ({:#}), falling back to HTTPS", dns_error);
-
-            match my_ip_via_https().await {
-                Ok(ip) => {
+        Err(live_error) => {
+            if let Some(path) = public_ip_cache_path() {
+                if let Some(cached) = load_cached_public_ip(&path).await {
                     #[cfg(feature = "log")]
-                    log::debug!(
-                        "My IP: {} (resolved via HTTPS in {:?})",
-                        ip,
-                        start_time.elapsed()
+                    log::warn!(
+                        "live public-IP lookup failed ({live_error:#}); using cached IP {cached} as last resort"
                     );
-                    ip
-                }
-                Err(https_error) => {
-                    return Err(https_error.context(format!(
-                        "could not determine public IP; DNS also failed: {:#}",
-                        dns_error
-                    )));
+                    #[cfg(not(feature = "log"))]
+                    let _ = &live_error;
+                    return Ok(cached);
                 }
             }
+            return Err(live_error
+                .context("all live public-IP sources failed and no cached IP is available"));
         }
     };
 
@@ -255,6 +250,20 @@ async fn resolve_public_ip() -> anyhow::Result<String> {
     }
     let _ = start_time;
     Ok(ip)
+}
+
+async fn race_live_ip_sources() -> anyhow::Result<String> {
+    let mut pending = FuturesUnordered::new();
+    pending.push(async { my_ip_via_dns().await }.boxed());
+    pending.push(async { my_ip_via_https().await }.boxed());
+    let mut errors = Vec::new();
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(ip) => return Ok(ip),
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    anyhow::bail!("all live public-IP sources failed: {}", errors.join("; "))
 }
 
 #[cfg(test)]

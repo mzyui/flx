@@ -120,6 +120,9 @@ pub trait ProxyClient {
             .await
             .with_context(|| format!("timed out connecting to {} after {:?}", host, timeout))?
             .with_context(|| format!("failed to connect to {}", host))?;
+        // Nagle's algorithm would otherwise buffer the small CONNECT/SOCKS
+        // greetings and TLS handshakes behind delayed ACKs.
+        let _ = tcp_stream.set_nodelay(true);
         let elapsed_time = start_time.elapsed().as_secs_f64();
         self.log_trace(format!("Connected in {:.3}s", elapsed_time));
 

@@ -243,7 +243,13 @@ impl ProxyValidator {
                     .context("HTTPS online judge pool is empty after preflight")?;
             Ok::<_, anyhow::Error>(Some((pool, report)))
         };
-        let (http_target, tunnel_target) = tokio::join!(http_preflight, tunnel_preflight);
+        // Warm the public-IP cache in parallel with judge preflights so the
+        // first probe does not pay a cold lookup inline on its deadline.
+        let my_ip_warmup = async {
+            let _ = crate::resolver::my_ip().await;
+        };
+        let (http_target, tunnel_target, _) =
+            tokio::join!(http_preflight, tunnel_preflight, my_ip_warmup);
         let http_target = http_target?;
         let tunnel_target = tunnel_target?;
         let mut judge_health = JudgeHealthReport::default();
@@ -458,12 +464,15 @@ impl ProxyValidator {
 
             let worker_group_tx = group_tx.clone();
             let worker_failures = failure_tx.clone();
+            let worker_group_dead: work::GroupDeadMap =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             jobs.for_each_concurrent(concurrency_limit, move |job| {
                 let sender = sender.clone();
                 let counters = worker_counters.clone();
                 let targets = targets.clone();
                 let group_tx = worker_group_tx.clone();
                 let failures = worker_failures.clone();
+                let group_dead = std::sync::Arc::clone(&worker_group_dead);
                 let params = WorkParams {
                     max_attempts,
                     request_timeout: Duration::from_secs(request_timeout),
@@ -516,6 +525,7 @@ impl ProxyValidator {
                                 targets,
                                 &params,
                                 failures,
+                                Some(group_dead),
                             )
                             .await
                             {
