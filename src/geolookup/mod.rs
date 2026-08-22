@@ -247,15 +247,59 @@ pub(crate) fn data_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn database_path() -> anyhow::Result<PathBuf> {
-    let mut mmdb_path = data_dir()?;
-    mmdb_path.set_file_name("geolite2-city.mmdb");
-    Ok(mmdb_path)
+    Ok(database_in(data_dir()?, "geolite2-city.mmdb"))
 }
 
 fn asn_database_path() -> anyhow::Result<PathBuf> {
-    let mut mmdb_path = data_dir()?;
-    mmdb_path.set_file_name("geolite2-asn.mmdb");
-    Ok(mmdb_path)
+    Ok(database_in(data_dir()?, "geolite2-asn.mmdb"))
+}
+
+fn database_in(mut dir: PathBuf, file_name: &str) -> PathBuf {
+    dir.push(file_name);
+    migrate_legacy_database(&dir);
+    dir
+}
+
+/// Older releases built the database path with `set_file_name` on the data
+/// directory itself, storing `<data>/geolite2-*.mmdb` beside (not inside) the
+/// `flx/` folder. Move such a leftover into the real location so an existing
+/// install does not re-download, carrying the ETag marker along.
+fn migrate_legacy_database(new_path: &Path) {
+    let Some(file_name) = new_path.file_name() else {
+        return;
+    };
+    let Some(legacy) = new_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| dir.join(file_name))
+    else {
+        return;
+    };
+    if new_path.exists() || !legacy.exists() {
+        return;
+    }
+    if let Err(error) = fs::rename(legacy, new_path) {
+        #[cfg(feature = "log")]
+        log::warn!(
+            "failed to move legacy database to {}: {error}",
+            new_path.display()
+        );
+        #[cfg(not(feature = "log"))]
+        let _ = error;
+        return;
+    }
+    // The ETag sidecar moves too, otherwise the next sync would treat the
+    // migrated copy as unverified and download the full body again.
+    let marker = sync_marker_path(new_path);
+    if let Some(legacy_marker) = marker
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| dir.join(marker.file_name().unwrap_or_default()))
+    {
+        if !marker.exists() && legacy_marker.exists() {
+            let _ = fs::rename(legacy_marker, &marker);
+        }
+    }
 }
 
 fn local_build_epoch(mmdb_path: &Path) -> Option<u64> {
@@ -686,5 +730,55 @@ mod tests {
         assert!(format!("{:#}", result.unwrap_err()).contains("body timed out"));
         assert!(!path.exists());
         assert!(!partial.exists());
+    }
+
+    // Builds a `<root>/data/flx/…` tree mirroring the data-dir layout so the
+    // legacy sibling location is `<root>/data/<file>`.
+    fn migration_dir(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "flx_geoip_migrate_{tag}_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let dir = root.join("data").join("flx");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let new_path = dir.join("geolite2-city.mmdb");
+        let legacy = root.join("data").join("geolite2-city.mmdb");
+        (new_path, legacy, root)
+    }
+
+    #[test]
+    fn legacy_database_is_migrated_into_data_dir() {
+        let (new_path, legacy, root) = migration_dir("moves");
+        std::fs::write(&legacy, b"mmdb").unwrap();
+        std::fs::write(legacy.with_file_name("geolite2-city.mmdb.etag"), b"etag").unwrap();
+
+        super::migrate_legacy_database(&new_path);
+
+        assert!(new_path.exists());
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read(&new_path).unwrap(), b"mmdb");
+        // the ETag sidecar moves along so the copy stays verifiable
+        assert_eq!(std::fs::read(sync_marker_path(&new_path)).unwrap(), b"etag");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migration_never_touches_fresh_installs() {
+        let (new_path, legacy, root) = migration_dir("fresh");
+
+        // nothing anywhere: no panic, no files created
+        super::migrate_legacy_database(&new_path);
+        assert!(!new_path.exists());
+
+        // an existing up-to-date database is left alone
+        std::fs::write(&new_path, b"current").unwrap();
+        std::fs::write(&legacy, b"stale").unwrap();
+        super::migrate_legacy_database(&new_path);
+        assert_eq!(std::fs::read(&new_path).unwrap(), b"current");
+        assert!(legacy.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
