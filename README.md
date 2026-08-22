@@ -92,5 +92,3 @@ flx find -m 1000 --timeout 5 --max-attempts 3
 flx find --support-cookies --support-referer --no-verify-tls
 flx find --report-failures failures.jsonl
 ```
-
-Suggestions and bug reports: https://github.com/mzyui/flx/issues
