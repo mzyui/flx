@@ -2,7 +2,10 @@
 
 use std::{
     fmt::{Display, Formatter},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        {Arc, Mutex},
+    },
     time::Instant,
 };
 
@@ -12,6 +15,71 @@ use status_line::StatusLine;
 use tokio::sync::watch;
 
 use crate::OutputGuard;
+
+// Single-glyph accents: color lives only here, never on a whole line.
+const VALIDATING_ICON: &str = "▸";
+const PHASE_ICON: &str = "⟳";
+const DOWNLOAD_ICON: &str = "⇣";
+const GATHER_ICON: &str = "✦";
+const ELLIPSIS_TAIL: &str = " …";
+
+/// Compose `<icon> <phase>` with the trailing ellipsis de-emphasized so a
+/// repaint never paints the whole line in one hue.
+fn phase_line(phase: &str, color: bool) -> String {
+    let body = phase.trim_end();
+    let (text, tail) = match body.strip_suffix('…') {
+        Some(head) => (head.trim_end(), ELLIPSIS_TAIL),
+        None => (body, ""),
+    };
+    if !color {
+        return format!("{PHASE_ICON} {text}{tail}");
+    }
+    format!("{} {}{}", PHASE_ICON.cyan(), text.bold(), tail.dimmed())
+}
+
+const HIDE_CURSOR: &str = "\x1b[?25l";
+const SHOW_CURSOR: &str = "\x1b[?25h";
+
+static LIVE_CURSOR_HIDERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Escape to emit for a live-handle count transition, if any.
+fn cursor_escape(prev: usize, next: usize) -> Option<&'static str> {
+    match (prev, next) {
+        (0, 1) => Some(HIDE_CURSOR),
+        (1, 0) => Some(SHOW_CURSOR),
+        _ => None,
+    }
+}
+
+fn apply_cursor_escape(escape: Option<&'static str>) {
+    use std::io::{IsTerminal as _, Write as _};
+    if let Some(escape) = escape {
+        // Bars only exist on a TTY stderr; the check keeps tests and
+        // redirected runs free of stray control sequences.
+        if std::io::stderr().is_terminal() {
+            let _ = std::io::stderr().lock().write_all(escape.as_bytes());
+        }
+    }
+}
+
+/// Refcounted RAII hiding the terminal cursor while any status bar lives.
+/// Escapes are idempotent, so racing drops may repeat them harmlessly.
+struct CursorHider;
+
+impl CursorHider {
+    fn acquire() -> Self {
+        let prev = LIVE_CURSOR_HIDERS.fetch_add(1, Ordering::AcqRel);
+        apply_cursor_escape(cursor_escape(prev, prev + 1));
+        Self
+    }
+}
+
+impl Drop for CursorHider {
+    fn drop(&mut self) {
+        let prev = LIVE_CURSOR_HIDERS.fetch_sub(1, Ordering::AcqRel);
+        apply_cursor_escape(cursor_escape(prev, prev - 1));
+    }
+}
 
 /// Current terminal width in columns, or `None` when it cannot be determined.
 fn terminal_width() -> Option<usize> {
@@ -142,12 +210,14 @@ impl Display for Frame {
         let line = if self.color {
             let valid = format!("{passed} valid").green();
             let fail = format!("{failed} fail").red();
+            let rate = format!(" ({rate:.0}/s)").dimmed();
             format!(
-                "{} {done}/{total}  {valid} · {fail} ({rate:.0}/s)",
-                "Validating".cyan().bold(),
+                "{} {} {done}/{total} · {valid} · {fail}{rate}",
+                VALIDATING_ICON.cyan(),
+                "Validating".bold(),
             )
         } else {
-            format!("Validating {done}/{total}  {passed} valid · {failed} fail ({rate:.0}/s)")
+            format!("{VALIDATING_ICON} Validating {done}/{total} · {passed} valid · {failed} fail ({rate:.0}/s)")
         };
         f.write_str(&fit_terminal(line, self.color, terminal_width()))
     }
@@ -175,6 +245,7 @@ fn use_color(no_color: bool) -> bool {
 
 pub struct ValidationBar {
     _status: StatusLine<Frame>,
+    _cursor: CursorHider,
 }
 
 impl ValidationBar {
@@ -191,8 +262,12 @@ impl ValidationBar {
         }
         // The global `colored` override is set once in `run_application`, so
         // the bar respects `--no-color` like the end-of-run summary.
+        let _cursor = CursorHider::acquire();
         let status = StatusLine::new(Frame::new(progress, use_color(no_color)));
-        Some(Self { _status: status })
+        Some(Self {
+            _status: status,
+            _cursor,
+        })
     }
 
     fn hide(&self) {
@@ -220,6 +295,7 @@ impl OutputGuard for ValidationBar {
 pub struct WarmupBar {
     status: StatusLine<WarmupFrame>,
     phase: Arc<Mutex<&'static str>>,
+    _cursor: CursorHider,
 }
 
 struct WarmupFrame {
@@ -233,17 +309,17 @@ struct WarmupFrame {
 impl Display for WarmupFrame {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let line = if let Some(dl) = self.download.borrow().as_ref() {
-            let text = if dl.total > 0 {
+            let detail = if dl.total > 0 {
                 let pct = (dl.downloaded as f64 / dl.total as f64) * 100.0;
-                format!("Fetching {} … {pct:.2}%", dl.name)
+                format!("{ELLIPSIS_TAIL} {pct:.2}%")
             } else {
                 let mb = dl.downloaded as f64 / (1024.0 * 1024.0);
-                format!("Fetching {} … {mb:.1} MB", dl.name)
+                format!("{ELLIPSIS_TAIL} {mb:.1} MB")
             };
             if self.color {
-                text.bold().cyan().to_string()
+                format!("{} {}{}", DOWNLOAD_ICON.cyan(), dl.name, detail.dimmed())
             } else {
-                text
+                format!("{DOWNLOAD_ICON} {}{detail}", dl.name)
             }
         } else if let Some(gathered) = &self.gathered {
             let n = *gathered.borrow();
@@ -254,17 +330,18 @@ impl Display for WarmupFrame {
                 0.0
             };
             if self.color {
-                format!("{} {n} proxies ({rate:.0}/s)", "Gathering".cyan().bold())
+                let rate_text = format!(" ({rate:.0}/s)").dimmed();
+                format!(
+                    "{} {} {n} proxies{rate_text}",
+                    GATHER_ICON.cyan(),
+                    "Gathering".bold()
+                )
             } else {
-                format!("Gathering {n} proxies ({rate:.0}/s)")
+                format!("{GATHER_ICON} Gathering {n} proxies ({rate:.0}/s)")
             }
         } else {
             let phase = self.phase.lock().unwrap_or_else(|e| e.into_inner());
-            if self.color {
-                phase.bold().cyan().to_string()
-            } else {
-                phase.to_string()
-            }
+            phase_line(&phase, self.color)
         };
         f.write_str(&fit_terminal(line, self.color, terminal_width()))
     }
@@ -289,6 +366,7 @@ impl WarmupBar {
         ) {
             return None;
         }
+        let _cursor = CursorHider::acquire();
         let phase = Arc::new(Mutex::new("Warming up …"));
         let frame = WarmupFrame {
             phase: Arc::clone(&phase),
@@ -298,7 +376,11 @@ impl WarmupBar {
             color: use_color(no_color),
         };
         let status = StatusLine::with_options(frame, status_line::Options::default());
-        Some(Self { status, phase })
+        Some(Self {
+            status,
+            phase,
+            _cursor,
+        })
     }
 
     pub fn set_phase(&self, phase: &'static str) {
@@ -322,8 +404,12 @@ impl OutputGuard for WarmupBar {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_terminal, show_progress, use_color, visible_len, Frame, WarmupFrame};
+    use super::{
+        cursor_escape, fit_terminal, show_progress, use_color, visible_len, CursorHider, Frame,
+        WarmupFrame, HIDE_CURSOR, LIVE_CURSOR_HIDERS, SHOW_CURSOR,
+    };
     use flx::{DownloadProgress, ValidationProgress};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::{Duration, Instant};
     use tokio::sync::watch;
@@ -334,6 +420,42 @@ mod tests {
 
     fn lock_color() -> MutexGuard<'static, ()> {
         COLOR_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // The live-cursor-hider count is process-global like `colored`'s override.
+    static CURSOR_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn cursor_escapes_are_the_standard_ansi_ones() {
+        assert_eq!(HIDE_CURSOR, "\x1b[?25l");
+        assert_eq!(SHOW_CURSOR, "\x1b[?25h");
+    }
+
+    #[test]
+    fn cursor_escape_transitions() {
+        assert_eq!(cursor_escape(0, 1), Some(HIDE_CURSOR));
+        assert_eq!(cursor_escape(1, 0), Some(SHOW_CURSOR));
+        assert_eq!(cursor_escape(1, 2), None);
+        assert_eq!(cursor_escape(2, 1), None);
+        assert_eq!(cursor_escape(0, 0), None);
+    }
+
+    #[test]
+    fn cursor_hider_hides_once_and_restores_on_last_release() {
+        let _guard = CURSOR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = LIVE_CURSOR_HIDERS.load(Ordering::Acquire);
+
+        let hider = CursorHider::acquire();
+        assert_eq!(LIVE_CURSOR_HIDERS.load(Ordering::Acquire), before + 1);
+
+        let extra = CursorHider::acquire();
+        assert_eq!(LIVE_CURSOR_HIDERS.load(Ordering::Acquire), before + 2);
+
+        drop(extra);
+        assert_eq!(LIVE_CURSOR_HIDERS.load(Ordering::Acquire), before + 1);
+
+        drop(hider);
+        assert_eq!(LIVE_CURSOR_HIDERS.load(Ordering::Acquire), before);
     }
 
     fn with_color<T>(f: impl FnOnce() -> T) -> T {
@@ -363,7 +485,7 @@ mod tests {
     fn warmup_frame_renders_current_phase() {
         let (_, download) = watch::channel(None);
         let frame = frame("Fetching primary sources …", download, None, false);
-        assert!(frame.to_string().contains("Fetching primary sources"));
+        assert!(frame.to_string().starts_with("⟳ Fetching primary sources"));
     }
 
     #[test]
@@ -381,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn warmup_frame_colors_download_line_like_phases() {
+    fn warmup_frame_colors_download_line_accent_only() {
         let (tx, download) = watch::channel(None);
         tx.send_replace(Some(DownloadProgress {
             name: "GeoLite2-City.mmdb",
@@ -390,8 +512,11 @@ mod tests {
         }));
         let frame = frame("Fetching primary sources …", download, None, true);
         let rendered = with_color(|| frame.to_string());
-        assert!(rendered.contains("\x1b[1;36mFetching GeoLite2-City.mmdb"));
+        assert!(rendered.starts_with("\x1b[36m⇣\x1b[0m GeoLite2-City.mmdb"));
+        assert!(rendered.contains("\x1b[2m … 40.00%\x1b[0m"));
         assert!(rendered.ends_with("\x1b[0m"));
+        // No whole-line hue: the old full-line cyan-bold must stay gone.
+        assert!(!rendered.contains("\x1b[1;36m"));
     }
 
     #[test]
@@ -407,7 +532,7 @@ mod tests {
         );
 
         let rendered = frame.to_string();
-        assert_eq!(rendered, "Gathering 12 proxies (3/s)");
+        assert_eq!(rendered, "✦ Gathering 12 proxies (3/s)");
     }
 
     #[test]
@@ -453,13 +578,23 @@ mod tests {
         let frame = Frame::new(ValidationProgress::default(), false);
         let rendered = frame.to_string();
 
-        assert!(rendered.starts_with("Validating "));
+        assert!(rendered.starts_with("▸ Validating "));
         assert!(rendered.contains(" 0/0 "));
         assert!(rendered.contains("0 valid · 0 fail"));
         assert!(rendered.contains("0/s"));
         assert!(!rendered.contains('%'));
         assert!(!rendered.contains("ETA"));
         assert!(!rendered.contains('▐') && !rendered.contains('▌'));
+    }
+
+    #[test]
+    fn frame_colors_icon_and_rate_not_whole_line() {
+        let colored = with_color(|| Frame::new(ValidationProgress::default(), true).to_string());
+        assert!(colored.starts_with("\x1b[36m▸\x1b[0m "));
+        assert!(colored.contains("\x1b[1mValidating\x1b[0m"));
+        assert!(colored.contains("\x1b[2m (0/s)\x1b[0m"));
+        // The label must not carry the icon's cyan on top of bold.
+        assert!(!colored.contains("\x1b[1;36mValidating"));
     }
 
     #[test]
