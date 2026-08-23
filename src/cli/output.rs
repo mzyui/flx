@@ -4,6 +4,7 @@ use flx::IpType;
 use futures_util::{Stream, StreamExt};
 use std::io::IsTerminal as _;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
@@ -44,13 +45,41 @@ pub(crate) fn effective_format<'a>(
     }
 }
 
+// Item counter shared by chained output passes so a fallback pass extends
+// the array opened by an earlier pass instead of starting a new document.
+#[derive(Default)]
+pub struct JsonDoc {
+    items: AtomicUsize,
+}
+
+impl JsonDoc {
+    pub fn items(&self) -> usize {
+        self.items.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, count: usize) {
+        self.items.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+// Links one pass to a shared `JsonDoc`. `leave_open` keeps the closing `]`
+// unwritten so a later chained pass can append more items to the array.
+#[derive(Clone)]
+pub struct JsonContinuation {
+    pub doc: Arc<JsonDoc>,
+    pub leave_open: bool,
+}
+
 // Controls document finalization when `process_result` chains one output
 // pass after another. Empty JSON is only suppressed on the first pass, and
 // the CSV header is only emitted once.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FinalizeOpts {
     pub suppress_empty_json: bool,
     pub emit_csv_header: bool,
+    // A chained pass also opens its output file in append mode so bytes
+    // written by earlier passes are never truncated away.
+    pub continue_json: Option<JsonContinuation>,
 }
 
 impl Default for FinalizeOpts {
@@ -58,47 +87,25 @@ impl Default for FinalizeOpts {
         Self {
             suppress_empty_json: false,
             emit_csv_header: true,
+            continue_json: None,
         }
     }
 }
 
-// Sorts proxies by the requested field, honoring `--order`.
+// Sorts proxies by the requested field, honoring `--order`. The string flags
+// are a CLI concern; the ordering itself lives in the shared library module.
 fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
-    match sort {
-        "avg-response" | "response-time" => proxies.sort_by(|a, b| {
-            a.avg_response_time()
-                .partial_cmp(&b.avg_response_time())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-        "country" => proxies.sort_by(|a, b| a.geo.iso_code.cmp(&b.geo.iso_code)),
-        _ => proxies.sort_by_key(super::filters::proxy_anonymity_rank),
-    }
-    if order == Some("desc") {
-        proxies.reverse();
-    }
-}
-
-// Simple deterministic-free Fisher-Yates shuffle: a xorshift64 PRNG seeded
-// from wall-clock time avoids pulling in a `rand` dependency for one flag.
-pub fn shuffle_proxies(proxies: &mut [Proxy]) {
-    let mut state = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9e3779b97f4a7c15)
-        ^ u64::from(std::process::id());
-    if state == 0 {
-        state = 0x9e3779b97f4a7c15;
-    }
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
+    let key = match sort {
+        "avg-response" | "response-time" => flx::SortKey::AvgResponseTime,
+        "country" => flx::SortKey::Country,
+        _ => flx::SortKey::Anonymity,
     };
-    for i in (1..proxies.len()).rev() {
-        let j = (next() % (i as u64 + 1)) as usize;
-        proxies.swap(i, j);
-    }
+    let order = if order == Some("desc") {
+        flx::SortOrder::Desc
+    } else {
+        flx::SortOrder::Asc
+    };
+    flx::sort_proxies(proxies, key, order);
 }
 
 /// Maps a proxy's best protocol to a proxychains type string.
@@ -172,11 +179,12 @@ where
     if options.append && matches!(format, "json" | "pretty-json") {
         anyhow::bail!("--append cannot be combined with the {format} format");
     }
+    let chained = finalize.continue_json.is_some();
     let mut output_file = match options.output_file.as_ref() {
         Some(file_path) => {
             let mut open = tokio::fs::OpenOptions::new();
             open.write(true).create(true);
-            if options.append {
+            if options.append || chained {
                 open.append(true);
             } else {
                 open.truncate(true);
@@ -194,8 +202,17 @@ where
             if matches!(tokio::fs::metadata(file_path).await, Ok(metadata) if metadata.len() > 0));
 
     let json = matches!(format, "json" | "pretty-json");
+    // A chained pass resumes the array opened by an earlier one: the first
+    // item emits a `,` separator when earlier passes already wrote items.
+    let leave_open = finalize
+        .continue_json
+        .as_ref()
+        .is_some_and(|chain| chain.leave_open);
+    let mut item_count = finalize
+        .continue_json
+        .as_ref()
+        .map_or(0, |chain| chain.doc.items());
     let _csv = format == "csv";
-    let mut found_proxy = false;
     let mut cancelled = false;
     let filter = Arc::new(ProxyFilter::from_options(&options));
     let source: std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>> =
@@ -227,7 +244,7 @@ where
                 }
             }
             if options.shuffle {
-                shuffle_proxies(&mut buffered);
+                flx::shuffle_proxies(&mut buffered);
             }
             if let Some(sort) = options.sort.as_deref() {
                 sort_proxies(&mut buffered, sort, Some(options.order.as_str()));
@@ -340,7 +357,7 @@ where
                         buf.push(b'\n');
                     }
                     "json" => {
-                        if index == 0 {
+                        if item_count == 0 {
                             buf.extend_from_slice(b"[\n  ");
                         } else {
                             buf.extend_from_slice(b",\n  ");
@@ -354,7 +371,7 @@ where
                         }
                     }
                     "pretty-json" => {
-                        if index == 0 {
+                        if item_count == 0 {
                             buf.extend_from_slice(b"[\n");
                         } else {
                             buf.extend_from_slice(b",\n");
@@ -413,7 +430,10 @@ where
                     guard.after_write();
                 }
 
-                found_proxy = true;
+                item_count += 1;
+                if let Some(chain) = &finalize.continue_json {
+                    chain.doc.add(1);
+                }
                 if should_end {
                     break;
                 }
@@ -424,14 +444,18 @@ where
     if json {
         // Finalizing is best-effort: an interrupted or failing run must still
         // yield valid JSON, but a failure here is only interesting when nothing
-        // else already went wrong.
+        // else already went wrong. A chained pass leaves the array open for a
+        // later one, except when cancelled or already failing — an unterminated
+        // document is worse than a doubled closer.
         guard.before_write();
+        let close_document = !leave_open || cancelled || write_error.is_some();
         if write_error.is_none() {
             write_error = finalize_json_output(
                 &mut output_file,
                 &mut stdout,
-                found_proxy,
+                item_count,
                 finalize.suppress_empty_json,
+                close_document,
             )
             .await
             .err();
@@ -439,8 +463,9 @@ where
             let _ = finalize_json_output(
                 &mut output_file,
                 &mut stdout,
-                found_proxy,
+                item_count,
                 finalize.suppress_empty_json,
+                close_document,
             )
             .await;
         }
@@ -469,10 +494,14 @@ where
 async fn finalize_json_output(
     output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
     stdout: &mut std::io::StdoutLock<'static>,
-    found_proxy: bool,
+    item_count: usize,
     suppress_empty_json: bool,
+    close_document: bool,
 ) -> anyhow::Result<()> {
-    let close = if found_proxy {
+    let close = if !close_document {
+        // A later chained pass owns the closer.
+        ""
+    } else if item_count > 0 {
         "\n]\n"
     } else if suppress_empty_json {
         ""
@@ -499,9 +528,11 @@ async fn write_output(
     Ok(())
 }
 
-// Emits the document a skipped fallback pass would have closed: an empty JSON
-// array for JSON formats and nothing for any other format.
-pub async fn emit_empty_skipped_fallback(options: &OutputOptions) -> anyhow::Result<()> {
+// Closes a chained JSON document once no further pass will run: appends the
+// closer when an earlier pass already wrote items and a complete empty array
+// otherwise; other formats need no finalization. The output file is opened in
+// append mode so bytes written by earlier passes survive.
+pub async fn close_chained_json(options: &OutputOptions, item_count: usize) -> anyhow::Result<()> {
     let format = effective_format(
         &options.format,
         options.output_file.as_deref(),
@@ -510,24 +541,25 @@ pub async fn emit_empty_skipped_fallback(options: &OutputOptions) -> anyhow::Res
     if !matches!(format, "json" | "pretty-json") {
         return Ok(());
     }
+    let closer: &[u8] = if item_count > 0 { b"\n]\n" } else { b"[]\n" };
     let mut stdout = std::io::stdout().lock();
     if let Some(ref file_path) = options.output_file {
         let mut file = tokio::io::BufWriter::new(
             tokio::fs::OpenOptions::new()
                 .write(true)
+                .append(true)
                 .create(true)
-                .truncate(true)
                 .open(file_path)
                 .await
                 .with_context(|| format!("failed to open output file {}", file_path.display()))?,
         );
-        file.write_all(b"[]\n")
+        file.write_all(closer)
             .await
             .context("failed to write proxy to output file")?;
         file.flush().await?;
     } else {
         stdout
-            .write_all(b"[]\n")
+            .write_all(closer)
             .context("failed to write proxy to stdout")?;
     }
     Ok(())

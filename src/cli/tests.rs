@@ -703,6 +703,7 @@ fn json_empty_is_suppressed_when_requested() {
             FinalizeOpts {
                 suppress_empty_json: true,
                 emit_csv_header: true,
+                continue_json: None,
             },
         )
         .await
@@ -712,6 +713,146 @@ fn json_empty_is_suppressed_when_requested() {
     let _ = std::fs::remove_file(&path);
     // The empty document is left to a later pass, so nothing is written.
     assert_eq!(content, "");
+}
+
+// Runs the two chained passes of `find`'s fallback flow against one output
+// file and returns the resulting file contents.
+fn run_chained_passes(format: &str, pass1: &[Proxy], pass2: &[Proxy]) -> String {
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let (options, path) = output_options(format, 0);
+    rt.block_on(async {
+        let doc = Arc::new(JsonDoc::default());
+        process_result(
+            stream::iter(pass1.to_vec()),
+            options.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts {
+                suppress_empty_json: true,
+                emit_csv_header: true,
+                continue_json: Some(JsonContinuation {
+                    doc: Arc::clone(&doc),
+                    leave_open: true,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        process_result(
+            stream::iter(pass2.to_vec()),
+            options.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts {
+                suppress_empty_json: false,
+                emit_csv_header: false,
+                continue_json: Some(JsonContinuation {
+                    doc,
+                    leave_open: false,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    content
+}
+
+#[test]
+fn fallback_pass_extends_the_json_array_instead_of_truncating() {
+    let pass1: Vec<Proxy> = (1u8..=3).map(sample_proxy).collect();
+    let pass2: Vec<Proxy> = (4u8..=5).map(sample_proxy).collect();
+    let out = run_chained_passes("json", &pass1, &pass2);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("one valid JSON document");
+    assert_eq!(
+        parsed.as_array().map(Vec::len),
+        Some(5),
+        "pass 2 must extend, not replace, the array written by pass 1"
+    );
+}
+
+#[test]
+fn skipped_fallback_after_partial_pass_closes_the_open_array() {
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let (options, path) = output_options("json", 0);
+    rt.block_on(async {
+        let doc = Arc::new(JsonDoc::default());
+        process_result(
+            stream::iter(vec![sample_proxy(1), sample_proxy(2)]),
+            options.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts {
+                suppress_empty_json: true,
+                emit_csv_header: true,
+                continue_json: Some(JsonContinuation {
+                    doc: Arc::clone(&doc),
+                    leave_open: true,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        close_chained_json(&options, doc.items()).await.unwrap();
+    });
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&content).expect("a single closed document");
+    assert_eq!(parsed.as_array().map(Vec::len), Some(2));
+    assert_eq!(content.matches('[').count(), 1, "exactly one array opener");
+}
+
+#[test]
+fn skipped_fallback_with_an_empty_pass_emits_one_empty_array() {
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let (options, path) = output_options("json", 0);
+    rt.block_on(async {
+        let doc = Arc::new(JsonDoc::default());
+        process_result(
+            stream::iter(Vec::<Proxy>::new()),
+            options.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts {
+                suppress_empty_json: true,
+                emit_csv_header: true,
+                continue_json: Some(JsonContinuation {
+                    doc: Arc::clone(&doc),
+                    leave_open: true,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        close_chained_json(&options, doc.items()).await.unwrap();
+    });
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(content, "[]\n");
+}
+
+#[test]
+fn fallback_pass_appends_text_output_without_truncating_pass_1() {
+    let pass1: Vec<Proxy> = (1u8..=3).map(sample_proxy).collect();
+    let pass2: Vec<Proxy> = (4u8..=5).map(sample_proxy).collect();
+    let out = run_chained_passes("text", &pass1, &pass2);
+    assert_eq!(out.lines().count(), 5, "pass-1 rows must survive pass 2");
+}
+
+#[test]
+fn fallback_pass_preserves_the_csv_header_and_pass_1_rows() {
+    let pass1: Vec<Proxy> = (1u8..=3).map(sample_proxy).collect();
+    let pass2: Vec<Proxy> = (4u8..=5).map(sample_proxy).collect();
+    let out = run_chained_passes("csv", &pass1, &pass2);
+    let mut lines = out.lines();
+    assert!(
+        lines.next().unwrap().starts_with("ip,port,"),
+        "the header written by pass 1 must survive pass 2"
+    );
+    assert_eq!(lines.count(), 5);
 }
 
 #[test]
@@ -1311,7 +1452,7 @@ fn exclude_type_filter_uses_advertised_types_when_unvalidated() {
 fn shuffle_flag_is_accepted_and_preserves_the_set() {
     let proxies: Vec<_> = (1..=10).map(sample_proxy).collect();
     let mut shuffled = proxies.clone();
-    shuffle_proxies(&mut shuffled);
+    flx::shuffle_proxies(&mut shuffled);
 
     let mut expected: Vec<u8> = proxies.iter().map(|p| p.ip.octets()[3]).collect();
     expected.sort_unstable();
@@ -1658,4 +1799,83 @@ fn process_result_shuffle_stops_collecting_once_the_limit_is_reached() {
     let content = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!(parse_json_lines(&content).len(), 2);
+}
+
+#[test]
+fn clap_defaults_match_facade_defaults_field_by_field() {
+    use clap::CommandFactory;
+
+    fn clap_default(cmd: &clap::Command, id: &str) -> String {
+        fn argument_default(cmd: &clap::Command, id: &str) -> Option<String> {
+            let own = cmd
+                .get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .and_then(|argument| argument.get_default_values().first())
+                .map(|value| value.to_string_lossy().into_owned());
+            own.or_else(|| {
+                cmd.get_subcommands()
+                    .find_map(|sub| argument_default(sub, id))
+            })
+        }
+        argument_default(cmd, id).unwrap_or_else(|| panic!("argument `{id}` has no default value"))
+    }
+
+    let command = Cli::command();
+    let fetcher = flx::FetcherConfig::default();
+    let validator = flx::ValidatorConfig::default();
+
+    assert_eq!(
+        clap_default(&command, "fetch_concurrency"),
+        fetcher.concurrency_limit.to_string(),
+        "--fetch-concurrency must track FetcherConfig::default()"
+    );
+    assert_eq!(
+        clap_default(&command, "cache_ttl"),
+        flx::fetcher::DEFAULT_CACHE_TTL_MINUTES.to_string(),
+        "--cache-ttl must track DEFAULT_CACHE_TTL_MINUTES"
+    );
+    assert_eq!(
+        fetcher.cache_ttl,
+        Some(std::time::Duration::from_secs(15 * 60))
+    );
+    assert_eq!(
+        clap_default(&command, "fetch_phase_timeout"),
+        flx::fetcher::PRIMARY_PHASE_TIMEOUT.as_secs().to_string(),
+        "--fetch-phase-timeout must track PRIMARY_PHASE_TIMEOUT"
+    );
+    assert_eq!(
+        clap_default(&command, "max_connections"),
+        validator.concurrency_limit.to_string(),
+        "--max-connections must track ValidatorConfig::default()"
+    );
+    assert_eq!(
+        clap_default(&command, "timeout"),
+        validator.request_timeout.to_string(),
+        "--timeout must track ValidatorConfig request_timeout"
+    );
+
+    let http_judges: Vec<String> = clap_default(&command, "http_judge_urls")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        http_judges,
+        flx::validator::DEFAULT_HTTP_JUDGE_URLS
+            .iter()
+            .map(|url| url.to_string())
+            .collect::<Vec<_>>(),
+        "--http-judge-urls must track DEFAULT_HTTP_JUDGE_URLS"
+    );
+    let https_judges: Vec<String> = clap_default(&command, "https_judge_urls")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        https_judges,
+        flx::validator::DEFAULT_HTTPS_JUDGE_URLS
+            .iter()
+            .map(|url| url.to_string())
+            .collect::<Vec<_>>(),
+        "--https-judge-urls must track DEFAULT_HTTPS_JUDGE_URLS"
+    );
 }

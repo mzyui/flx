@@ -321,23 +321,7 @@ fn list_sources() {
 type BoxStream = std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>>;
 
 async fn file_source(paths: &[std::path::PathBuf]) -> anyhow::Result<BoxStream> {
-    let paths = paths.to_owned();
-    let proxies = tokio::task::spawn_blocking(move || {
-        let mut proxies = Vec::new();
-        for path in paths {
-            let parsed = if path.as_os_str() == "-" {
-                ProxySource::from_stdin().context("failed to read proxies from stdin")?
-            } else {
-                ProxySource::from_file(path.clone())
-                    .with_context(|| format!("failed to read proxies from {}", path.display()))?
-            };
-            let parsed = parsed.collect::<Vec<_>>();
-            proxies.extend(parsed);
-        }
-        Ok::<_, anyhow::Error>(proxies)
-    })
-    .await
-    .context("proxy file reader task failed")??;
+    let proxies = flx::load_proxy_files(paths.to_owned()).await?;
     Ok(Box::pin(futures_util::stream::iter(proxies)))
 }
 
@@ -681,15 +665,24 @@ async fn run_find(
     // results never overwrite the line it is drawn on.
     let guard1 = make_guard(progress1.clone(), quiet, no_color);
     // An empty pass 1 leaves nothing on the wire so the fallback pass can
-    // open the document itself; group-only requests never fall back.
+    // open the document itself; group-only requests never fall back. When a
+    // fallback is possible, pass 1 leaves the JSON array unclosed and its
+    // output file untruncated so pass 2 (or `close_chained_json` below) can
+    // finish the document without losing pass-1 results.
+    let may_fallback = !protocols.is_empty();
+    let json_doc = may_fallback.then(|| Arc::new(JsonDoc::default()));
     let outcome1 = process_result(
         pass1,
         find.output.clone(),
         cancel.clone(),
         &guard1,
         FinalizeOpts {
-            suppress_empty_json: !protocols.is_empty(),
+            suppress_empty_json: may_fallback,
             emit_csv_header: true,
+            continue_json: json_doc.clone().map(|doc| JsonContinuation {
+                doc,
+                leave_open: true,
+            }),
         },
     )
     .await;
@@ -715,8 +708,7 @@ async fn run_find(
     // the gated pass came up empty or below the limit.
     let limit = find.output.limit;
     let p1_passed = progress1.passed();
-    let needs_fallback =
-        !protocols.is_empty() && (p1_passed == 0 || (limit > 0 && p1_passed < limit));
+    let needs_fallback = may_fallback && (p1_passed == 0 || (limit > 0 && p1_passed < limit));
 
     if needs_fallback {
         let requested = protocols;
@@ -734,7 +726,7 @@ async fn run_find(
         if candidates.is_empty() {
             // The second pass would produce no probes, so skip the redundant
             // judge preflight and emit the document it would have closed.
-            emit_empty_skipped_fallback(&options2).await?;
+            close_chained_json(&options2, json_doc.as_ref().map_or(0, |doc| doc.items())).await?;
             report_validation_summary(
                 ValidationStats {
                     passed: p1_passed,
@@ -788,6 +780,10 @@ async fn run_find(
             FinalizeOpts {
                 suppress_empty_json: false,
                 emit_csv_header: false,
+                continue_json: json_doc.map(|doc| JsonContinuation {
+                    doc,
+                    leave_open: false,
+                }),
             },
         )
         .await;
@@ -823,6 +819,11 @@ async fn run_find(
         return Ok(RunOutcome::Finished);
     }
 
+    // No fallback ran although one was possible (pass 1 filled the limit):
+    // close the array pass 1 left open.
+    if let Some(doc) = &json_doc {
+        close_chained_json(&find.output, doc.items()).await?;
+    }
     report_validation_summary(
         ValidationStats {
             passed: progress1.passed(),
