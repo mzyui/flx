@@ -39,9 +39,13 @@ pub(crate) struct SingletonJob {
     pub(crate) requested: Protocol,
 }
 
+// Identifies a (proxy, group) pair across the worker and aggregator tasks.
+// The id is assigned monotonically per proxy when jobs are built, so it is
+// stable for the proxy's lifetime — unlike an address, which the allocator
+// may hand to a different proxy after the old one is dropped.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GroupKey {
-    proxy: usize,
+    proxy_id: u64,
     group_idx: usize,
 }
 
@@ -190,6 +194,7 @@ pub(crate) async fn do_work(
 
 pub(crate) struct GroupMemberJob {
     pub(crate) proxy: Arc<Proxy>,
+    pub(crate) proxy_id: u64,
     pub(crate) protocol: Protocol,
     pub(crate) group_idx: usize,
     pub(crate) slot: usize,
@@ -208,13 +213,14 @@ pub(crate) async fn do_group_work(
 ) -> anyhow::Result<()> {
     let GroupMemberJob {
         proxy,
+        proxy_id,
         protocol,
         group_idx,
         slot,
         group_len,
     } = member;
     let key = GroupKey {
-        proxy: Arc::as_ptr(&proxy) as usize,
+        proxy_id,
         group_idx,
     };
     if let Some(map) = dead_map.as_ref() {
@@ -307,6 +313,7 @@ pub(crate) async fn aggregate_groups(
     mut group_rx: mpsc::Receiver<GroupWorkResult>,
     aggregate_sender: mpsc::Sender<Proxy>,
     aggregate_progress: ValidationProgress,
+    dead_map: Option<GroupDeadMap>,
 ) {
     let mut states: HashMap<GroupKey, GroupState> = HashMap::new();
     while let Some(msg) = group_rx.recv().await {
@@ -320,6 +327,14 @@ pub(crate) async fn aggregate_groups(
             let finished = states
                 .remove(&msg.key)
                 .expect("current group state was pushed above");
+            // Every member has reported, so the dead flag can never be read
+            // again for this key; evict it to keep the map bounded and free
+            // the id for reuse by later proxies.
+            if let Some(map) = dead_map.as_ref() {
+                map.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&msg.key);
+            }
             aggregate_progress
                 .done
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -331,5 +346,106 @@ pub(crate) async fn aggregate_groups(
                 let _ = aggregate_sender.send(proxy).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn test_params() -> WorkParams {
+        WorkParams {
+            max_attempts: 1,
+            request_timeout: Duration::from_millis(50),
+            insecure: true,
+            support_cookies: false,
+            support_referer: false,
+            retry_delay: Duration::ZERO,
+        }
+    }
+
+    fn group_job(proxy_id: u64) -> GroupMemberJob {
+        GroupMemberJob {
+            proxy: Arc::new(Proxy::new(Ipv4Addr::LOCALHOST, 9)),
+            proxy_id,
+            protocol: Protocol::Http(Anonymity::Unknown),
+            group_idx: 0,
+            slot: 0,
+            group_len: 1,
+        }
+    }
+
+    fn empty_targets() -> JudgeTargets {
+        JudgeTargets {
+            http: Arc::new(checker::JudgePool::from_targets(Vec::new())),
+            tunnel: Arc::new(checker::JudgePool::from_targets(Vec::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_member_marks_only_its_own_key_dead() {
+        let dead_map: GroupDeadMap = Arc::default();
+        let (group_tx, mut group_rx) = mpsc::channel(8);
+        do_group_work(
+            group_job(1),
+            group_tx,
+            empty_targets(),
+            &test_params(),
+            None,
+            Some(Arc::clone(&dead_map)),
+        )
+        .await
+        .unwrap();
+        let result = group_rx.recv().await.unwrap();
+        assert!(result.proxy.is_none());
+        // The failing probe flags exactly its own (id, group) key — never a
+        // different proxy that happens to share an allocation address.
+        let guard = dead_map.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.len(), 1);
+        assert!(guard.values().all(|flag| flag.load(Ordering::Relaxed)));
+    }
+
+    #[tokio::test]
+    async fn aggregate_groups_evicts_dead_flags_when_a_group_completes() {
+        let dead_map: GroupDeadMap = Arc::default();
+        let key = GroupKey {
+            proxy_id: 7,
+            group_idx: 0,
+        };
+        dead_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Arc::new(AtomicBool::new(true)));
+
+        let (group_tx, group_rx) = mpsc::channel(8);
+        let (pass_tx, mut pass_rx) = mpsc::channel(8);
+        let aggregator = tokio::spawn(aggregate_groups(
+            group_rx,
+            pass_tx,
+            ValidationProgress::default(),
+            Some(Arc::clone(&dead_map)),
+        ));
+        group_tx
+            .send(GroupWorkResult {
+                key,
+                slot: 0,
+                group_len: 1,
+                proxy: None,
+            })
+            .await
+            .unwrap();
+        drop(group_tx);
+        // The failed group forwards nothing and must not leave its dead flag
+        // behind to poison a later proxy.
+        assert!(pass_rx.recv().await.is_none());
+        aggregator.await.unwrap();
+        assert!(
+            dead_map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a completed group's dead flag must be evicted"
+        );
     }
 }

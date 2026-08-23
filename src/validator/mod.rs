@@ -6,7 +6,10 @@ mod work;
 
 use std::{
     pin::Pin,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context as TaskContext, Poll},
     time::Duration,
     vec::Vec,
@@ -316,10 +319,16 @@ impl ProxyValidator {
         // concurrently so multi-type results stream out as they complete.
         let aggregate_sender = sender.clone();
         let aggregate_progress = progress.clone();
+        // Shared by group workers so a failed member short-circuits its
+        // siblings; entries are evicted by the aggregator once a group
+        // completes.
+        let worker_group_dead: work::GroupDeadMap =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let group_aggregator = tokio::spawn(aggregate_groups(
             group_rx,
             aggregate_sender,
             aggregate_progress,
+            Some(std::sync::Arc::clone(&worker_group_dead)),
         ));
 
         let manager = tokio::spawn(async move {
@@ -331,6 +340,7 @@ impl ProxyValidator {
                 },
                 GroupMember {
                     proxy: Arc<Proxy>,
+                    proxy_id: u64,
                     protocol: Protocol,
                     group_idx: usize,
                     slot: usize,
@@ -349,8 +359,17 @@ impl ProxyValidator {
 
             // Expand each proxy into its singleton jobs (advertised-gated, OR
             // semantics) plus its AND-group jobs (every member always probed).
+            // Monotonic per-run proxy identity for AND-group bookkeeping; an
+            // address would be unsafe because the allocator can hand a freed
+            // slot to a different proxy mid-run.
+            let next_proxy_id = AtomicU64::new(0);
+            // `total` must use the same unit as `done`/`passed`: one per
+            // singleton job and one per (proxy, group), counted as jobs are
+            // emitted below.
+            let stream_total = Arc::clone(&manager_total);
             let jobs = proxy_source.flat_map(move |proxy: Proxy| {
                 let proxy = Arc::new(proxy);
+                let proxy_id = next_proxy_id.fetch_add(1, Ordering::Relaxed);
                 let advertised = Arc::clone(&proxy.expected_types);
                 let has_singleton = if probe_missed {
                     // Requested types the advertised set does not cover (or
@@ -368,13 +387,7 @@ impl ProxyValidator {
                             .any(|requested| advertised_matches_request(advertised, requested))
                     })
                 };
-                if has_singleton {
-                    manager_total.fetch_add(1, Ordering::Relaxed);
-                }
                 let has_group = !group_spec.is_empty();
-                if has_group {
-                    manager_total.fetch_add(1, Ordering::Relaxed);
-                }
 
                 // Singleton path, allocation-free: no `Vec` is built per proxy,
                 // `Protocol` is `Copy`, and both the advertised and requested
@@ -464,8 +477,14 @@ impl ProxyValidator {
 
                 let group: futures_util::stream::BoxStream<'static, Job> = if has_group {
                     Box::pin(futures_util::stream::unfold(
-                        (0usize, proxy, Arc::clone(&group_spec), Arc::clone(&groups)),
-                        |(mut idx, proxy, spec, groups)| async move {
+                        (
+                            0usize,
+                            proxy_id,
+                            proxy,
+                            Arc::clone(&group_spec),
+                            Arc::clone(&groups),
+                        ),
+                        |(mut idx, proxy_id, proxy, spec, groups)| async move {
                             if idx >= spec.len() {
                                 return None;
                             }
@@ -475,12 +494,13 @@ impl ProxyValidator {
                             Some((
                                 Job::GroupMember {
                                     proxy: Arc::clone(&proxy),
+                                    proxy_id,
                                     protocol,
                                     group_idx,
                                     slot,
                                     group_len,
                                 },
-                                (idx, proxy, spec, groups),
+                                (idx, proxy_id, proxy, spec, groups),
                             ))
                         },
                     ))
@@ -488,13 +508,24 @@ impl ProxyValidator {
                     Box::pin(futures_util::stream::empty())
                 };
 
-                singleton.chain(group)
+                singleton.chain(group).inspect({
+                    let stream_total = Arc::clone(&stream_total);
+                    move |job| match job {
+                        Job::Singleton { .. } => {
+                            stream_total.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // A group is one unit of work regardless of member
+                        // count; slot 0 is emitted exactly once per group.
+                        Job::GroupMember { slot, .. } if *slot == 0 => {
+                            stream_total.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                })
             });
 
             let worker_group_tx = group_tx.clone();
             let worker_failures = failure_tx.clone();
-            let worker_group_dead: work::GroupDeadMap =
-                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             jobs.for_each_concurrent(concurrency_limit, move |job| {
                 let sender = sender.clone();
                 let counters = worker_counters.clone();
@@ -537,6 +568,7 @@ impl ProxyValidator {
                         }
                         Job::GroupMember {
                             proxy,
+                            proxy_id,
                             protocol,
                             group_idx,
                             slot,
@@ -545,6 +577,7 @@ impl ProxyValidator {
                             if let Err(_e) = do_group_work(
                                 GroupMemberJob {
                                     proxy,
+                                    proxy_id,
                                     protocol,
                                     group_idx,
                                     slot,
@@ -951,6 +984,127 @@ mod tests {
         while validator.get_one().await.is_some() {}
         assert_eq!(progress.total(), 0);
         assert_eq!(progress.done(), 0);
+    }
+
+    #[tokio::test]
+    async fn total_counts_each_singleton_job_not_each_proxy() {
+        // Offline-safe: two advertised HTTP variants each satisfy the single
+        // requested type, so every candidate emits two singleton jobs. `total`
+        // must count jobs (two per proxy) exactly like `done` does — counting
+        // per proxy would let done/pass outrun total on multi-type runs.
+        let judge = spawn_echo_judge().await;
+        let candidates = (1u16..=2).map(|port| {
+            Proxy::with_expected_types(
+                std::net::Ipv4Addr::LOCALHOST,
+                port,
+                std::sync::Arc::from([
+                    Protocol::Http(Anonymity::Anonymous),
+                    Protocol::Http(Anonymity::Unknown),
+                ]),
+            )
+        });
+        let config = Config {
+            types: vec![Protocol::Http(Anonymity::Unknown)],
+            http_judge_urls: vec![judge],
+            https_judge_urls: vec![],
+            ..Config::default()
+        };
+        let mut validator =
+            ProxyValidator::validate(futures_util::stream::iter(candidates), config)
+                .await
+                .unwrap();
+        let progress = validator.progress();
+        while validator.get_one().await.is_some() {}
+        assert_eq!(progress.total(), 4);
+        assert_eq!(progress.done(), 4);
+        assert!(progress.fraction() <= 1.0);
+    }
+
+    #[tokio::test]
+    async fn group_failure_does_not_leak_to_the_next_candidate() {
+        // Offline-safe: the first AND-group candidate fails fast against a
+        // closed port; the second is backed by a mock HTTP proxy and must
+        // still be probed. Address-derived group keys could inherit the dead
+        // flag of the first candidate when the allocator reuses its slot;
+        // monotonic ids keep every candidate independently probeable.
+        let judge = spawn_echo_judge().await;
+        let proxy_port = spawn_mock_http_proxy().await;
+        let candidates = [
+            Proxy::new(std::net::Ipv4Addr::LOCALHOST, 9),
+            Proxy::new(std::net::Ipv4Addr::LOCALHOST, proxy_port),
+        ];
+        let config = Config {
+            types: Vec::new(),
+            groups: vec![vec![Protocol::Http(Anonymity::Unknown)]],
+            http_judge_urls: vec![judge],
+            https_judge_urls: vec![],
+            ..Config::default()
+        };
+        let mut validator =
+            ProxyValidator::validate(futures_util::stream::iter(candidates), config)
+                .await
+                .unwrap();
+        let progress = validator.progress();
+        let winner = validator
+            .get_one()
+            .await
+            .expect("the mock candidate must pass");
+        while validator.get_one().await.is_some() {}
+        assert_eq!(progress.done(), 2);
+        assert_eq!(progress.passed(), 1);
+        assert!(winner
+            .proxy_types
+            .iter()
+            .any(|pt| matches!(pt.protocol, Protocol::Http(_))));
+    }
+
+    /// Spawns a minimal HTTP forward proxy: it answers every request with a
+    /// 200 whose body echoes the incoming `X-Fluxy-Token` header, which is
+    /// exactly the marker the judge check requires.
+    async fn spawn_mock_http_proxy() -> u16 {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    loop {
+                        let read = stream.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..read]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let token = text
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("x-fluxy-token")
+                                .then(|| value.trim().to_owned())
+                        })
+                        .unwrap_or_default();
+                    let body = format!("HTTP_X_FLUXY_TOKEN = {token}\n");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        port
     }
 
     /// Spawns a plain-HTTP judge that echoes the `X-Fluxy-Token` header, enough
