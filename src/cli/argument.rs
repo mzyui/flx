@@ -3,6 +3,7 @@ use clap::builder::TypedValueParser;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 fn is_valid_type_value(value: &str) -> bool {
     // Accept every token the protocol parser understands (including the
@@ -262,11 +263,11 @@ pub struct FetcherArgs {
     pub list_providers: bool,
 
     /// Maximum number of proxy sources fetched concurrently.
-    #[arg(long, default_value_t = 25, help_heading = "Fetching")]
+    #[arg(long, default_value_t = flx::fetcher::DEFAULT_CONCURRENCY_LIMIT, help_heading = "Fetching")]
     pub fetch_concurrency: usize,
 
     /// Freshness in minutes for the local provider-source cache.
-    #[arg(long, default_value_t = 15, help_heading = "Fetching")]
+    #[arg(long, default_value_t = flx::fetcher::DEFAULT_CACHE_TTL_MINUTES, help_heading = "Fetching")]
     pub cache_ttl: u64,
 
     /// Ignore the local provider-source cache and fetch every source again.
@@ -282,7 +283,7 @@ pub struct FetcherArgs {
     pub fallback_threshold: Option<usize>,
 
     /// Maximum seconds to wait for the fallback provider phase (0 = unbounded).
-    #[arg(long, default_value_t = 30, help_heading = "Fetching")]
+    #[arg(long, default_value_t = flx::fetcher::PRIMARY_PHASE_TIMEOUT.as_secs(), help_heading = "Fetching")]
     pub fetch_phase_timeout: u64,
 
     /// Disable deduplication of identical endpoints across sources.
@@ -304,6 +305,13 @@ pub struct FetchArgs {
     pub output: OutputOptions,
 }
 
+/// Judge defaults joined once for clap's `default_value`, so the CLI and the
+/// library cannot drift apart.
+static HTTP_JUDGE_DEFAULTS: LazyLock<String> =
+    LazyLock::new(|| flx::validator::DEFAULT_HTTP_JUDGE_URLS.join(","));
+static HTTPS_JUDGE_DEFAULTS: LazyLock<String> =
+    LazyLock::new(|| flx::validator::DEFAULT_HTTPS_JUDGE_URLS.join(","));
+
 /// Options controlling proxy validation against online judges.
 #[derive(Args, Debug, Clone)]
 pub struct ValidatorArgs {
@@ -312,7 +320,7 @@ pub struct ValidatorArgs {
     pub types: Vec<String>,
 
     /// Maximum number of concurrent proxy checks.
-    #[arg(short = 'm', long, default_value_t = 500, help_heading = "Validation")]
+    #[arg(short = 'm', long, default_value_t = flx::validator::DEFAULT_CONCURRENCY_LIMIT, help_heading = "Validation")]
     pub max_connections: usize,
 
     /// Maximum number of attempts to validate a proxy.
@@ -330,7 +338,7 @@ pub struct ValidatorArgs {
     /// Online judges used to validate plain HTTP proxy forwarding.
     #[arg(
         long,
-        default_value = "http://azenv.net/,http://wfuchs.de/azenv.php,http://proxyjudge.us/,http://shinh.org/env.cgi",
+        default_value = HTTP_JUDGE_DEFAULTS.as_str(),
         value_delimiter = ',',
         help_heading = "Validation"
     )]
@@ -339,7 +347,7 @@ pub struct ValidatorArgs {
     /// Online judges used for HTTPS, CONNECT and SOCKS tunnels.
     #[arg(
         long,
-        default_value = "https://aranguren.org/azenv.php,https://wfuchs.de/azenv.php",
+        default_value = HTTPS_JUDGE_DEFAULTS.as_str(),
         value_delimiter = ',',
         help_heading = "Validation"
     )]

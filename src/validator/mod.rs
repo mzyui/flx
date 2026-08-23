@@ -21,7 +21,9 @@ use futures_util::{Stream, StreamExt};
 use tokio::time::Instant;
 use tokio::{sync::mpsc, task::JoinHandle};
 
-pub use config::{Config, DEFAULT_CONCURRENCY_LIMIT};
+pub use config::{
+    Config, DEFAULT_CONCURRENCY_LIMIT, DEFAULT_HTTPS_JUDGE_URLS, DEFAULT_HTTP_JUDGE_URLS,
+};
 pub use progress::{JudgeHealthReport, ValidationProgress};
 pub use tunnel::ValidationStatus;
 pub use work::ProxyFailure;

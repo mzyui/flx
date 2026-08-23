@@ -23,30 +23,6 @@ fn anonymity_from_name(name: &str) -> Option<Anonymity> {
     }
 }
 
-/// Best anonymity rank across a proxy's validated types; types without an
-/// anonymity level (SOCKS, CONNECT) count as `Unknown`.
-pub(crate) fn proxy_anonymity_rank(proxy: &Proxy) -> u8 {
-    proxy
-        .proxy_types
-        .iter()
-        .filter_map(|proxy_type| match proxy_type.protocol {
-            Protocol::Http(anonymity) | Protocol::Https(anonymity) => Some(anonymity.rank()),
-            _ => None,
-        })
-        .max()
-        .unwrap_or_else(|| Anonymity::Unknown.rank())
-}
-
-// Maps any protocol to the anonymity-agnostic form of its family, so an
-// `--exclude-type HTTP` filter also drops `HTTP:Elite` results.
-fn protocol_family(protocol: Protocol) -> Protocol {
-    match protocol {
-        Protocol::Http(_) => Protocol::Http(Anonymity::Unknown),
-        Protocol::Https(_) => Protocol::Https(Anonymity::Unknown),
-        other => other,
-    }
-}
-
 /// Post-validation filters applied before a proxy is rendered.
 pub struct ProxyFilter {
     min_anonymity_rank: Option<u8>,
@@ -80,7 +56,7 @@ impl ProxyFilter {
 
     pub fn matches(&self, proxy: &Proxy) -> bool {
         if let Some(min_rank) = self.min_anonymity_rank {
-            if proxy_anonymity_rank(proxy) < min_rank {
+            if flx::proxy_anonymity_rank(proxy) < min_rank {
                 return false;
             }
         }
@@ -118,9 +94,9 @@ impl ProxyFilter {
                     .collect()
             };
             if types.iter().any(|protocol| {
-                self.exclude_types
-                    .iter()
-                    .any(|excluded| protocol_family(*excluded) == protocol_family(*protocol))
+                self.exclude_types.iter().any(|excluded| {
+                    flx::protocol_family(*excluded) == flx::protocol_family(*protocol)
+                })
             }) {
                 return false;
             }

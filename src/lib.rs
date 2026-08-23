@@ -22,6 +22,7 @@
 
 pub mod error;
 pub mod fetcher;
+pub mod filters;
 pub mod geolookup;
 
 mod api;
@@ -43,9 +44,13 @@ use std::{
 
 // ── Root re-exports ───────────────────────────────────────────────────
 
-pub use api::Flx;
+pub use api::{load_proxy_files, Flx, ValidationRun};
 pub use error::{FlxError, ProtocolParseError, ProxyParseError};
 pub use fetcher::{Config as FetcherConfig, FetchStage, ProxyFetcher};
+pub use filters::{
+    protocol_family, proxy_anonymity_rank, shuffle_proxies, sort_proxies, ProxyStreamExt, SortKey,
+    SortOrder,
+};
 pub use geolookup::models::GeoData;
 pub use geolookup::{
     install_download_observer, sync_database, DownloadProgress, GeoLookup, IpType, SyncOutcome,
@@ -62,10 +67,11 @@ pub use validator::{
 /// Convenience glob for common types.
 pub mod prelude {
     pub use crate::{
-        all_providers, sync_database, Anonymity, FetcherConfig, Flx, FlxError, GeoData, GeoLookup,
-        IpType, JudgeHealthReport, Protocol, Proxy, ProxyFailure, ProxyFetcher, ProxyParseError,
-        ProxySource, ProxyType, ProxyValidator, RuntimeStats, ScrapeMode, Source, SyncOutcome,
-        ValidationProgress, ValidatorConfig,
+        all_providers, load_proxy_files, sync_database, Anonymity, FetcherConfig, Flx, FlxError,
+        GeoData, GeoLookup, IpType, JudgeHealthReport, Protocol, Proxy, ProxyFailure, ProxyFetcher,
+        ProxyParseError, ProxySource, ProxyStreamExt, ProxyType, ProxyValidator, RuntimeStats,
+        ScrapeMode, SortKey, SortOrder, Source, SyncOutcome, ValidationProgress, ValidationRun,
+        ValidatorConfig,
     };
 }
 

@@ -44,7 +44,8 @@ use crate::{
 
 pub(crate) const FETCH_CHANNEL_CAPACITY: usize = 2_048;
 
-const PRIMARY_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard budget for the primary provider phase before the fallback decides.
+pub const PRIMARY_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Async stream of scraped proxy candidates.
 pub struct ProxyFetcher {
