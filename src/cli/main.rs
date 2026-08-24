@@ -581,8 +581,11 @@ async fn run_find(
     }
 
     // Candidates are recorded while pass 1 streams so the fallback pass can
-    // re-validate the same set without re-fetching.
+    // re-validate the same set without re-fetching. The recorder filters by
+    // the same missed-probe predicate the fallback consumer applies, so it
+    // never deep-copies candidates that would be discarded anyway.
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
+    let recorded_types: Arc<[Protocol]> = Arc::from(protocols.clone());
     let warmup = make_warmup(quiet, no_color, download, false, None);
     let config = validator_config(&find.validator, protocols.clone(), groups.clone(), false);
 
@@ -599,7 +602,11 @@ async fn run_find(
                 return Ok(RunOutcome::Cancelled);
             }
         };
-        let source = Box::pin(tee_recorder(files, recordings.clone()));
+        let source = Box::pin(tee_recorder(
+            files,
+            recordings.clone(),
+            Arc::clone(&recorded_types),
+        ));
         let validate = ProxyValidator::validate(source, config);
         tokio::pin!(validate);
         let pass = tokio::select! {
@@ -624,7 +631,11 @@ async fn run_find(
             drop(warmup);
             return Ok(RunOutcome::Cancelled);
         };
-        let source = Box::pin(tee_recorder(fetcher, recordings.clone()));
+        let source = Box::pin(tee_recorder(
+            fetcher,
+            recordings.clone(),
+            Arc::clone(&recorded_types),
+        ));
         let validate = ProxyValidator::validate(source, config);
         tokio::pin!(validate);
         let pass = tokio::select! {
@@ -714,14 +725,11 @@ async fn run_find(
 
     if needs_fallback {
         let requested = protocols;
-        // Only candidates whose advertisement leaves a requested type
-        // uncovered can yield new results here; the rest already passed (or
+        // The recorder already kept only candidates whose advertisement
+        // leaves a requested type uncovered; the rest already passed (or
         // failed) in pass 1 and would only repeat the judge preflight.
         let candidates: Vec<Proxy> =
-            std::mem::take(&mut *recordings.lock().expect("recorder poisoned"))
-                .into_iter()
-                .filter(|proxy| needs_missed_probe(proxy, &requested))
-                .collect();
+            std::mem::take(&mut *recordings.lock().expect("recorder poisoned"));
         let mut options2 = find.output.clone();
         options2.limit = if limit > 0 { limit - p1_passed } else { 0 };
 
@@ -910,21 +918,26 @@ fn report_validation_summary(stats: ValidationStats, dst: Option<&str>, quiet: b
 fn tee_recorder<S>(
     inner: S,
     recordings: Arc<std::sync::Mutex<Vec<Proxy>>>,
+    requested: Arc<[Protocol]>,
 ) -> impl Stream<Item = Proxy>
 where
     S: Stream<Item = Proxy> + Unpin,
 {
     futures_util::stream::unfold(inner, move |mut inner| {
         let recordings = Arc::clone(&recordings);
+        let requested = Arc::clone(&requested);
         async move {
             match inner.next().await {
-                Some(proxy) => {
+                // Only candidates the fallback pass could re-probe are worth
+                // a deep copy; the consumer would discard the rest anyway.
+                Some(proxy) if needs_missed_probe(&proxy, &requested) => {
                     recordings
                         .lock()
                         .expect("candidate recorder mutex poisoned")
                         .push(proxy.clone());
                     Some((proxy, inner))
                 }
+                Some(proxy) => Some((proxy, inner)),
                 None => None,
             }
         }

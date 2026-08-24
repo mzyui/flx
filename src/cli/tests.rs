@@ -861,9 +861,16 @@ fn tee_recorder_forwards_and_records_candidates() {
         .map(|port| Proxy::new(std::net::Ipv4Addr::LOCALHOST, port))
         .collect();
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
+    // Plain `Proxy::new` candidates advertise nothing, so every one of them
+    // is a missed-probe candidate regardless of the requested list.
+    let requested: Arc<[Protocol]> = Arc::from(vec![Protocol::Http(Anonymity::Unknown)]);
     let rt = runtime::Builder::new_current_thread().build().unwrap();
     let forwarded = rt.block_on(async {
-        let s = tee_recorder(stream::iter(proxies.clone()), Arc::clone(&recordings));
+        let s = tee_recorder(
+            stream::iter(proxies.clone()),
+            Arc::clone(&recordings),
+            requested,
+        );
         s.collect::<Vec<_>>().await
     });
     let recorded = recordings.lock().unwrap();
@@ -872,6 +879,42 @@ fn tee_recorder_forwards_and_records_candidates() {
     assert_eq!(forwarded[0].ip, proxies[0].ip);
     assert_eq!(forwarded[1].port, proxies[1].port);
     assert_eq!(recorded[2].port, proxies[2].port);
+}
+
+#[test]
+fn tee_recorder_skips_candidates_the_fallback_would_discard() {
+    // An advertised set covering every requested type can never yield a
+    // missed probe, so the recorder must not pay a deep copy for it.
+    let covering = Proxy::with_expected_types(
+        std::net::Ipv4Addr::new(192, 168, 0, 9),
+        9000,
+        std::sync::Arc::from([Protocol::Http(Anonymity::Unknown)]),
+    );
+    let plain = sample_proxy(1);
+    let plain_port = plain.port;
+    let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
+    let requested: Arc<[Protocol]> = Arc::from(vec![Protocol::Http(Anonymity::Unknown)]);
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let forwarded = rt.block_on(async {
+        let s = tee_recorder(
+            stream::iter(vec![covering, plain]),
+            Arc::clone(&recordings),
+            requested,
+        );
+        s.collect::<Vec<_>>().await
+    });
+    assert_eq!(
+        forwarded.len(),
+        2,
+        "every candidate must still stream through"
+    );
+    let recorded = recordings.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "only missed-probe candidates are recorded"
+    );
+    assert_eq!(recorded[0].port, plain_port);
 }
 
 #[test]
