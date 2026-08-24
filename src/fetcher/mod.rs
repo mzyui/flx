@@ -269,9 +269,7 @@ impl ProxyFetcher {
                 // primary counter is stable before evaluating the fallback
                 // threshold.  Notify is a zero-cost signal: the consumer
                 // calls `notify_one` when it detects the channel is empty.
-                if sender.capacity() < sender.max_capacity() {
-                    drain_notify_coordinator.notified().await;
-                }
+                wait_for_drain(&sender, &drain_notify_coordinator).await;
 
                 let found = produced.load(Ordering::Relaxed);
                 if let Some(threshold) = fallback_threshold {
@@ -341,6 +339,20 @@ impl ProxyFetcher {
             stop_signaled: AtomicBool::new(false),
             stages: Some(stages),
         })
+    }
+}
+
+// Waits until the consumer has emptied the channel buffer so the produced
+// counter is stable. A `notify_one` fired before this task registered as a
+// waiter leaves a stale stored permit, so every wakeup must re-verify the
+// real condition (empty buffer) instead of trusting the signal alone.
+async fn wait_for_drain(tx: &mpsc::Sender<Proxy>, notify: &Notify) {
+    while tx.capacity() < tx.max_capacity() {
+        let drained = notify.notified();
+        if tx.capacity() == tx.max_capacity() {
+            break;
+        }
+        drained.await;
     }
 }
 
@@ -547,8 +559,8 @@ impl Drop for ProxyFetcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_proxy, do_work, finish_phase, protocol_hash, source_host, AcceptContext, DedupTable,
-        FetchJob, FetchStage, PhaseContext, ProxyFetcher, Throttle,
+        accept_proxy, do_work, finish_phase, protocol_hash, source_host, wait_for_drain,
+        AcceptContext, DedupTable, FetchJob, FetchStage, PhaseContext, ProxyFetcher, Throttle,
     };
     use crate::fetcher::{cache::Cache, Config};
     use crate::geolookup::models::GeoData;
@@ -837,6 +849,46 @@ mod tests {
 
         assert!(accepted_home.is_some());
         assert!(rejected_datacenter.is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_wait_survives_stale_notify_permits() {
+        // Regression test: the consumer signals a drain whenever it finds
+        // the channel empty; a signal fired before the coordinator
+        // registered as a waiter leaves one stored permit behind. The old
+        // single `notified().await` consumed it instantly and evaluated the
+        // fallback threshold while items were still buffered.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Proxy>(4);
+        for port in 8000u16..8003 {
+            tx.send(Proxy::new(Ipv4Addr::new(192, 0, 2, 1), port))
+                .await
+                .unwrap();
+        }
+        let notify = Arc::new(tokio::sync::Notify::new());
+        notify.notify_one();
+
+        let wait = wait_for_drain(&tx, &notify);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), wait)
+                .await
+                .is_err(),
+            "a stale permit must not end the drain wait while items are buffered"
+        );
+
+        // A real drain followed by a fresh signal must release the wait. The
+        // consumer runs as a task so the waiter is woken by the signal rather
+        // than by the short-circuit empty-buffer check.
+        let consumer_notify = Arc::clone(&notify);
+        let consumer = tokio::spawn(async move {
+            // `recv` parks forever on an empty-but-open channel, so drain
+            // with `try_recv`.
+            while rx.try_recv().is_ok() {}
+            consumer_notify.notify_one();
+        });
+        tokio::time::timeout(Duration::from_secs(1), wait_for_drain(&tx, &notify))
+            .await
+            .expect("a real drain signal must release the wait");
+        consumer.await.unwrap();
     }
 
     #[tokio::test]
