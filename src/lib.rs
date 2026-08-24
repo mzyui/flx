@@ -25,6 +25,9 @@ pub mod fetcher;
 pub mod filters;
 pub mod geolookup;
 
+#[cfg(test)]
+mod test_support;
+
 mod api;
 pub mod negotiators;
 pub mod providers;

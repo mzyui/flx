@@ -544,7 +544,7 @@ mod tests {
             std::future::pending::<()>().await; // never reply
         });
 
-        let fast_url = spawn_plain_echo_judge().await;
+        let fast_url = crate::test_support::spawn_echo_judge().await;
         let started = Instant::now();
 
         let pool = JudgePool::build(
@@ -638,44 +638,6 @@ mod tests {
             std::sync::Arc::new(ValidationTarget::online(&url).unwrap()),
         ]));
         assert_eq!(pool.len(), 2);
-    }
-
-    async fn spawn_plain_echo_judge() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let mut received = Vec::new();
-                loop {
-                    let n = match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    received.extend_from_slice(&buf[..n]);
-                    if received.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let mut token = String::new();
-                for line in received.split(|&b| b == b'\n') {
-                    let line = String::from_utf8_lossy(line);
-                    let (name, value) = line.split_once(':').unwrap_or(("", ""));
-                    if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
-                        token = value.trim().to_owned();
-                        break;
-                    }
-                }
-                let body = format!("HTTP_X_FLUXY_TOKEN = {token}");
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-        format!("http://{address}/azenv.php")
     }
 
     // Self-signed fixtures (CN=127.0.0.1, SAN IP:127.0.0.1) that a strict TLS
