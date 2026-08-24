@@ -493,10 +493,17 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
                     }
                 }
             }
-            // Carry the anonymity level through for HTTP rows.
-            if let (Some(Protocol::Http(_)), Some(cell)) = (protocol.as_ref(), anon_cell.as_deref())
-            {
-                protocol = Some(Protocol::Http(anonymity_from_str(cell)));
+            // Carry the source-claimed anonymity through for HTTP and HTTPS
+            // rows alike: the table's anonymity column describes the proxy
+            // regardless of connect scheme. Other protocols have no anonymity
+            // notion.
+            if let (Some(current), Some(cell)) = (protocol, anon_cell.as_deref()) {
+                let level = anonymity_from_str(cell);
+                protocol = match current {
+                    Protocol::Http(_) => Some(Protocol::Http(level)),
+                    Protocol::Https(_) => Some(Protocol::Https(level)),
+                    other => Some(other),
+                };
             }
 
             if !visit((ip, port, protocol)) {
@@ -738,7 +745,28 @@ mod tests {
         let parsed = parse_html_table(body);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].1, 8080);
+        // The anonymity column describes the proxy regardless of the connect
+        // scheme, so an HTTPS row carries it just like an HTTP one.
+        assert_eq!(parsed[0].2, Some(Protocol::Https(Anonymity::Elite)));
+    }
+
+    #[test]
+    fn html_table_https_yes_without_anonymity_column_stays_unknown() {
+        // No anonymity column at all: the HTTPS flag alone must not invent a
+        // level.
+        let body = r#"<table><tr><th>IP Address</th><th>Port</th><th>Https</th></tr>
+            <tr><td>1.2.3.4</td><td>8080</td><td>yes</td></tr></table>"#;
+        let parsed = parse_html_table(body);
         assert_eq!(parsed[0].2, Some(Protocol::Https(Anonymity::Unknown)));
+    }
+
+    #[test]
+    fn html_table_socks_rows_ignore_the_anonymity_column() {
+        // SOCKS has no anonymity notion; the cell must not be forced onto it.
+        let body = r#"<table><tr><th>Proxy Type</th><th>IP ADDRESS</th><th>Port</th><th>Anonymity</th></tr>
+            <tr><td>socks4</td><td>1.2.3.4</td><td>1080</td><td>elite proxy</td></tr></table>"#;
+        let parsed = parse_html_table(body);
+        assert_eq!(parsed[0].2, Some(Protocol::Socks4));
     }
 
     #[test]
