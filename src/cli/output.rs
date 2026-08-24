@@ -584,33 +584,24 @@ fn ip_type_str(proxy: &Proxy) -> &'static str {
 }
 
 fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
-    let ip = proxy.ip.to_string();
-    let port = proxy.port.to_string();
-    let proxy_type = proxy
-        .proxy_types
-        .iter()
-        .map(|pt| pt.protocol.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let response_time = format!("{:.2}", proxy.avg_response_time());
-    let country = proxy.geo.iso_code.as_deref().unwrap_or("");
-
-    for (i, field) in [
-        ip.as_str(),
-        port.as_str(),
-        proxy_type.as_str(),
-        response_time.as_str(),
-        country,
-        ip_type_str(proxy),
-    ]
-    .iter()
-    .enumerate()
-    {
+    // Written field-by-field straight into `buf`: intermediate `String`s here
+    // would be pure allocator churn on the hottest output path. The numeric
+    // and protocol fields can never contain CSV-special characters, so only
+    // the free-form country and ip-type fields go through `csv_quote`.
+    let _ = write!(buf, "{},{}", proxy.ip, proxy.port);
+    buf.push(b',');
+    for (i, pt) in proxy.proxy_types.iter().enumerate() {
         if i > 0 {
             buf.push(b',');
         }
-        csv_quote(buf, field);
+        let _ = write!(buf, "{}", pt.protocol);
     }
+    buf.push(b',');
+    let _ = write!(buf, "{:.2}", proxy.avg_response_time());
+    buf.push(b',');
+    csv_quote(buf, proxy.geo.iso_code.as_deref().unwrap_or(""));
+    buf.push(b',');
+    csv_quote(buf, ip_type_str(proxy));
     buf.push(b'\n');
 }
 

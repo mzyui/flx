@@ -118,6 +118,8 @@ pub struct WarmupBar;
 #[cfg(not(feature = "progress_bar"))]
 impl WarmupBar {
     pub fn set_phase(&self, _phase: &'static str) {}
+
+    pub fn refresh(&self) {}
 }
 
 #[cfg(not(feature = "progress_bar"))]

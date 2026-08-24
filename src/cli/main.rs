@@ -8,7 +8,7 @@ use colored::Colorize;
 use flx::initialize_logging;
 use flx::{
     proxy::models::{Anonymity, Protocol, Proxy},
-    FetchStage, IpType, ProxySource, ProxyValidator,
+    FetchStage, IpType, ProxySource, ProxyValidator, ValidationProgress,
 };
 use futures_util::{Stream, StreamExt};
 use std::io::Write as _;
@@ -411,6 +411,78 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     outcome
 }
 
+// Abstraction over the real warmup bar and the no-progress stub so the fetch
+// startup below works in both feature configurations.
+trait PhaseLabel {
+    fn set_phase(&self, phase: &'static str);
+}
+
+#[cfg(feature = "progress_bar")]
+impl PhaseLabel for progress::WarmupBar {
+    fn set_phase(&self, phase: &'static str) {
+        progress::WarmupBar::set_phase(self, phase)
+    }
+}
+
+#[cfg(not(feature = "progress_bar"))]
+impl PhaseLabel for WarmupBar {
+    fn set_phase(&self, phase: &'static str) {
+        WarmupBar::set_phase(self, phase)
+    }
+}
+
+// Shared startup for the fetching phase of `grab` and `find`: races the
+// fetcher against cancel and relays the gathering stages onto the warmup bar.
+// Returns `None` when cancel fired; the caller owns the warmup bar and decides
+// how to unwind.
+async fn start_fetch_phase<B>(
+    fetch_cfg: flx::fetcher::Config,
+    cancel: &Arc<tokio::sync::Notify>,
+    warmup: Option<Arc<B>>,
+    done_label: &'static str,
+) -> anyhow::Result<Option<(flx::ProxyFetcher, Option<tokio::task::JoinHandle<()>>)>>
+where
+    B: PhaseLabel + Send + Sync + 'static,
+{
+    if let Some(bar) = warmup.as_deref() {
+        let phase = if fetch_cfg.enable_geo_lookup {
+            "Preparing GeoLite2 database …"
+        } else {
+            "Fetching proxy lists …"
+        };
+        bar.set_phase(phase);
+    }
+    let mut fetcher = tokio::select! {
+        fetcher = ProxySource::from_fetcher(fetch_cfg) => {
+            fetcher.context("failed to start proxy fetcher")?
+        }
+        _ = cancel.notified() => return Ok(None),
+    };
+    let stages = fetcher.stage_events();
+    if let Some(bar) = warmup.as_deref() {
+        bar.set_phase("Fetching proxy lists …");
+    }
+    // Watch the gathering phases on a side task so the bar stays live while
+    // results stream out in parallel.
+    let watcher = match (warmup, stages) {
+        (Some(bar), Some(mut rx)) => Some(tokio::spawn(async move {
+            while let Some(stage) = rx.recv().await {
+                let phase = match stage {
+                    FetchStage::Primary => "Fetching primary sources …",
+                    FetchStage::Fallback => "Fetching fallback sources …",
+                    FetchStage::Done => done_label,
+                };
+                bar.set_phase(phase);
+                if matches!(stage, FetchStage::Done) {
+                    break;
+                }
+            }
+        })),
+        _ => None,
+    };
+    Ok(Some((fetcher, watcher)))
+}
+
 async fn run_grab(
     grab: FetchArgs,
     quiet: bool,
@@ -432,28 +504,13 @@ async fn run_grab(
     } else {
         None
     };
-    if let Some(bar) = &warmup {
-        let phase = if fetch_cfg.enable_geo_lookup {
-            "Preparing GeoLite2 database …"
-        } else {
-            "Fetching proxy lists …"
-        };
-        bar.set_phase(phase);
-    }
-    let mut fetcher = tokio::select! {
-        fetcher = ProxySource::from_fetcher(fetch_cfg) => {
-            fetcher.context("failed to start proxy fetcher")?
-        }
-        _ = cancel.notified() => {
-            drop(warmup);
-            return Ok(RunOutcome::Cancelled);
-        }
+    let Some((fetcher, watcher)) =
+        start_fetch_phase(fetch_cfg, &cancel, warmup.clone(), "Done gathering").await?
+    else {
+        drop(warmup);
+        return Ok(RunOutcome::Cancelled);
     };
     let accepted = fetcher.accepted_handle();
-    let stages = fetcher.stage_events();
-    if let Some(bar) = &warmup {
-        bar.set_phase("Fetching proxy lists …");
-    }
     // Repaint the bar on a fixed cadence so the gathered count stays live even
     // while the source stream is quiet.
     let ticker = warmup.as_ref().map(|bar| {
@@ -468,25 +525,6 @@ async fn run_grab(
             }
         })
     });
-    let watcher = match (&warmup, stages) {
-        (Some(bar), Some(mut rx)) => {
-            let bar = Arc::clone(bar);
-            Some(tokio::spawn(async move {
-                while let Some(stage) = rx.recv().await {
-                    let phase = match stage {
-                        FetchStage::Primary => "Fetching primary sources …",
-                        FetchStage::Fallback => "Fetching fallback sources …",
-                        FetchStage::Done => "Done gathering",
-                    };
-                    bar.set_phase(phase);
-                    if matches!(stage, FetchStage::Done) {
-                        break;
-                    }
-                }
-            }))
-        }
-        _ => None,
-    };
     let started = std::time::Instant::now();
     let dst: Option<String> = grab
         .output
@@ -575,49 +613,18 @@ async fn run_find(
         pass
     } else {
         let fetch_cfg = fetcher_config(&find.fetcher);
-        if let Some(bar) = &warmup {
-            let phase = if fetch_cfg.enable_geo_lookup {
-                "Preparing GeoLite2 database …"
-            } else {
-                "Fetching proxy lists …"
-            };
-            bar.set_phase(phase);
-        }
-        let mut fetcher = tokio::select! {
-            fetcher = ProxySource::from_fetcher(fetch_cfg) => {
-                fetcher.context("failed to start proxy fetcher")?
-            }
-            _ = cancel.notified() => {
-                drop(warmup);
-                return Ok(RunOutcome::Cancelled);
-            }
+        let Some((fetcher, watcher)) = start_fetch_phase(
+            fetch_cfg,
+            &cancel,
+            warmup.clone(),
+            "Checking online judges …",
+        )
+        .await?
+        else {
+            drop(warmup);
+            return Ok(RunOutcome::Cancelled);
         };
-        let stages = fetcher.stage_events();
         let source = Box::pin(tee_recorder(fetcher, recordings.clone()));
-        if let Some(bar) = &warmup {
-            bar.set_phase("Fetching proxy lists …");
-        }
-        // Watch the gathering phases on a side task while the validator
-        // preflights judges and consumes the stream in parallel.
-        let watcher = match (&warmup, stages) {
-            (Some(bar), Some(mut rx)) => {
-                let bar = Arc::clone(bar);
-                Some(tokio::spawn(async move {
-                    while let Some(stage) = rx.recv().await {
-                        let phase = match stage {
-                            FetchStage::Primary => "Fetching primary sources …",
-                            FetchStage::Fallback => "Fetching fallback sources …",
-                            FetchStage::Done => "Checking online judges …",
-                        };
-                        bar.set_phase(phase);
-                        if matches!(stage, FetchStage::Done) {
-                            break;
-                        }
-                    }
-                }))
-            }
-            _ => None,
-        };
         let validate = ProxyValidator::validate(source, config);
         tokio::pin!(validate);
         let pass = tokio::select! {
@@ -691,12 +698,7 @@ async fn run_find(
     if !matches!(outcome1, Ok(RunOutcome::Finished)) {
         if matches!(outcome1, Ok(RunOutcome::Cancelled)) {
             report_validation_summary(
-                ValidationStats {
-                    passed: progress1.passed(),
-                    done: progress1.done(),
-                    total: progress1.total(),
-                    elapsed: started.elapsed(),
-                },
+                ValidationStats::from_progress(&progress1, started.elapsed()),
                 dst.as_deref(),
                 quiet,
             );
@@ -728,12 +730,7 @@ async fn run_find(
             // judge preflight and emit the document it would have closed.
             close_chained_json(&options2, json_doc.as_ref().map_or(0, |doc| doc.items())).await?;
             report_validation_summary(
-                ValidationStats {
-                    passed: p1_passed,
-                    done: progress1.done(),
-                    total: progress1.total(),
-                    elapsed: started.elapsed(),
-                },
+                ValidationStats::from_progress(&progress1, started.elapsed()),
                 dst.as_deref(),
                 quiet,
             );
@@ -751,12 +748,7 @@ async fn run_find(
             pass = &mut validate2 => pass.context("failed to start proxy validator")?,
             _ = cancel.notified() => {
                 report_validation_summary(
-                    ValidationStats {
-                        passed: p1_passed,
-                        done: progress1.done(),
-                        total: progress1.total(),
-                        elapsed: started.elapsed(),
-                    },
+                    ValidationStats::from_progress(&progress1, started.elapsed()),
                     dst.as_deref(),
                     quiet,
                 );
@@ -788,31 +780,18 @@ async fn run_find(
         )
         .await;
         drop(guard2);
+        let summary2 = || {
+            ValidationStats::from_progress(&progress1, started.elapsed()).merged(
+                &ValidationStats::from_progress(&progress2, started.elapsed()),
+            )
+        };
         if !matches!(outcome2, Ok(RunOutcome::Finished)) {
             if matches!(outcome2, Ok(RunOutcome::Cancelled)) {
-                report_validation_summary(
-                    ValidationStats {
-                        passed: p1_passed + progress2.passed(),
-                        done: progress1.done() + progress2.done(),
-                        total: progress1.total() + progress2.total(),
-                        elapsed: started.elapsed(),
-                    },
-                    dst.as_deref(),
-                    quiet,
-                );
+                report_validation_summary(summary2(), dst.as_deref(), quiet);
             }
             return outcome2;
         }
-        report_validation_summary(
-            ValidationStats {
-                passed: p1_passed + progress2.passed(),
-                done: progress1.done() + progress2.done(),
-                total: progress1.total() + progress2.total(),
-                elapsed: started.elapsed(),
-            },
-            dst.as_deref(),
-            quiet,
-        );
+        report_validation_summary(summary2(), dst.as_deref(), quiet);
         for task in failure_tasks {
             let _ = task.await;
         }
@@ -825,12 +804,7 @@ async fn run_find(
         close_chained_json(&find.output, doc.items()).await?;
     }
     report_validation_summary(
-        ValidationStats {
-            passed: progress1.passed(),
-            done: progress1.done(),
-            total: progress1.total(),
-            elapsed: started.elapsed(),
-        },
+        ValidationStats::from_progress(&progress1, started.elapsed()),
         dst.as_deref(),
         quiet,
     );
@@ -897,6 +871,26 @@ struct ValidationStats {
     done: usize,
     total: usize,
     elapsed: std::time::Duration,
+}
+
+impl ValidationStats {
+    fn from_progress(progress: &ValidationProgress, elapsed: std::time::Duration) -> Self {
+        Self {
+            passed: progress.passed(),
+            done: progress.done(),
+            total: progress.total(),
+            elapsed,
+        }
+    }
+
+    fn merged(self, other: &Self) -> Self {
+        Self {
+            passed: self.passed + other.passed,
+            done: self.done + other.done,
+            total: self.total + other.total,
+            elapsed: self.elapsed,
+        }
+    }
 }
 
 fn report_validation_summary(stats: ValidationStats, dst: Option<&str>, quiet: bool) {
