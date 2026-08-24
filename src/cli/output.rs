@@ -313,6 +313,9 @@ where
     // per-item `String` allocation) and written in a single call, so stdout
     // issues one syscall per proxy.
     let mut buf: Vec<u8> = Vec::new();
+    // Scratch for serializing one item before it is committed to `buf`, so a
+    // failed serialization can be discarded without undoing prefix bytes.
+    let mut body: Vec<u8> = Vec::new();
 
     // When `cancel` resolves (Ctrl+C in the real binary), the run finalizes a
     // valid JSON document instead of leaving an unterminated array behind.
@@ -351,23 +354,21 @@ where
                 let Some((index, proxy)) = item else { break };
                 let should_end = options.limit > 0 && index + 1 >= options.limit;
                 buf.clear();
+                // JSON arms clear this on a failed serialization; such an
+                // item is skipped entirely instead of leaving a dangling
+                // separator behind.
+                let mut emitted = true;
                 match format {
                     "text" => {
                         buf.extend_from_slice(proxy.as_text().as_bytes());
                         buf.push(b'\n');
                     }
                     "json" => {
-                        if item_count == 0 {
-                            buf.extend_from_slice(b"[\n  ");
-                        } else {
-                            buf.extend_from_slice(b",\n  ");
-                        }
-                        let body_start = buf.len();
-                        if serde_json::to_writer(&mut buf, &proxy).is_err() {
-                            // `as_json()` falls back to an empty string when
-                            // serialization fails; mirror that by undoing the
-                            // partial write.
-                            buf.truncate(body_start);
+                        // Serialize first so a failed item leaves no trace:
+                        // writing the `[`/`,` prefix beforehand would strand
+                        // it in the document when serialization aborts.
+                        if !write_json_item(&mut buf, &mut body, item_count, &proxy) {
+                            emitted = false;
                         }
                     }
                     "pretty-json" => {
@@ -386,8 +387,14 @@ where
                         }
                     }
                     "json-lines" => {
-                        if serde_json::to_writer(&mut buf, &proxy).is_ok() {
+                        body.clear();
+                        if serde_json::to_writer(&mut body, &proxy).is_ok() {
+                            buf.extend_from_slice(&body);
                             buf.push(b'\n');
+                        } else {
+                            // Drop the item entirely: partial bytes without a
+                            // trailing newline would fuse with the next line.
+                            emitted = false;
                         }
                     }
                     "csv" => {
@@ -412,27 +419,29 @@ where
                      _ => writeln!(&mut buf, "{}", proxy).expect("writing to a Vec cannot fail"),
                 };
 
-                if let Some(ref mut file) = output_file {
-                    if let Err(error) = file.write_all(&buf).await {
-                        write_error = Some(
-                            anyhow::Error::new(error)
-                                .context("failed to write proxy to output file"),
-                        );
-                        break;
+                if emitted {
+                    if let Some(ref mut file) = output_file {
+                        if let Err(error) = file.write_all(&buf).await {
+                            write_error = Some(
+                                anyhow::Error::new(error)
+                                    .context("failed to write proxy to output file"),
+                            );
+                            break;
+                        }
+                    } else {
+                        guard.before_write();
+                        // `print!` panics on a broken pipe; keep that behaviour by
+                        // panicking here too.
+                        stdout
+                            .write_all(&buf)
+                            .expect("failed to write proxy to stdout");
+                        guard.after_write();
                     }
-                } else {
-                    guard.before_write();
-                    // `print!` panics on a broken pipe; keep that behaviour by
-                    // panicking here too.
-                    stdout
-                        .write_all(&buf)
-                        .expect("failed to write proxy to stdout");
-                    guard.after_write();
-                }
 
-                item_count += 1;
-                if let Some(chain) = &finalize.continue_json {
-                    chain.doc.add(1);
+                    item_count += 1;
+                    if let Some(chain) = &finalize.continue_json {
+                        chain.doc.add(1);
+                    }
                 }
                 if should_end {
                     break;
@@ -621,5 +630,71 @@ fn csv_quote(buf: &mut Vec<u8>, field: &str) {
         buf.push(b'"');
     } else {
         buf.extend_from_slice(field.as_bytes());
+    }
+}
+
+// Serializes one item into the scratch buffer and, on success, commits it to
+// `buf` with the array opener/continuation separator. On failure nothing is
+// written: a dangling `[` or `,` would render the document invalid.
+fn write_json_item<T: ?Sized + serde::Serialize>(
+    buf: &mut Vec<u8>,
+    body: &mut Vec<u8>,
+    item_count: usize,
+    value: &T,
+) -> bool {
+    body.clear();
+    if serde_json::to_writer(&mut *body, value).is_err() {
+        return false;
+    }
+    if item_count == 0 {
+        buf.extend_from_slice(b"[\n  ");
+    } else {
+        buf.extend_from_slice(b",\n  ");
+    }
+    buf.extend_from_slice(body);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Serializes to an error unconditionally, standing in for any future
+    // `Proxy` field that serde_json cannot render.
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S>(&self, _: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("boom"))
+        }
+    }
+
+    #[test]
+    fn failed_first_item_opens_the_array_with_the_next_one() {
+        let mut buf = Vec::new();
+        let mut body = Vec::new();
+        assert!(!write_json_item(&mut buf, &mut body, 0, &Unserializable));
+        assert!(buf.is_empty(), "a failed item must write nothing");
+
+        assert!(write_json_item(&mut buf, &mut body, 0, &1u32));
+        assert_eq!(buf, b"[\n  1", "the next item must open the array itself");
+    }
+
+    #[test]
+    fn failed_middle_item_leaves_exactly_one_separator_between_neighbours() {
+        let mut buf = Vec::new();
+        let mut body = Vec::new();
+        assert!(write_json_item(&mut buf, &mut body, 0, &1u32));
+        let after_first = buf.clone();
+        assert!(!write_json_item(&mut buf, &mut body, 1, &Unserializable));
+        assert_eq!(buf, after_first, "a failed item must not touch the buffer");
+        assert!(write_json_item(&mut buf, &mut body, 1, &2u32));
+        assert_eq!(
+            buf, b"[\n  1,\n  2",
+            "exactly one separator must sit between the surviving items"
+        );
     }
 }
