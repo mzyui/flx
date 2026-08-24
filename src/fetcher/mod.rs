@@ -1173,6 +1173,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn throttle_spaces_concurrent_same_host_requests_cumulatively() {
+        // Regression test: each caller used to record its own arrival time,
+        // so three concurrent arrivals all woke around t0+delay together.
+        // Projected slots must space them one `delay` apart instead.
+        let throttle = Arc::new(Throttle::new());
+        let delay = Duration::from_millis(100);
+        let start = tokio::time::Instant::now();
+        let handles = (0..3)
+            .map(|_| {
+                let throttle = Arc::clone(&throttle);
+                tokio::spawn(async move { throttle.wait("example.com", delay).await })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert!(
+            start.elapsed() >= delay * 2 - Duration::from_millis(30),
+            "three concurrent requests need three distinct slots: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
     async fn source_host_comes_from_url_host() {
         let source = Arc::new(Source::all("http://lists.example.org/proxies?page=1").unwrap());
         assert_eq!(source_host(&source), "lists.example.org");

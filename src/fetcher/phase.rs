@@ -95,27 +95,28 @@ pub(crate) struct FetchSettings {
 
 /// Serializes network requests to the same host.
 pub(crate) struct Throttle {
-    last: Mutex<HashMap<String, time::Instant>>,
+    /// Projected earliest instant the host may see the next request. Storing
+    /// the projection (not the arrival time) keeps N concurrent callers one
+    /// `delay` apart instead of letting them cluster behind the first.
+    next_slot: Mutex<HashMap<String, time::Instant>>,
 }
 
 impl Throttle {
     pub(crate) fn new() -> Self {
         Self {
-            last: Mutex::new(HashMap::new()),
+            next_slot: Mutex::new(HashMap::new()),
         }
     }
 
     pub(crate) async fn wait(&self, host: &str, delay: Duration) {
-        let remaining = {
-            let mut last = self.last.lock().unwrap();
+        let available_at = {
+            let mut next_slot = self.next_slot.lock().unwrap_or_else(|e| e.into_inner());
             let now = time::Instant::now();
-            let remaining = last
-                .get(host)
-                .map(|prev| delay.saturating_sub(prev.elapsed()))
-                .unwrap_or_default();
-            last.insert(host.to_owned(), now);
-            remaining
+            let available_at = next_slot.get(host).copied().unwrap_or(now).max(now);
+            next_slot.insert(host.to_owned(), available_at + delay);
+            available_at
         };
+        let remaining = available_at.saturating_duration_since(time::Instant::now());
         if !remaining.is_zero() {
             time::sleep(remaining).await;
         }
