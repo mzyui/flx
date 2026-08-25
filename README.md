@@ -126,7 +126,7 @@ let proxies = Flx::fetch()
     .await?;
 ```
 
-More examples live in [`examples/`](examples/): plain fetching, fetch + validate, and validating a file.
+A guided walkthrough of every sample lives in [`examples/README.md`](examples/README.md).
 
 ## Development
 
