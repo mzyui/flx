@@ -12,6 +12,7 @@ flx is a fast proxy scraper & validator written in Rust. It collects free proxie
 - **GeoIP** via GeoLite2 City + ASN, with a one-command database sync
 - **9 output formats** including JSON, CSV, PAC, and proxychains config
 - **Streaming-first pipeline** with backpressure, atomic parse cache, and graceful Ctrl+C finalization
+- **Proxy rotating server** — expose validated proxies through a local rotating endpoint *(under active development, not yet available)*
 
 ## Install
 
