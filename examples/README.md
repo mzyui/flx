@@ -8,7 +8,7 @@ cargo run --example fetch
 
 ## Fetch
 
-[`fetch.rs`](examples/fetch.rs) is the smallest useful program: scrape from the built-in providers, validate every candidate as plain HTTP, and print the survivors as `ip:port`.
+[`fetch.rs`](fetch.rs) is the smallest useful program: scrape from the built-in providers, validate every candidate as plain HTTP, and print the survivors as `ip:port`.
 
 ```rust
 let proxies = Flx::fetch().validate_http().limit(10).collect().await?;
@@ -18,7 +18,7 @@ let proxies = Flx::fetch().validate_http().limit(10).collect().await?;
 
 ## Validate a file
 
-[`validate.rs`](examples/validate.rs) reads candidates from an `ip:port` file instead of scraping. Lines may be bare (`1.2.3.4:8080`, inheriting every requested protocol) or scheme-prefixed (`socks5://…`, pinning their own type).
+[`validate.rs`](validate.rs) reads candidates from an `ip:port` file instead of scraping. Lines may be bare (`1.2.3.4:8080`, inheriting every requested protocol) or scheme-prefixed (`socks5://…`, pinning their own type).
 
 ```rust
 let proxies = Flx::from_file("proxies.txt")?
@@ -31,11 +31,11 @@ The path `-` reads standard input, and `Flx::from_files([...])` accepts many fil
 
 ## SOCKS only
 
-[`socks.rs`](examples/socks.rs) validates a list against SOCKS5 alone. SOCKS proxies have no anonymity level — passing the tunnel handshake is the whole test — so results print as ready-to-use `socks5://ip:port` URIs.
+[`socks.rs`](socks.rs) validates a list against SOCKS5 alone. SOCKS proxies have no anonymity level — passing the tunnel handshake is the whole test — so results print as ready-to-use `socks5://ip:port` URIs.
 
 ## AND groups
 
-[`groups.rs`](examples/groups.rs) requires one endpoint to support **both** protocols of a group: HTTP forwarding *and* a SOCKS5 tunnel. Every member of a group is always probed, and the group passes only when all slots succeed.
+[`groups.rs`](groups.rs) requires one endpoint to support **both** protocols of a group: HTTP forwarding *and* a SOCKS5 tunnel. Every member of a group is always probed, and the group passes only when all slots succeed.
 
 ```rust
 Flx::fetch()
@@ -44,7 +44,7 @@ Flx::fetch()
 
 ## Streaming with progress
 
-[`stream.rs`](examples/stream.rs) swaps `collect()` for `stream_with_progress()`: validated proxies arrive one at a time while live counters tick, and the final tallies are readable once the stream ends.
+[`stream.rs`](stream.rs) swaps `collect()` for `stream_with_progress()`: validated proxies arrive one at a time while live counters tick, and the final tallies are readable once the stream ends.
 
 ```rust
 let mut run = Flx::fetch().validate_http().limit(20).stream_with_progress().await?;
@@ -54,13 +54,13 @@ let progress = run.progress(); // passed / done / total
 
 ## Failure reports
 
-[`failures.rs`](examples/failures.rs) enables `.report_failures()`, which opens a side channel emitting one machine-readable record per failed probe — IP, port, protocol, and a classified reason (`timeout`, `rejected`, …).
+[`failures.rs`](failures.rs) enables `.report_failures()`, which opens a side channel emitting one machine-readable record per failed probe — IP, port, protocol, and a classified reason (`timeout`, `rejected`, …).
 
 Take the receiver before draining the stream; an undrained channel silently drops failures once its buffer fills.
 
 ## Filters and sorting
 
-[`filter.rs`](examples/filter.rs) composes the stream adapters: keep only anonymous/elite results, bound the response time, sort fastest-first, then take ten.
+[`filter.rs`](filter.rs) composes the stream adapters: keep only anonymous/elite results, bound the response time, sort fastest-first, then take ten.
 
 ```rust
 stream.filter_levels([Anonymity::Anonymous, Anonymity::Elite])
@@ -73,11 +73,11 @@ Filtering is lazy per item; sorting buffers everything upstream before emitting.
 
 ## GeoIP filtering
 
-[`geo.rs`](examples/geo.rs) annotates every result with GeoLite2 data and keeps a single country. `.with_geo()` annotates without filtering; `.countries(["ID"])` filters and implies the lookup. The first run downloads the GeoLite2 database (a few tens of MB); `flx geo-update` refreshes it later.
+[`geo.rs`](geo.rs) annotates every result with GeoLite2 data and keeps a single country. `.with_geo()` annotates without filtering; `.countries(["ID"])` filters and implies the lookup. The first run downloads the GeoLite2 database (a few tens of MB); `flx geo-update` refreshes it later.
 
 ## Parse-only passthrough
 
-[`passthrough.rs`](examples/passthrough.rs) calls `.no_validate()` to normalize a list without touching the judges: parse, deduplicate, re-emit.
+[`passthrough.rs`](passthrough.rs) calls `.no_validate()` to normalize a list without touching the judges: parse, deduplicate, re-emit.
 
 ## Builder cheat sheet
 
