@@ -12,8 +12,7 @@ target/criterion/
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
-# Local documentation, never committed
-docs/
+dev/
 
 # Local agent instructions, never committed
 AGENTS.md
@@ -24,3 +23,5 @@ graphify-out/
 # Editor & agent working directories
 .claude/
 .opencode
+
+.flx.toml
