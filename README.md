@@ -112,6 +112,20 @@ flx find --support-cookies --support-referer --no-verify-tls
 flx find --report-failures failures.jsonl
 ```
 
+## Config file
+
+Persist your defaults in TOML. CLI flags always win over the config, and a project `.flx.toml` overrides the user config key-by-key.
+
+```bash
+flx config init                 # write a commented template to ~/.config/flx/config.toml
+flx config path                 # show which files are in effect
+flx config show                 # print the merged configuration
+flx --config ./custom.toml find # use one specific file (or $FLX_CONFIG)
+flx --no-config find            # ignore every config file
+```
+
+The user config lives at `$XDG_CONFIG_HOME/flx/config.toml` (default `~/.config/flx/config.toml`); a `.flx.toml` in the current directory overrides it. Loaded even for `grab`; `--verbose` overrides a `quiet = true` set by the config.
+
 ## Library usage
 
 flx is also a library. The `Flx` builder mirrors the CLI defaults:

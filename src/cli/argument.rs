@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-fn is_valid_type_value(value: &str) -> bool {
+pub(crate) fn is_valid_type_value(value: &str) -> bool {
     // Accept every token the protocol parser understands (including the
     // `HTTP:Elite`-style anonymity annotations) in any `+` combination.
     value
@@ -91,6 +91,18 @@ pub struct Cli {
     /// Skip the background check for newer flx releases.
     #[arg(long, help_heading = "Global")]
     pub skip_version_check: bool,
+
+    /// Path to a config file overriding the discovery defaults.
+    #[arg(long, global = true, help_heading = "Global")]
+    pub config: Option<PathBuf>,
+
+    /// Skip loading any config file.
+    #[arg(long, global = true, help_heading = "Global")]
+    pub no_config: bool,
+
+    /// Override the `quiet` value set by the config file.
+    #[arg(long, global = true, help_heading = "Global")]
+    pub verbose: bool,
 }
 
 /// The pipeline commands available in the CLI.
@@ -103,6 +115,8 @@ pub enum Command {
     /// Download and verify the GeoLite2 GeoIP database.
     #[command(name = "geo-update")]
     GeoUpdate,
+    /// Manage the flx configuration file.
+    Config(ConfigCmd),
 }
 
 /// Options shared by every command that render proxies.
@@ -385,4 +399,28 @@ pub struct FindArgs {
 
     #[command(flatten)]
     pub validator: ValidatorArgs,
+}
+
+/// `flx config`: manage the configuration file.
+#[derive(Args, Debug)]
+pub struct ConfigCmd {
+    #[command(subcommand)]
+    pub action: ConfigAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Print the config file path(s) in effect.
+    Path,
+    /// Write a commented template config file.
+    Init {
+        /// Write to this path instead of the default location.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Overwrite an existing config file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the merged configuration as TOML.
+    Show,
 }

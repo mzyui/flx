@@ -1,6 +1,7 @@
 use super::argument::OutputOptions;
 use super::filters::ProxyFilter;
 use super::*;
+use clap::Parser;
 use flx::proxy::models::Anonymity;
 use futures_util::stream;
 

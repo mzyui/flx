@@ -1,7 +1,7 @@
 use anyhow::Context;
 use argument::Cli;
-use argument::{Command, FetchArgs, FetcherArgs, FindArgs, ValidatorArgs};
-use clap::Parser;
+use argument::{Command, ConfigAction, ConfigCmd, FetchArgs, FetcherArgs, FindArgs, ValidatorArgs};
+use clap::{CommandFactory, FromArgMatches};
 #[cfg(feature = "progress_bar")]
 use colored::Colorize;
 #[cfg(feature = "log")]
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::runtime;
 
 mod argument;
+mod config;
 mod filters;
 mod guard;
 mod output;
@@ -326,7 +327,25 @@ async fn file_source(paths: &[std::path::PathBuf]) -> anyhow::Result<BoxStream> 
 }
 
 fn run_application() -> anyhow::Result<RunOutcome> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).expect("clap validates args");
+
+    // Config files patch only the values the CLI did not set, so load and
+    // apply them before anything reads the flags. The `config` subcommand
+    // manages the files themselves, so it loads on demand instead.
+    if !matches!(&cli.command, Some(Command::Config(_))) {
+        let home = config_home();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(cfg) = config::load(
+            cli.config.as_deref(),
+            std::env::var("FLX_CONFIG").ok().as_deref(),
+            cli.no_config,
+            &home,
+            &cwd,
+        )? {
+            config::apply_config(&mut cli, &cfg, &matches);
+        }
+    }
 
     #[cfg(feature = "log")]
     {
@@ -405,10 +424,80 @@ fn run_application() -> anyhow::Result<RunOutcome> {
             Command::Grab(grab) => run_grab(grab, cli.quiet, cli.no_color, &download, cancel).await,
             Command::Find(find) => run_find(find, cli.quiet, cli.no_color, &download, cancel).await,
             Command::GeoUpdate => run_geo_update(&download, cli.quiet, cli.no_color, cancel).await,
+            Command::Config(config) => run_config(config, cli.no_config, cli.config.as_deref()),
         }
     });
     runtime.shutdown_background();
     outcome
+}
+
+fn config_home() -> std::path::PathBuf {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.config_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn run_config(
+    config: ConfigCmd,
+    no_config: bool,
+    config_flag: Option<&std::path::Path>,
+) -> anyhow::Result<RunOutcome> {
+    let home = config_home();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let env_path = std::env::var("FLX_CONFIG").ok();
+    match config.action {
+        ConfigAction::Path => {
+            if no_config {
+                println!("no config files in effect (--no-config)");
+                return Ok(RunOutcome::Finished);
+            }
+            let paths =
+                config::paths_in_effect(config_flag, env_path.as_deref(), no_config, &home, &cwd);
+            let mut shown = 0;
+            for path in [paths.primary, paths.project, paths.user]
+                .into_iter()
+                .flatten()
+            {
+                println!("{}", path.display());
+                shown += 1;
+            }
+            if shown == 0 {
+                println!(
+                    "no config file found (checked {} and {})",
+                    cwd.join(".flx.toml").display(),
+                    home.join("flx").join("config.toml").display()
+                );
+            }
+            Ok(RunOutcome::Finished)
+        }
+        ConfigAction::Init { path, force } => {
+            let target = path.unwrap_or_else(|| home.join("flx").join("config.toml"));
+            if target.exists() && !force {
+                anyhow::bail!(
+                    "config file already exists at {} (use --force to overwrite)",
+                    target.display()
+                );
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, config::template())?;
+            println!("wrote config template to {}", target.display());
+            Ok(RunOutcome::Finished)
+        }
+        ConfigAction::Show => {
+            match config::load(config_flag, env_path.as_deref(), no_config, &home, &cwd)? {
+                Some(cfg) => {
+                    print!("{}", config::to_toml(&cfg));
+                    Ok(RunOutcome::Finished)
+                }
+                None => {
+                    println!("# no config values set (no config file found)");
+                    Ok(RunOutcome::Finished)
+                }
+            }
+        }
+    }
 }
 
 // Abstraction over the real warmup bar and the no-progress stub so the fetch
