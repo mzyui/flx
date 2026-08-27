@@ -118,6 +118,8 @@ Persist your defaults in TOML. CLI flags always win over the config, and a proje
 
 ```bash
 flx config init                 # write a commented template to ~/.config/flx/config.toml
+flx config wizard               # interactively set up a config file
+flx config wizard --yes         # write one with every default (no questions)
 flx config path                 # show which files are in effect
 flx config show                 # print the merged configuration
 flx --config ./custom.toml find # use one specific file (or $FLX_CONFIG)

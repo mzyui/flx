@@ -423,4 +423,23 @@ pub enum ConfigAction {
     },
     /// Print the merged configuration as TOML.
     Show,
+    /// Interactively set up a config file.
+    Wizard(WizardArgs),
+}
+
+/// Options for `flx config wizard`.
+#[derive(Args, Debug, Default)]
+pub struct WizardArgs {
+    /// Write to this path instead of the default location.
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+    /// Write the user config instead of the project one.
+    #[arg(long)]
+    pub user: bool,
+    /// Overwrite an existing config file.
+    #[arg(long)]
+    pub force: bool,
+    /// Non-interactive: answer every question with its default.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }

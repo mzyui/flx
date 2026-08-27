@@ -25,6 +25,7 @@ mod output;
 #[cfg(feature = "progress_bar")]
 mod progress;
 mod version;
+mod wizard;
 
 #[cfg(test)]
 mod tests;
@@ -496,6 +497,12 @@ fn run_config(
                     Ok(RunOutcome::Finished)
                 }
             }
+        }
+        ConfigAction::Wizard(wizard) => {
+            let mut stdin = std::io::stdin().lock();
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            wizard::run_wizard(wizard, &home, &cwd, &mut stdin, &mut stdout)
         }
     }
 }

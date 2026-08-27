@@ -187,7 +187,7 @@ fn deser_section<T: serde::de::DeserializeOwned>(
 
 const LOG_LEVELS: &[&str] = &["off", "error", "warn", "info", "debug", "trace"];
 const IP_TYPES: &[&str] = &["residential", "datacenter", "mobile", "unknown"];
-const FORMATS: &[&str] = &[
+pub(crate) const FORMATS: &[&str] = &[
     "default",
     "text",
     "json",
@@ -200,7 +200,7 @@ const FORMATS: &[&str] = &[
 ];
 const SORTS: &[&str] = &["avg-response", "response-time", "country", "anonymity"];
 const ORDERS: &[&str] = &["asc", "desc"];
-const ANONYMITY_LEVELS: &[&str] = &["transparent", "anonymous", "elite", "unknown"];
+pub(crate) const ANONYMITY_LEVELS: &[&str] = &["transparent", "anonymous", "elite", "unknown"];
 
 fn validate_enum_values(cfg: &FileConfig) -> Result<(), ConfigError> {
     if let Some(g) = &cfg.global {
