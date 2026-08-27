@@ -4,6 +4,10 @@
 
 flx is a fast proxy scraper & validator written in Rust. It collects free proxies from 13 sources, validates them against online judges (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT), filters by anonymity / country / IP type / response time, and exports in 9 formats. It ships as both a CLI (`flx`) and a Rust library.
 
+## Demo
+
+![demo](https://vhs.charm.sh/vhs-3tm46j5tEl6LYWePbsAuOw.gif)
+
 ## Features
 
 - **Scrape** from 12 primary providers + GitHub raw mirrors, or plug in your own plaintext source
@@ -27,10 +31,6 @@ git clone https://github.com/mzyui/flx
 cd flx
 cargo install --path .
 ```
-
-## Demo
-
-![demo](https://vhs.charm.sh/vhs-3tm46j5tEl6LYWePbsAuOw.gif)
 
 ## Scrape
 
