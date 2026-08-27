@@ -24,6 +24,8 @@ mod guard;
 mod output;
 #[cfg(feature = "progress_bar")]
 mod progress;
+#[cfg(feature = "progress_bar")]
+mod status_line;
 mod version;
 mod wizard;
 

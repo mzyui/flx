@@ -9,9 +9,9 @@ use std::{
     time::Instant,
 };
 
+use crate::status_line::{Options as StatusLineOptions, StatusLine};
 use colored::Colorize;
 use flx::{DownloadProgress, ValidationProgress};
-use status_line::StatusLine;
 use tokio::sync::watch;
 
 use crate::OutputGuard;
@@ -384,7 +384,7 @@ impl WarmupBar {
             started: Instant::now(),
             color: use_color(no_color),
         };
-        let status = StatusLine::with_options(frame, status_line::Options::default());
+        let status = StatusLine::with_options(frame, StatusLineOptions::default());
         Some(Self {
             status,
             phase,

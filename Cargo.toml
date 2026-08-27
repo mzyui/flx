@@ -23,7 +23,6 @@ tokio = { version = "1.41.1", features = [
 log = { version = "0.4.22", optional = true }
 stderrlog = { version = "0.6.0", optional = true }
 async-trait = "0.1.83"
-status-line = { version = "0.2.0", optional = true }
 colored = { version = "3.1.1", optional = true }
 clap = { version = "4.5", optional = true, features = ["derive"] }
 directories = "6.0.0"
@@ -83,5 +82,5 @@ required-features = ["clap"]
 [features]
 default = ["log", "progress_bar", "clap"]
 log = ["stderrlog", "dep:log"]
-progress_bar = ["colored", "status-line"]
+progress_bar = ["colored"]
 clap = ["dep:clap"]
