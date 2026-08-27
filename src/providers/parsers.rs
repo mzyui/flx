@@ -6,9 +6,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use regex::Regex;
 use scraper::{Html, Selector};
 use serde::{
-    de::{
-        DeserializeOwned, DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor,
-    },
+    de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
 
@@ -16,16 +14,23 @@ use crate::proxy::models::{Anonymity, Protocol};
 
 pub type ParsedProxy = (Ipv4Addr, u16, Option<Protocol>);
 const VISITOR_STOPPED: &str = "flx parser visitor stopped";
+// Longest IPv4 literal is 15 bytes ("255.255.255.255"); headroom covers a
+// UTF-8 char mid-sequence before the overflow guard rejects the payload.
+const PROXYNOVA_IP_BUFFER_LEN: usize = 64;
 
-struct JsonDataSeed<'a, T, F> {
+struct JsonDataSeed<'a, 'de, T, F>
+where
+    T: Deserialize<'de>,
+    F: FnMut(T) -> bool,
+{
     visit: &'a mut F,
     stopped: &'a Cell<bool>,
-    marker: std::marker::PhantomData<T>,
+    marker: std::marker::PhantomData<&'de T>,
 }
 
-impl<'de, T, F> DeserializeSeed<'de> for JsonDataSeed<'_, T, F>
+impl<'de, T, F> DeserializeSeed<'de> for JsonDataSeed<'_, 'de, T, F>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'de>,
     F: FnMut(T) -> bool,
 {
     type Value = ();
@@ -42,15 +47,19 @@ where
     }
 }
 
-struct JsonRootVisitor<'a, T, F> {
+struct JsonRootVisitor<'a, 'de, T, F>
+where
+    T: Deserialize<'de>,
+    F: FnMut(T) -> bool,
+{
     visit: &'a mut F,
     stopped: &'a Cell<bool>,
-    marker: std::marker::PhantomData<T>,
+    marker: std::marker::PhantomData<&'de T>,
 }
 
-impl<'de, T, F> Visitor<'de> for JsonRootVisitor<'_, T, F>
+impl<'de, T, F> Visitor<'de> for JsonRootVisitor<'_, 'de, T, F>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'de>,
     F: FnMut(T) -> bool,
 {
     type Value = ();
@@ -63,7 +72,7 @@ where
     where
         A: MapAccess<'de>,
     {
-        while let Some(key) = map.next_key::<String>()? {
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
             if key == "data" {
                 map.next_value_seed(JsonRowsSeed {
                     visit: self.visit,
@@ -78,15 +87,19 @@ where
     }
 }
 
-struct JsonRowsSeed<'a, T, F> {
+struct JsonRowsSeed<'a, 'de, T, F>
+where
+    T: Deserialize<'de>,
+    F: FnMut(T) -> bool,
+{
     visit: &'a mut F,
     stopped: &'a Cell<bool>,
-    marker: std::marker::PhantomData<T>,
+    marker: std::marker::PhantomData<&'de T>,
 }
 
-impl<'de, T, F> DeserializeSeed<'de> for JsonRowsSeed<'_, T, F>
+impl<'de, T, F> DeserializeSeed<'de> for JsonRowsSeed<'_, 'de, T, F>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'de>,
     F: FnMut(T) -> bool,
 {
     type Value = ();
@@ -103,15 +116,19 @@ where
     }
 }
 
-struct JsonRowsVisitor<'a, T, F> {
+struct JsonRowsVisitor<'a, 'de, T, F>
+where
+    T: Deserialize<'de>,
+    F: FnMut(T) -> bool,
+{
     visit: &'a mut F,
     stopped: &'a Cell<bool>,
-    marker: std::marker::PhantomData<T>,
+    marker: std::marker::PhantomData<&'de T>,
 }
 
-impl<'de, T, F> Visitor<'de> for JsonRowsVisitor<'_, T, F>
+impl<'de, T, F> Visitor<'de> for JsonRowsVisitor<'_, 'de, T, F>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'de>,
     F: FnMut(T) -> bool,
 {
     type Value = ();
@@ -134,9 +151,10 @@ where
     }
 }
 
-fn visit_json_data<T>(body: &str, mut visit: impl FnMut(T) -> bool) -> anyhow::Result<()>
+fn visit_json_data<'de, T, F>(body: &'de str, mut visit: F) -> anyhow::Result<()>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'de> + 'de,
+    F: FnMut(T) -> bool,
 {
     let stopped = Cell::new(false);
     let mut deserializer = serde_json::Deserializer::from_str(body);
@@ -237,15 +255,18 @@ pub fn visit_plaintext(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
 }
 
 #[derive(Deserialize)]
-struct GeonodeRow {
-    ip: String,
-    port: String,
+struct GeonodeRow<'a> {
+    // `Cow` borrows when the JSON string has no escapes (always, in practice)
+    // and falls back to an owned copy only for escaped sequences, which plain
+    // `&'a str` cannot represent.
+    ip: Cow<'a, str>,
+    port: Cow<'a, str>,
     #[serde(default)]
-    protocols: Vec<String>,
+    protocols: Vec<Cow<'a, str>>,
 }
 
 pub fn visit_geonode(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) -> anyhow::Result<()> {
-    visit_json_data::<GeonodeRow>(body, |row| {
+    visit_json_data::<GeonodeRow, _>(body, |row| {
         let (Ok(ip), Ok(port)) = (row.ip.parse::<Ipv4Addr>(), row.port.parse::<u16>()) else {
             return true;
         };
@@ -253,7 +274,7 @@ pub fn visit_geonode(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) -> 
             return visit((ip, port, None));
         }
         for protocol in &row.protocols {
-            if !visit((ip, port, protocol_from_str(protocol))) {
+            if !visit((ip, port, protocol_from_str(protocol.as_ref()))) {
                 return false;
             }
         }
@@ -262,9 +283,69 @@ pub fn visit_geonode(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) -> 
 }
 
 #[derive(Deserialize)]
-struct ProxyNovaRow {
-    ip: String,
-    port: serde_json::Value,
+struct ProxyNovaRow<'a> {
+    // `Cow` borrows when the JSON string has no escapes; the obfuscated ip
+    // payload routinely contains escaped quotes, so a bare `&'a str` would
+    // reject rows the owned parser previously accepted.
+    ip: Cow<'a, str>,
+    #[serde(deserialize_with = "deserialize_port")]
+    port: Option<u16>,
+}
+
+/// ProxyNova ships the port as either a JSON string or number; the visitor
+/// parses both without buffering a `serde_json::Value` (one owned String per
+/// row in the old path). Non-parseable ports become `None`, mirroring the old
+/// `Number::as_u64` fallback for negative/float numbers.
+fn deserialize_port<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct PortVisitor;
+
+    impl<'de> Visitor<'de> for PortVisitor {
+        type Value = Option<u16>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string or numeric port")
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.trim().parse::<u16>().ok())
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.trim().parse::<u16>().ok())
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(u16::try_from(value).ok())
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(u16::try_from(value).ok())
+        }
+
+        fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(PortVisitor)
 }
 
 fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
@@ -273,7 +354,8 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
         return Some(ip);
     }
 
-    let mut decoded = String::new();
+    let mut buffer = [0u8; PROXYNOVA_IP_BUFFER_LEN];
+    let mut len = 0usize;
 
     // Leading char-code array, e.g. `[51,49,51].map(code => fromCharCode(code-1))`.
     if let Some(start) = raw.find('[') {
@@ -291,39 +373,39 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
                 let Some(ch) = u32::try_from(code - offset).ok().and_then(char::from_u32) else {
                     continue;
                 };
-                decoded.push(ch);
+                if buffer.len() - len < 4 {
+                    return None;
+                }
+                len += ch.encode_utf8(&mut buffer[len..]).len();
             }
         }
     }
 
     // Trailing `atob("...")` base64 literal.
     if let Some(caps) = RE_PROXYNOVA_ATOB.captures(raw) {
-        if let Some(text) = caps
-            .get(1)
-            .and_then(|m| BASE64.decode(m.as_str()).ok())
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-        {
-            decoded.push_str(&text);
+        if let Some(text) = caps.get(1) {
+            if let Ok(written) = BASE64.decode_slice(text.as_str(), &mut buffer[len..]) {
+                len += written;
+            }
         }
     }
 
-    decoded.trim().parse().ok()
+    std::str::from_utf8(&buffer[..len])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 pub fn visit_proxynova(
     body: &str,
     mut visit: impl FnMut(ParsedProxy) -> bool,
 ) -> anyhow::Result<()> {
-    visit_json_data::<ProxyNovaRow>(body, |row| {
-        let Some(ip) = deobfuscate_proxynova_ip(&row.ip) else {
+    visit_json_data::<ProxyNovaRow, _>(body, |row| {
+        let Some(ip) = deobfuscate_proxynova_ip(row.ip.as_ref()) else {
             return true;
         };
-        let port = match &row.port {
-            serde_json::Value::String(s) => s.trim().parse::<u16>().ok(),
-            serde_json::Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
-            _ => None,
-        };
-        let Some(port) = port else { return true };
+        let Some(port) = row.port else { return true };
         visit((ip, port, Some(Protocol::Http(Anonymity::Unknown))))
     })
 }
@@ -560,7 +642,7 @@ pub fn visit_json_strings(
         where
             A: SeqAccess<'de>,
         {
-            while let Some(row) = seq.next_element::<String>()? {
+            while let Some(row) = seq.next_element::<Cow<'de, str>>()? {
                 let Some((ip, port)) = parse_pair(&row) else {
                     continue;
                 };
@@ -849,6 +931,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn json_string_array_non_string_element_fails_the_whole_parse() {
+        // Locked parity with the owned `String` path: a non-string element
+        // aborts the stream (documented fail-fast, not skipped).
+        let body = r#"["1.2.3.4:8080",42]"#;
+        assert!(parse_json_strings(body).is_err());
+    }
+
+    #[test]
+    fn geonode_rows_without_protocols_field_default_to_untyped() {
+        let body = r#"{"data":[{"ip":"1.2.3.4","port":"8080"}]}"#;
+        let parsed = parse_geonode(body).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.to_string(), "1.2.3.4");
+        assert_eq!(parsed[0].1, 8080);
+        assert_eq!(parsed[0].2, None);
     }
 
     #[test]
