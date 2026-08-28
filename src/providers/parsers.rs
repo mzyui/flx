@@ -17,6 +17,7 @@ const VISITOR_STOPPED: &str = "flx parser visitor stopped";
 // Longest IPv4 literal is 15 bytes ("255.255.255.255"); headroom covers a
 // UTF-8 char mid-sequence before the overflow guard rejects the payload.
 const PROXYNOVA_IP_BUFFER_LEN: usize = 64;
+const BASE64_ROW_BUFFER_LEN: usize = 256;
 
 struct JsonDataSeed<'a, 'de, T, F>
 where
@@ -244,6 +245,9 @@ pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
 }
 
 pub fn visit_plaintext(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
+    // Some sources prepend a UTF-8 BOM to the first line, which would corrupt
+    // the first `ip:port` pair.
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     for row in body
         .lines()
         .filter_map(|line| parse_pair(line).map(|(ip, port)| (ip, port, None)))
@@ -609,9 +613,16 @@ pub fn visit_regex_pairs(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool)
 
 pub fn visit_base64_rows(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
     for row in RE_PROXY_CALL.captures_iter(body).filter_map(|caps| {
-        let decoded = BASE64.decode(caps.get(1)?.as_str()).ok()?;
-        let text = String::from_utf8(decoded).ok()?;
-        let (ip, port) = parse_pair(&text)?;
+        let encoded = caps.get(1)?.as_str();
+        let mut buffer = [0u8; BASE64_ROW_BUFFER_LEN];
+        let decoded: &[u8] = if encoded.len() <= buffer.len() {
+            let written = BASE64.decode_slice(encoded, &mut buffer).ok()?;
+            &buffer[..written]
+        } else {
+            &BASE64.decode(encoded).ok()?
+        };
+        let text = std::str::from_utf8(decoded).ok()?;
+        let (ip, port) = parse_pair(text)?;
         Some((ip, port, None))
     }) {
         if !visit(row) {
@@ -760,6 +771,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn plaintext_strips_utf8_bom() {
+        let body = "\u{feff}1.2.3.4:8080\n5.6.7.8:1080\n";
+        let parsed = parse_plaintext(body);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, Ipv4Addr::new(1, 2, 3, 4));
     }
 
     #[test]
