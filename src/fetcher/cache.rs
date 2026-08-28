@@ -3,7 +3,6 @@
 use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    str::FromStr,
     time::{Duration, SystemTime},
 };
 
@@ -15,9 +14,10 @@ use crate::{
 };
 
 const ORPHANED_TMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-// Bump when the row encoding or any source parser changes so stale rows are
-// rejected instead of replayed.
-const CACHE_MAGIC: &str = "flx-parse-v1";
+// Binary cache header. `CACHE_MAGIC` guards the row encoding described in
+// `decode_rows`; bump it any time that encoding or a source parser changes so
+// stale rows are rejected instead of replayed.
+const CACHE_MAGIC: &[u8; 8] = b"FLXPCW02";
 
 /// Local cache of parsed proxy rows.
 pub struct Cache {
@@ -77,7 +77,7 @@ impl Cache {
         if age > self.ttl {
             return None;
         }
-        let body = tokio::fs::read_to_string(path).await.ok()?;
+        let body = tokio::fs::read(path).await.ok()?;
         let rows = decode_rows(&body)?;
         if rows.is_empty() {
             return None;
@@ -89,23 +89,25 @@ impl Cache {
         if rows.is_empty() {
             return;
         }
-        let mut body = String::with_capacity(rows.len() * 20);
-        body.push_str(CACHE_MAGIC);
-        body.push('\n');
+        let mut body = Vec::with_capacity(8 + 4 + rows.len() * 7);
+        body.extend_from_slice(CACHE_MAGIC);
+        body.extend_from_slice(&(rows.len() as u32).to_le_bytes());
         for (ip, port, protocol) in rows {
-            body.push_str(&ip.to_string());
-            body.push(':');
-            body.push_str(&port.to_string());
-            if let Some(protocol) = protocol {
-                body.push(':');
-                body.push_str(&protocol_token(*protocol));
+            body.extend_from_slice(&ip.octets());
+            body.extend_from_slice(&port.to_le_bytes());
+            match protocol {
+                None => body.push(0),
+                Some(Protocol::Connect(p)) => {
+                    body.push(11);
+                    body.extend_from_slice(&p.to_le_bytes());
+                }
+                Some(p) => body.push(protocol_code(Some(*p)).unwrap_or(0)),
             }
-            body.push('\n');
         }
         let name = cache_file_name(url);
         let path = self.dir.join(&name);
         let tmp = self.dir.join(format!(".{name}.tmp-{}", std::process::id()));
-        if let Err(error) = tokio::fs::write(&tmp, body.as_bytes()).await {
+        if let Err(error) = tokio::fs::write(&tmp, &body).await {
             #[cfg(feature = "log")]
             log::debug!("failed to write cache for {url}: {error}");
             let _ = error;
@@ -120,43 +122,89 @@ impl Cache {
     }
 }
 
-fn protocol_token(protocol: Protocol) -> String {
-    match protocol {
-        Protocol::Http(anonymity) => match anonymity {
-            Anonymity::Elite => "HTTP:Elite".into(),
-            Anonymity::Transparent => "HTTP:Transparent".into(),
-            Anonymity::Anonymous => "HTTP:Anonymous".into(),
-            Anonymity::Unknown => "HTTP".into(),
-        },
-        Protocol::Https(anonymity) => match anonymity {
-            Anonymity::Elite => "HTTPS:Elite".into(),
-            Anonymity::Transparent => "HTTPS:Transparent".into(),
-            Anonymity::Anonymous => "HTTPS:Anonymous".into(),
-            Anonymity::Unknown => "HTTPS".into(),
-        },
-        Protocol::Socks4 => "SOCKS4".into(),
-        Protocol::Socks5 => "SOCKS5".into(),
-        Protocol::Connect(port) => format!("CONNECT:{port}"),
+// ── Binary row encoding (see CACHE_MAGIC) ─────────────────────────────
+//
+// Row layout: [4 bytes IP octets][2 bytes port LE][1 byte protocol code],
+// plus 2 extra bytes for the CONNECT port code.
+//
+// Protocol code table:
+//   0 = none
+//   1..=4 = HTTP(Elite|Transparent|Anonymous|Unknown)
+//   5..=8 = HTTPS(Elite|Transparent|Anonymous|Unknown)
+//   9 = SOCKS4, 10 = SOCKS5
+//   11 = CONNECT (followed by u16 LE port)
+
+fn anon_code(anonymity: Anonymity) -> u8 {
+    match anonymity {
+        Anonymity::Elite => 0,
+        Anonymity::Transparent => 1,
+        Anonymity::Anonymous => 2,
+        Anonymity::Unknown => 3,
     }
 }
 
-fn decode_rows(body: &str) -> Option<Vec<ParsedProxy>> {
-    let mut lines = body.lines();
-    if lines.next()? != CACHE_MAGIC {
+fn anon_from_code(code: u8) -> Option<Anonymity> {
+    match code {
+        0 => Some(Anonymity::Elite),
+        1 => Some(Anonymity::Transparent),
+        2 => Some(Anonymity::Anonymous),
+        3 => Some(Anonymity::Unknown),
+        _ => None,
+    }
+}
+
+fn protocol_code(protocol: Option<Protocol>) -> Option<u8> {
+    match protocol? {
+        Protocol::Http(a) => Some(1 + anon_code(a)),
+        Protocol::Https(a) => Some(5 + anon_code(a)),
+        Protocol::Socks4 => Some(9),
+        Protocol::Socks5 => Some(10),
+        Protocol::Connect(_) => Some(11),
+    }
+}
+
+fn protocol_from_code(code: u8) -> Option<Protocol> {
+    match code {
+        1..=4 => Some(Protocol::Http(anon_from_code(code - 1)?)),
+        5..=8 => Some(Protocol::Https(anon_from_code(code - 5)?)),
+        9 => Some(Protocol::Socks4),
+        10 => Some(Protocol::Socks5),
+        _ => None,
+    }
+}
+
+fn decode_rows(body: &[u8]) -> Option<Vec<ParsedProxy>> {
+    if body.len() < 12 || !body.starts_with(&CACHE_MAGIC[..]) {
         return None;
     }
-    let mut rows = Vec::new();
-    for line in lines {
-        let mut parts = line.splitn(3, ':');
-        let (Some(ip), Some(port)) = (parts.next(), parts.next()) else {
-            continue;
+    let n = u32::from_le_bytes(body[8..12].try_into().ok()?) as usize;
+    let mut rows = Vec::with_capacity(n);
+    let mut cursor = 12;
+    for _ in 0..n {
+        if cursor + 7 > body.len() {
+            return None;
+        }
+        let ip = Ipv4Addr::new(
+            body[cursor],
+            body[cursor + 1],
+            body[cursor + 2],
+            body[cursor + 3],
+        );
+        let port = u16::from_le_bytes([body[cursor + 4], body[cursor + 5]]);
+        let code = body[cursor + 6];
+        cursor += 7;
+        let protocol = match code {
+            0 => None,
+            11 => {
+                if cursor + 2 > body.len() {
+                    return None;
+                }
+                let p = u16::from_le_bytes([body[cursor], body[cursor + 1]]);
+                cursor += 2;
+                Some(Protocol::Connect(p))
+            }
+            code => protocol_from_code(code),
         };
-        let (Ok(ip), Ok(port)) = (ip.parse::<Ipv4Addr>(), port.parse::<u16>()) else {
-            continue;
-        };
-        let protocol = parts
-            .next()
-            .and_then(|token| Protocol::from_str(token).ok());
         rows.push((ip, port, protocol));
     }
     Some(rows)
@@ -173,12 +221,11 @@ fn cache_file_name(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_file_name, decode_rows, protocol_token, Cache, CACHE_MAGIC};
+    use super::{cache_file_name, decode_rows, protocol_code, protocol_from_code, Cache, CACHE_MAGIC};
     use crate::proxy::models::Protocol;
     use std::{
         net::Ipv4Addr,
         path::PathBuf,
-        str::FromStr,
         sync::atomic::{AtomicU64, Ordering},
         time::Duration,
     };
@@ -280,38 +327,76 @@ mod tests {
         cleanup(&dir);
     }
 
-    #[tokio::test]
-    async fn malformed_rows_are_skipped() {
-        let mut body = String::from(CACHE_MAGIC);
-        body.push('\n');
-        body.push_str("1.2.3.4:8080\n");
-        body.push_str("not-an-ip:8080\n");
-        body.push_str("9.9.9.9:99999\n");
-        body.push_str("9.9.9.9:1080:SOCKS5\n");
-        let rows = decode_rows(&body).expect("magic matches");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], (Ipv4Addr::new(1, 2, 3, 4), 8080, None));
-        assert_eq!(
-            rows[1],
-            (Ipv4Addr::new(9, 9, 9, 9), 1080, Some(Protocol::Socks5))
-        );
+    fn binary_rows(rows: &[(Ipv4Addr, u16, Option<Protocol>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(CACHE_MAGIC);
+        body.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for (ip, port, protocol) in rows {
+            body.extend_from_slice(&ip.octets());
+            body.extend_from_slice(&port.to_le_bytes());
+            match protocol {
+                None => body.push(0),
+                Some(Protocol::Connect(p)) => {
+                    body.push(protocol_code(*protocol).unwrap());
+                    body.extend_from_slice(&p.to_le_bytes());
+                }
+                Some(p) => body.push(protocol_code(Some(*p)).unwrap()),
+            }
+        }
+        body
     }
 
     #[test]
-    fn protocol_tokens_round_trip_through_from_str() {
-        for token in [
-            "HTTP",
-            "HTTP:Elite",
-            "HTTP:Transparent",
-            "HTTP:Anonymous",
-            "HTTPS",
-            "HTTPS:Elite",
-            "SOCKS4",
-            "SOCKS5",
-            "CONNECT:8080",
+    fn binary_round_trips_all_protocol_variants() {
+        let rows = [
+            (Ipv4Addr::new(1, 2, 3, 4), 8080, None),
+            (
+                Ipv4Addr::new(5, 6, 7, 8),
+                3128,
+                Some(Protocol::Http(crate::proxy::models::Anonymity::Elite)),
+            ),
+            (
+                Ipv4Addr::new(9, 9, 9, 9),
+                1080,
+                Some(Protocol::Socks5),
+            ),
+            (
+                Ipv4Addr::new(10, 0, 0, 1),
+                443,
+                Some(Protocol::Connect(443)),
+            ),
+            (
+                Ipv4Addr::new(10, 0, 0, 2),
+                8443,
+                Some(Protocol::Https(crate::proxy::models::Anonymity::Transparent)),
+            ),
+        ];
+        let parsed = decode_rows(&binary_rows(&rows)).expect("valid binary cache");
+        assert_eq!(parsed, rows.to_vec());
+    }
+
+    #[test]
+    fn truncated_binary_cache_is_rejected() {
+        let rows = [(Ipv4Addr::new(1, 2, 3, 4), 8080, Some(Protocol::Connect(443)))];
+        let full = binary_rows(&rows);
+        // Turn a full row into a truncated one mid-row.
+        assert!(decode_rows(&full[..full.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn protocol_codes_round_trip() {
+        for protocol in [
+            Protocol::Http(crate::proxy::models::Anonymity::Elite),
+            Protocol::Http(crate::proxy::models::Anonymity::Transparent),
+            Protocol::Http(crate::proxy::models::Anonymity::Anonymous),
+            Protocol::Http(crate::proxy::models::Anonymity::Unknown),
+            Protocol::Https(crate::proxy::models::Anonymity::Elite),
+            Protocol::Https(crate::proxy::models::Anonymity::Unknown),
+            Protocol::Socks4,
+            Protocol::Socks5,
         ] {
-            let protocol = Protocol::from_str(token).unwrap();
-            assert_eq!(protocol_token(protocol), token);
+            let code = protocol_code(Some(protocol)).unwrap();
+            assert_eq!(protocol_from_code(code), Some(protocol));
         }
     }
 
