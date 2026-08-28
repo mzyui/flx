@@ -5,6 +5,7 @@ mod tunnel;
 mod work;
 
 use std::{
+    collections::HashMap,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -82,6 +83,62 @@ struct JudgeTargets {
     tunnel: Arc<checker::JudgePool>,
 }
 
+// Reuses a verified judge pool across passes of one run (a `find` fallback
+// pass repeats `validate`, which would otherwise re-run the online preflight).
+// A strong ref with a short TTL lets pass-2 reuse pass-1's pool without
+// unbounded growth in long-lived processes.
+const JUDGE_POOL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PoolKey {
+    urls: Vec<String>,
+    insecure: bool,
+}
+
+struct CachedJudgePool {
+    created: std::time::Instant,
+    pool: Arc<checker::JudgePool>,
+}
+
+static POOL_CACHE: std::sync::OnceLock<Mutex<HashMap<PoolKey, CachedJudgePool>>> =
+    std::sync::OnceLock::new();
+
+fn pool_cache() -> &'static Mutex<HashMap<PoolKey, CachedJudgePool>> {
+    POOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_judge_pool(urls: &[String], insecure: bool) -> Option<Arc<checker::JudgePool>> {
+    let mut cache = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let key = PoolKey {
+        urls: urls.to_vec(),
+        insecure,
+    };
+    let entry = cache.get(&key)?;
+    if entry.created.elapsed() > JUDGE_POOL_CACHE_TTL {
+        cache.remove(&key);
+        None
+    } else {
+        Some(Arc::clone(&entry.pool))
+    }
+}
+
+fn cache_judge_pool(urls: &[String], insecure: bool, pool: &Arc<checker::JudgePool>) {
+    let key = PoolKey {
+        urls: urls.to_vec(),
+        insecure,
+    };
+    pool_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            key,
+            CachedJudgePool {
+                created: std::time::Instant::now(),
+                pool: Arc::clone(pool),
+            },
+        );
+}
+
 // Builds a judge pool, retrying the whole preflight once after a short delay
 // so a transient network blip cannot abort the run. Returns the pool plus a
 // snapshot of which candidate judges passed or failed preflight.
@@ -92,6 +149,9 @@ async fn preflight_pool(
 ) -> anyhow::Result<(Arc<checker::JudgePool>, JudgeHealthReport)> {
     const PREFLIGHT_RETRIES: usize = 1;
     const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
+    if let Some(pool) = cached_judge_pool(urls, insecure) {
+        return Ok((pool, JudgeHealthReport::default()));
+    }
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..=PREFLIGHT_RETRIES {
         if attempt > 0 {
@@ -133,6 +193,7 @@ async fn preflight_pool(
                     healthy: pool.len(),
                     failed: failed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 };
+                cache_judge_pool(urls, insecure, &pool);
                 return Ok((pool, report));
             }
             Err(error) => last_error = Some(error),
