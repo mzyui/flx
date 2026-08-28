@@ -15,6 +15,9 @@ use models::{ScrapeContext, ScrapeMode, Source};
 use tokio::time;
 
 const MAX_SOURCE_BODY_BYTES: usize = 8 * 1024 * 1024;
+// Typical sources are small; pre-sizing avoids quadratic reallocation during
+// frame accumulation.
+const SOURCE_BODY_INITIAL_CAPACITY: usize = 8192;
 const MAX_REDIRECTS: usize = 10;
 
 use crate::proxy::models::{Protocol, Proxy};
@@ -131,7 +134,7 @@ pub trait ProxyProvider {
         urls.push_back((initial_url, None));
 
         let user_agent = crate::user_agent::next_user_agent();
-        let mut content = String::new();
+        let mut content = String::with_capacity(SOURCE_BODY_INITIAL_CAPACITY);
         let mut pending = [0u8; 3];
         let mut pending_len = 0usize;
         let mut visited: HashSet<url::Url> = HashSet::new();
