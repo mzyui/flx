@@ -290,10 +290,16 @@ where
                 }
             } else {
                 guard.before_write();
-                let mut stdout = std::io::stdout().lock();
-                stdout
-                    .write_all(pac.as_bytes())
-                    .expect("failed to write PAC to stdout");
+                if let Err(error) = std::io::stdout().lock().write_all(pac.as_bytes()) {
+                    // A downstream consumer (e.g. `head`) closing the pipe is
+                    // normal termination, not a defect.
+                    if error.kind() == std::io::ErrorKind::BrokenPipe {
+                        guard.after_write();
+                        return Ok(RunOutcome::Finished);
+                    }
+                    guard.after_write();
+                    return Err(anyhow::Error::new(error).context("failed to write PAC to stdout"));
+                }
                 guard.after_write();
             }
         }
@@ -336,9 +342,16 @@ where
             }
         } else {
             guard.before_write();
-            stdout
-                .write_all(&buf)
-                .expect("failed to write CSV header to stdout");
+            if let Err(error) = stdout.write_all(&buf) {
+                // `head` (or any early-closing consumer) is expected termination.
+                if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    guard.after_write();
+                    return Ok(RunOutcome::Finished);
+                }
+                write_error = Some(
+                    anyhow::Error::new(error).context("failed to write CSV header to stdout"),
+                );
+            }
             guard.after_write();
         }
         buf.clear();
@@ -430,11 +443,20 @@ where
                         }
                     } else {
                         guard.before_write();
-                        // `print!` panics on a broken pipe; keep that behaviour by
-                        // panicking here too.
-                        stdout
-                            .write_all(&buf)
-                            .expect("failed to write proxy to stdout");
+                        // A downstream consumer closing the pipe (e.g. `head`)
+                        // is normal, so end the run cleanly instead of panicking.
+                        if let Err(error) = stdout.write_all(&buf) {
+                            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                                guard.after_write();
+                                break;
+                            }
+                            write_error = Some(
+                                anyhow::Error::new(error)
+                                    .context("failed to write proxy to stdout"),
+                            );
+                            guard.after_write();
+                            break;
+                        }
                         guard.after_write();
                     }
 
