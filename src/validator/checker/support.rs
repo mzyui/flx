@@ -403,9 +403,22 @@ pub(crate) async fn support_http(
                 // The lookup runs under its own fixed budget (`MY_IP_LOOKUP_TIMEOUT`)
                 // rather than the leftover probe deadline, so a proxy that answers
                 // just before its deadline is not rejected for a slow my-IP fetch.
-                let my_ip = my_ip().await.context(
-                    "cannot determine anonymity level without knowing our own public IP",
-                )?;
+                // A failed lookup must not fail a live proxy: degrade to Unknown
+                // (rank 3) so the result stays usable for min-anonymity filters.
+                let my_ip = match my_ip().await {
+                    Ok(ip) => ip,
+                    Err(_e) => {
+                        #[cfg(feature = "log")]
+                        log::trace!("{}: my_ip lookup failed, degrading to unknown: {:#}", proxy, _e);
+                        let _ = _e;
+                        pool.report_success(&target, started.elapsed());
+                        return Ok(Some(ProxyRuntimes {
+                            inner: Protocol::Http(Anonymity::Unknown),
+                            runtimes: end_to_end_runtime(started.elapsed()),
+                            driver,
+                        }));
+                    }
+                };
                 (body, my_ip)
             };
             let body = String::from_utf8_lossy(&body);
