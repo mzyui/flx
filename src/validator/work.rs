@@ -132,10 +132,8 @@ fn classify_failure(error: &anyhow::Error, protocol: Protocol) -> String {
         || text.contains("did not forward")
     {
         "rejected".to_owned()
-    } else if text.contains("cannot determine anonymity") {
-        "anonymity-unavailable".to_owned()
     } else {
-        format!("error ({}): {}", protocol, text)
+        format!("error ({protocol}): {text}")
     }
 }
 
