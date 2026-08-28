@@ -395,13 +395,23 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         if !cli.skip_version_check && !cli.quiet {
             let current = env!("CARGO_PKG_VERSION").to_owned();
             tokio::spawn(async move {
-                match fetch_latest_version().await {
-                    Ok(latest) if check_version(&current, &latest) => {
-                        eprintln!(
-                            "A new flx version is available: {latest} (you are on {current})."
-                        );
-                    }
-                    _ => {}
+                // Prefer a fresh on-disk cache to avoid a network round-trip on
+                // every run; a stale/missing cache triggers a fetch that
+                // refreshes it (best-effort).
+                let (latest, from_network) = match cached_latest_version() {
+                    Some(v) => (v, false),
+                    None => match fetch_latest_version().await {
+                        Ok(v) => (v, true),
+                        Err(_) => return,
+                    },
+                };
+                if from_network {
+                    cache_latest_version(&latest);
+                }
+                if check_version(&current, &latest) {
+                    eprintln!(
+                        "A new flx version is available: {latest} (you are on {current})."
+                    );
                 }
             });
         }
@@ -925,13 +935,14 @@ async fn write_failures(
     path: &std::path::Path,
     truncate: bool,
 ) {
-    use std::io::Write;
-    let file = std::fs::OpenOptions::new()
+    use tokio::io::AsyncWriteExt;
+    let file = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(truncate)
         .append(!truncate)
-        .open(path);
+        .open(path)
+        .await;
     let mut file = match file {
         Ok(file) => file,
         Err(error) => {
@@ -941,12 +952,18 @@ async fn write_failures(
             return;
         }
     };
+    // Buffer instead of one syscall per failure line, so a hot failure stream
+    // does not block the worker thread per record; flushed when the buffer
+    // fills and explicitly when the stream closes.
+    let mut writer = tokio::io::BufWriter::new(&mut file);
     while let Some(failure) = rx.recv().await {
         let line = serde_json::to_string(&failure).unwrap_or_default();
         if !line.is_empty() {
-            let _ = writeln!(file, "{line}");
+            let _ = writer.write_all(line.as_bytes()).await;
+            let _ = writer.write_all(b"\n").await;
         }
     }
+    let _ = writer.flush().await;
 }
 
 fn format_judge_health(report: &flx::JudgeHealthReport) -> String {
