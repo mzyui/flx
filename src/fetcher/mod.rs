@@ -424,9 +424,23 @@ impl ProxyFetcher {
             accepted: &self.accepted,
         };
         let result = accept_proxy(&mut ctx, proxy, |ip| {
-            self.geolookup
-                .as_ref()
-                .map(|geolookup| geolookup.lookup(ip))
+            self.geolookup.as_ref().map(|geolookup| {
+                // mmdb reads are memory-mapped binary searches (µs each, two
+                // per proxy). On the multi-thread runtime move them off the
+                // worker's task accounting so a cold page-cache hit does not
+                // stall the executor; `block_in_place` would panic on a
+                // current-thread runtime, so fall back to a direct read there.
+                let do_lookup = || geolookup.lookup(ip);
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle)
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        tokio::task::block_in_place(do_lookup)
+                    }
+                    _ => do_lookup(),
+                }
+            })
         });
         if result.is_some() {
             if let Some(threshold) = self.config.fallback_threshold {
