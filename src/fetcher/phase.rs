@@ -112,9 +112,19 @@ impl Throttle {
         let available_at = {
             let mut next_slot = self.next_slot.lock().unwrap_or_else(|e| e.into_inner());
             let now = time::Instant::now();
-            let available_at = next_slot.get(host).copied().unwrap_or(now).max(now);
-            next_slot.insert(host.to_owned(), available_at + delay);
-            available_at
+            // Update the slot in place via `Borrow<str>` so a String key is only
+            // allocated the first time a host appears, not on every call.
+            match next_slot.get_mut(host) {
+                Some(previous) => {
+                    let avail_at = (*previous).max(now);
+                    *previous = avail_at + delay;
+                    avail_at
+                }
+                None => {
+                    next_slot.insert(host.to_owned(), now + delay);
+                    now
+                }
+            }
         };
         let remaining = available_at.saturating_duration_since(time::Instant::now());
         if !remaining.is_zero() {
