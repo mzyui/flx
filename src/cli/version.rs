@@ -1,8 +1,51 @@
 use anyhow::Context;
-use std::time::Duration;
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 
 const VERSION_CHECK_URL: &str = "https://raw.githubusercontent.com/mzyui/flx/main/Cargo.toml";
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+// Skip the network round-trip for a day so a repeated run does not hit the
+// upstream on every invocation.
+const VERSION_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn version_cache_path() -> Option<PathBuf> {
+    let mut dir = flx::geolookup::data_dir().ok()?;
+    dir.push("version-check");
+    Some(dir)
+}
+
+/// Latest known version from a fresh on-disk cache, if any.
+pub(crate) fn cached_latest_version() -> Option<String> {
+    let path = version_cache_path()?;
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let age = SystemTime::now().duration_since(modified).ok()?;
+    if age > VERSION_CACHE_TTL {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let version = content.lines().next()?.trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_owned())
+    }
+}
+
+/// Persist the latest known version atomically for `VERSION_CACHE_TTL`.
+pub(crate) fn cache_latest_version(version: &str) {
+    let Some(path) = version_cache_path() else {
+        return;
+    };
+    let tmp = path.with_file_name(format!(
+        ".version-check.tmp-{}",
+        std::process::id()
+    ));
+    if std::fs::write(&tmp, format!("{version}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
 
 /// Returns true when `latest` is a newer release than `current`.
 pub fn check_version(current: &str, latest: &str) -> bool {
