@@ -96,8 +96,16 @@ const MOBILE_KEYWORDS: &[&str] = &[
 ];
 
 fn has_keyword(name: &str, keywords: &[&str]) -> bool {
-    let lower = name.to_ascii_lowercase();
-    keywords.iter().any(|keyword| lower.contains(keyword))
+    let name_bytes = name.as_bytes();
+    keywords.iter().any(|keyword| {
+        let keyword_bytes = keyword.as_bytes();
+        // Case-insensitive substring scan without allocating a lowercase copy
+        // on every classification.
+        keyword_bytes.is_empty()
+            || name_bytes
+                .windows(keyword_bytes.len())
+                .any(|window| window.eq_ignore_ascii_case(keyword_bytes))
+    })
 }
 
 fn has_hosting_keyword(name: &str) -> bool {
@@ -179,6 +187,17 @@ mod tests {
             IpType::classify(None, None, Some("Comcast"), None),
             IpType::Residential
         );
+    }
+
+    #[test]
+    fn keyword_match_is_case_insensitive_without_allocation() {
+        use super::{has_hosting_keyword, has_mobile_keyword, has_keyword, MOBILE_KEYWORDS};
+        // Uppercase / mixed-case occurrences must match like the old lowercase
+        // scan did, and an absent keyword must not.
+        assert!(has_mobile_keyword("PT Telkomsel Indonesia"));
+        assert!(has_mobile_keyword("telkomsel"));
+        assert!(has_keyword("Azteca DEploy", MOBILE_KEYWORDS) == false);
+        assert!(has_hosting_keyword("AMAZON AWS"));
     }
 
     #[test]
