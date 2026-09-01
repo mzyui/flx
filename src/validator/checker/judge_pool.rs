@@ -103,8 +103,12 @@ impl JudgePool {
     }
 
     #[cfg(test)]
+    /// Callers must guarantee the pool is non-empty (guaranteed by `build`
+    /// and the preflight gate before validation starts).
     pub fn next(&self) -> Arc<ValidationTarget> {
+        debug_assert!(!self.is_empty(), "judge pool must not be empty");
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+
         let now_ms = self.now_ms();
         let judges = self.judges.lock().unwrap_or_else(|e| e.into_inner());
         for offset in 0..judges.len() {
