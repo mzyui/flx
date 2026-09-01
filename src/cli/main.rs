@@ -39,23 +39,35 @@ pub(crate) use version::*;
 /// Formats the end-of-run stats line for `find`, colored under the
 /// `progress_bar` feature and plain otherwise.
 #[cfg(feature = "progress_bar")]
-fn format_validation_stats(stats: &ValidationStats, rate: f64, dst: Option<&str>) -> String {
+fn format_validation_stats(
+    stats: &ValidationStats,
+    rate: f64,
+    dst: Option<&str>,
+    dist: Option<&str>,
+) -> String {
     let v = format!("{} valid", stats.passed).green();
     let f = format!("{} failed", stats.done.saturating_sub(stats.passed)).red();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
+    let dist = dist.map(|d| format!(" · {d}")).unwrap_or_default();
     format!(
-        "{lead}{v} · {f} · {} total in {:?} ({rate:.1}/s){suffix}",
+        "{lead}{v} · {f} · {} total in {:?} ({rate:.1}/s){dist}{suffix}",
         stats.total, stats.elapsed
     )
 }
 
 #[cfg(not(feature = "progress_bar"))]
-fn format_validation_stats(stats: &ValidationStats, rate: f64, dst: Option<&str>) -> String {
+fn format_validation_stats(
+    stats: &ValidationStats,
+    rate: f64,
+    dst: Option<&str>,
+    dist: Option<&str>,
+) -> String {
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
+    let dist = dist.map(|d| format!(" · {d}")).unwrap_or_default();
     format!(
-        "{lead}{} valid · {} failed · {} total in {:?} ({rate:.1}/s){suffix}",
+        "{lead}{} valid · {} failed · {} total in {:?} ({rate:.1}/s){dist}{suffix}",
         stats.passed,
         stats.done.saturating_sub(stats.passed),
         stats.total,
@@ -71,11 +83,13 @@ fn format_gathered_stats(
     elapsed: std::time::Duration,
     rate: f64,
     dst: Option<&str>,
+    dist: Option<&str>,
 ) -> String {
     let n = format!("{gathered} proxies").green();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    format!("{lead}Gathered {n} in {elapsed:?} ({rate:.1}/s){suffix}")
+    let dist = dist.map(|d| format!(" · {d}")).unwrap_or_default();
+    format!("{lead}Gathered {n} in {elapsed:?} ({rate:.1}/s){dist}{suffix}")
 }
 
 #[cfg(not(feature = "progress_bar"))]
@@ -84,10 +98,12 @@ fn format_gathered_stats(
     elapsed: std::time::Duration,
     rate: f64,
     dst: Option<&str>,
+    dist: Option<&str>,
 ) -> String {
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    format!("{lead}Gathered {gathered} proxies in {elapsed:?} ({rate:.1}/s){suffix}")
+    let dist = dist.map(|d| format!(" · {d}")).unwrap_or_default();
+    format!("{lead}Gathered {gathered} proxies in {elapsed:?} ({rate:.1}/s){dist}{suffix}")
 }
 
 #[cfg(unix)]
@@ -641,8 +657,18 @@ async fn run_grab(
         Some(bar) => &**bar,
         None => &NoopGuard,
     };
-    let outcome =
-        process_result(fetcher, grab.output, cancel, guard, FinalizeOpts::default()).await;
+    let run_stats = crate::output::RunStats::new();
+    let outcome = process_result(
+        fetcher,
+        grab.output,
+        cancel,
+        guard,
+        FinalizeOpts {
+            stats: Some(Arc::clone(&run_stats)),
+            ..FinalizeOpts::default()
+        },
+    )
+    .await;
     if let Some(task) = watcher {
         task.abort();
         let _ = task.await;
@@ -660,9 +686,10 @@ async fn run_grab(
         } else {
             gathered as f64 / elapsed.as_secs_f64()
         };
+        let dist = run_stats.summary();
         eprintln!(
             "{}",
-            format_gathered_stats(gathered, elapsed, rate, dst.as_deref())
+            format_gathered_stats(gathered, elapsed, rate, dst.as_deref(), dist.as_deref())
         );
     }
     outcome
@@ -795,6 +822,7 @@ async fn run_find(
     // finish the document without losing pass-1 results.
     let may_fallback = !protocols.is_empty();
     let json_doc = may_fallback.then(|| Arc::new(JsonDoc::default()));
+    let run_stats = crate::output::RunStats::new();
     let outcome1 = process_result(
         pass1,
         find.output.clone(),
@@ -807,6 +835,7 @@ async fn run_find(
                 doc,
                 leave_open: true,
             }),
+            stats: Some(Arc::clone(&run_stats)),
         },
     )
     .await;
@@ -817,6 +846,7 @@ async fn run_find(
             report_validation_summary(
                 ValidationStats::from_progress(&progress1, started.elapsed()),
                 dst.as_deref(),
+                run_stats.summary().as_deref(),
                 quiet,
             );
         }
@@ -846,6 +876,7 @@ async fn run_find(
             report_validation_summary(
                 ValidationStats::from_progress(&progress1, started.elapsed()),
                 dst.as_deref(),
+                run_stats.summary().as_deref(),
                 quiet,
             );
             return Ok(RunOutcome::Finished);
@@ -864,6 +895,7 @@ async fn run_find(
                 report_validation_summary(
                     ValidationStats::from_progress(&progress1, started.elapsed()),
                     dst.as_deref(),
+                    run_stats.summary().as_deref(),
                     quiet,
                 );
                 return Ok(RunOutcome::Cancelled);
@@ -890,6 +922,7 @@ async fn run_find(
                     doc,
                     leave_open: false,
                 }),
+                stats: Some(Arc::clone(&run_stats)),
             },
         )
         .await;
@@ -901,11 +934,21 @@ async fn run_find(
         };
         if !matches!(outcome2, Ok(RunOutcome::Finished)) {
             if matches!(outcome2, Ok(RunOutcome::Cancelled)) {
-                report_validation_summary(summary2(), dst.as_deref(), quiet);
+                report_validation_summary(
+                    summary2(),
+                    dst.as_deref(),
+                    run_stats.summary().as_deref(),
+                    quiet,
+                );
             }
             return outcome2;
         }
-        report_validation_summary(summary2(), dst.as_deref(), quiet);
+        report_validation_summary(
+            summary2(),
+            dst.as_deref(),
+            run_stats.summary().as_deref(),
+            quiet,
+        );
         for task in failure_tasks {
             let _ = task.await;
         }
@@ -920,6 +963,7 @@ async fn run_find(
     report_validation_summary(
         ValidationStats::from_progress(&progress1, started.elapsed()),
         dst.as_deref(),
+        run_stats.summary().as_deref(),
         quiet,
     );
     for task in failure_tasks {
@@ -1014,7 +1058,12 @@ impl ValidationStats {
     }
 }
 
-fn report_validation_summary(stats: ValidationStats, dst: Option<&str>, quiet: bool) {
+fn report_validation_summary(
+    stats: ValidationStats,
+    dst: Option<&str>,
+    dist: Option<&str>,
+    quiet: bool,
+) {
     if quiet || stdout_is_pipe() {
         return;
     }
@@ -1023,7 +1072,7 @@ fn report_validation_summary(stats: ValidationStats, dst: Option<&str>, quiet: b
     } else {
         stats.total as f64 / stats.elapsed.as_secs_f64()
     };
-    eprintln!("{}", format_validation_stats(&stats, rate, dst));
+    eprintln!("{}", format_validation_stats(&stats, rate, dst, dist));
 }
 
 // Forwards every candidate while appending a copy to the recordings buffer,

@@ -704,6 +704,7 @@ fn json_empty_is_suppressed_when_requested() {
             FinalizeOpts {
                 suppress_empty_json: true,
                 emit_csv_header: true,
+                stats: None,
                 continue_json: None,
             },
         )
@@ -731,6 +732,7 @@ fn run_chained_passes(format: &str, pass1: &[Proxy], pass2: &[Proxy]) -> String 
             FinalizeOpts {
                 suppress_empty_json: true,
                 emit_csv_header: true,
+                stats: None,
                 continue_json: Some(JsonContinuation {
                     doc: Arc::clone(&doc),
                     leave_open: true,
@@ -747,6 +749,7 @@ fn run_chained_passes(format: &str, pass1: &[Proxy], pass2: &[Proxy]) -> String 
             FinalizeOpts {
                 suppress_empty_json: false,
                 emit_csv_header: false,
+                stats: None,
                 continue_json: Some(JsonContinuation {
                     doc,
                     leave_open: false,
@@ -788,6 +791,7 @@ fn skipped_fallback_after_partial_pass_closes_the_open_array() {
             FinalizeOpts {
                 suppress_empty_json: true,
                 emit_csv_header: true,
+                stats: None,
                 continue_json: Some(JsonContinuation {
                     doc: Arc::clone(&doc),
                     leave_open: true,
@@ -820,6 +824,7 @@ fn skipped_fallback_with_an_empty_pass_emits_one_empty_array() {
             FinalizeOpts {
                 suppress_empty_json: true,
                 emit_csv_header: true,
+                stats: None,
                 continue_json: Some(JsonContinuation {
                     doc: Arc::clone(&doc),
                     leave_open: true,
@@ -1922,4 +1927,55 @@ fn clap_defaults_match_facade_defaults_field_by_field() {
             .collect::<Vec<_>>(),
         "--https-judge-urls must track DEFAULT_HTTPS_JUDGE_URLS"
     );
+}
+
+fn run_with_stats(proxies: &[Proxy]) -> Option<String> {
+    let stats = super::output::RunStats::new();
+    let (options, path) = output_options("json-lines", 0);
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(async {
+        let s = stream::iter(proxies.to_vec());
+        process_result(
+            s,
+            options,
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts {
+                stats: Some(Arc::clone(&stats)),
+                ..FinalizeOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let _ = std::fs::remove_file(&path);
+    stats.summary()
+}
+
+#[test]
+fn run_stats_aggregates_protocol_families_and_countries() {
+    use flx::proxy::models::ProxyType;
+    let mut mixed = validated_proxy(1, "HTTP:Anonymous", 0.2);
+    mixed.proxy_types.push(ProxyType::checked(Protocol::Socks5));
+    let mut elite = validated_proxy(2, "HTTP:Elite", 0.2);
+    elite.geo = Arc::new(flx::GeoData {
+        iso_code: Some("ID".into()),
+        ..flx::GeoData::default()
+    });
+    let mut socks = validated_proxy(3, "SOCKS4", 0.2);
+    socks.geo = Arc::new(flx::GeoData {
+        iso_code: Some("US".into()),
+        ..flx::GeoData::default()
+    });
+
+    let summary = run_with_stats(&[mixed, elite, socks]).expect("non-empty summary");
+    assert!(summary.contains("HTTP: 2"), "{summary}");
+    assert!(summary.contains("SOCKS5: 1"), "{summary}");
+    assert!(summary.contains("SOCKS4: 1"), "{summary}");
+    assert!(summary.contains("top: ID 1, US 1"), "{summary}");
+}
+
+#[test]
+fn run_stats_summary_is_none_for_an_empty_run() {
+    assert!(run_with_stats(&[]).is_none());
 }

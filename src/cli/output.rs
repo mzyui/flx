@@ -2,10 +2,11 @@ use anyhow::Context;
 use flx::proxy::models::{Protocol, Proxy};
 use flx::IpType;
 use futures_util::{Stream, StreamExt};
+use std::collections::HashMap;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 
 use super::argument::OutputOptions;
@@ -45,6 +46,73 @@ pub(crate) fn effective_format<'a>(
     }
 }
 
+// Aggregated per-item distribution feeding the end-of-run summary line.
+#[derive(Default)]
+pub struct RunStats {
+    protocols: Mutex<HashMap<&'static str, usize>>,
+    countries: Mutex<HashMap<Box<str>, usize>>,
+}
+
+const RUN_STATS_TOP_COUNTRIES: usize = 5;
+
+impl RunStats {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn record(&self, proxy: &Proxy) {
+        {
+            let mut protocols = self.protocols.lock().unwrap_or_else(|e| e.into_inner());
+            for proxy_type in &proxy.proxy_types {
+                let family = match flx::protocol_family(proxy_type.protocol) {
+                    Protocol::Http(_) => "HTTP",
+                    Protocol::Https(_) => "HTTPS",
+                    Protocol::Socks4 => "SOCKS4",
+                    Protocol::Socks5 => "SOCKS5",
+                    Protocol::Connect(_) => "CONNECT",
+                };
+                *protocols.entry(family).or_default() += 1;
+            }
+        }
+        if let Some(iso_code) = &proxy.geo.iso_code {
+            let mut countries = self.countries.lock().unwrap_or_else(|e| e.into_inner());
+            *countries.entry(iso_code.clone()).or_default() += 1;
+        }
+    }
+
+    /// One-line distribution (`http: 12 · socks5: 3 · top: US 10, ID 4`),
+    /// `None` when nothing was emitted.
+    pub fn summary(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        {
+            let protocols = self.protocols.lock().unwrap_or_else(|e| e.into_inner());
+            let mut counts: Vec<(&'static str, usize)> =
+                protocols.iter().map(|(k, v)| (*k, *v)).collect();
+            counts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            parts.extend(counts.into_iter().map(|(name, n)| format!("{name}: {n}")));
+        }
+        {
+            let countries = self.countries.lock().unwrap_or_else(|e| e.into_inner());
+            let mut counts: Vec<(&str, usize)> =
+                countries.iter().map(|(k, v)| (k.as_ref(), *v)).collect();
+            counts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            if !counts.is_empty() {
+                let top: Vec<String> = counts
+                    .into_iter()
+                    .take(RUN_STATS_TOP_COUNTRIES)
+                    .map(|(iso, n)| format!("{iso} {n}"))
+                    .collect();
+                parts.push(format!("top: {}", top.join(", ")));
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    }
+}
+
 // Item counter shared by chained output passes so a fallback pass extends
 // the array opened by an earlier pass instead of starting a new document.
 #[derive(Default)]
@@ -80,6 +148,9 @@ pub struct FinalizeOpts {
     // A chained pass also opens its output file in append mode so bytes
     // written by earlier passes are never truncated away.
     pub continue_json: Option<JsonContinuation>,
+    // Shared per-item distribution collector for the end-of-run summary;
+    // chained passes share one instance so both passes count into it.
+    pub stats: Option<Arc<RunStats>>,
 }
 
 impl Default for FinalizeOpts {
@@ -88,6 +159,7 @@ impl Default for FinalizeOpts {
             suppress_empty_json: false,
             emit_csv_header: true,
             continue_json: None,
+            stats: None,
         }
     }
 }
@@ -462,6 +534,9 @@ where
                     item_count += 1;
                     if let Some(chain) = &finalize.continue_json {
                         chain.doc.add(1);
+                    }
+                    if let Some(stats) = &finalize.stats {
+                        stats.record(&proxy);
                     }
                 }
                 if should_end {
