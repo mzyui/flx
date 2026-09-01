@@ -167,43 +167,56 @@ impl ProxyType {
 
 // ── Serialization helpers ─────────────────────────────────────────────
 
-fn serialize_runtimes<S>(runtimes: &RuntimeStats, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_f64(runtimes.avg())
-}
+// Newtype so the `type` key can be serialized from a borrowed field inside
+// the manual `Proxy` serializer.
+struct TypesRef<'a>(&'a [ProxyType]);
 
-fn serialize_types<S>(types: &[ProxyType], serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match types {
-        [] => serializer.serialize_none(),
-        [single] => single.serialize(serializer),
-        many => many.serialize(serializer),
+impl serde::Serialize for TypesRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.0 {
+            [] => serializer.serialize_none(),
+            [single] => single.serialize(serializer),
+            many => many.serialize(serializer),
+        }
     }
 }
 
 // ── Proxy ─────────────────────────────────────────────────────────────
 
 /// A validated proxy endpoint with metadata.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Proxy {
     pub ip: Ipv4Addr,
     pub port: u16,
     pub geo: Arc<GeoData>,
-    #[serde(
-        rename = "average_response_time",
-        serialize_with = "serialize_runtimes"
-    )]
     pub runtimes: RuntimeStats,
-    #[serde(skip)]
     pub expected_types: Arc<[Protocol]>,
-    #[serde(rename = "type", serialize_with = "serialize_types")]
     pub proxy_types: Vec<ProxyType>,
-    #[serde(skip)]
     pub(crate) text: Arc<str>,
+}
+
+// Hand-written instead of derived so the latency statistics split out of the
+// single `runtimes` field while keeping every historical JSON key intact.
+impl serde::Serialize for Proxy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        let mut state = serializer.serialize_struct("Proxy", 8)?;
+        state.serialize_field("ip", &self.ip)?;
+        state.serialize_field("port", &self.port)?;
+        state.serialize_field("geo", &self.geo)?;
+        state.serialize_field("average_response_time", &self.runtimes.avg())?;
+        state.serialize_field("min_response_time", &self.runtimes.min)?;
+        state.serialize_field("max_response_time", &self.runtimes.max)?;
+        state.serialize_field("response_time_samples", &self.runtimes.count)?;
+        state.serialize_field("type", &TypesRef(&self.proxy_types))?;
+        state.end()
+    }
 }
 
 static DEFAULT_GEO: LazyLock<Arc<GeoData>> = LazyLock::new(|| Arc::new(GeoData::default()));
@@ -227,6 +240,25 @@ impl Proxy {
         let mut proxy = Self::new(ip, port);
         proxy.expected_types = expected_types;
         proxy
+    }
+
+    /// Fastest recorded end-to-end response time in seconds (0 when unsampled).
+    pub fn min_response_time(&self) -> f64 {
+        if self.runtimes.count == 0 {
+            0.0
+        } else {
+            self.runtimes.min
+        }
+    }
+
+    /// Slowest recorded end-to-end response time in seconds (0 when unsampled).
+    pub fn max_response_time(&self) -> f64 {
+        self.runtimes.max
+    }
+
+    /// Number of recorded response-time samples.
+    pub fn sample_count(&self) -> u32 {
+        self.runtimes.count
     }
 
     pub(crate) fn validation_probe(&self) -> Self {
@@ -388,6 +420,25 @@ mod tests {
 
         assert!(std::sync::Arc::ptr_eq(&proxy.expected_types, &expected));
         assert!(std::sync::Arc::ptr_eq(&proxy.text, &probe.text));
+    }
+
+    #[test]
+    fn json_keeps_historical_keys_and_adds_latency_statistics() {
+        let mut proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 50), 8080);
+        proxy.runtimes.record(0.2);
+        proxy.runtimes.record(0.8);
+
+        let value = serde_json::to_value(&proxy).unwrap();
+        assert_eq!(value["average_response_time"], serde_json::json!(0.5));
+        assert_eq!(value["min_response_time"], serde_json::json!(0.2));
+        assert_eq!(value["max_response_time"], serde_json::json!(0.8));
+        assert_eq!(value["response_time_samples"], serde_json::json!(2));
+        // Historical shape is untouched for existing consumers.
+        assert!(value["type"].is_null());
+        assert_eq!(value["ip"], serde_json::json!("192.0.2.50"));
+        assert_eq!(value["port"], serde_json::json!(8080));
+        assert!(proxy.min_response_time() > 0.0);
+        assert_eq!(proxy.sample_count(), 2);
     }
 
     #[test]
