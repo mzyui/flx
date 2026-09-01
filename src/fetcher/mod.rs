@@ -98,15 +98,10 @@ impl ProxyFetcher {
             None
         };
 
-        let mut providers = select_providers(
-            all_providers(),
-            &config.providers,
-            &config.excluded_providers,
-        );
-        let mut known_names: Vec<&str> = all_providers()
-            .iter()
-            .map(|provider| provider.name())
-            .collect();
+        let registry = all_providers();
+        let mut known_names: Vec<&str> = registry.iter().map(|provider| provider.name()).collect();
+        let mut providers =
+            select_providers(registry, &config.providers, &config.excluded_providers);
         if !config.custom_sources.is_empty() {
             known_names.push("custom");
         }
