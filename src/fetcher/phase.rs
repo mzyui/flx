@@ -155,37 +155,17 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
     let url = source.url.to_string();
     let expected_types = Arc::clone(&source.default_types);
 
-    let rows: Vec<ParsedProxy> = match ctx.settings.fetch_cache.as_ref() {
-        Some(fetch_cache) => match fetch_cache.load_rows(&url).await {
-            Some(rows) => rows,
-            None => {
-                if ctx.settings.offline {
-                    #[cfg(feature = "log")]
-                    log::warn!("offline: no cached rows for {url}; skipping");
-                    return Ok(());
-                }
-                let _permit = ctx
-                    .sem
-                    .acquire()
-                    .await
-                    .context("fetcher semaphore closed during shutdown")?;
-                throttle_wait(&ctx.settings, &source).await;
-                let body = provider
-                    .fetch(Arc::clone(&ctx.client), &url, source.timeout)
-                    .await
-                    .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
-                let mode = source.mode.clone();
-                let rows = tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
-                    .await
-                    .context("provider parser task failed")??;
-                fetch_cache.store_rows(&url, &rows).await;
-                rows
-            }
-        },
+    let cached = match ctx.settings.fetch_cache.as_ref() {
+        Some(fetch_cache) => fetch_cache.load_rows(&url).await,
+        None => None,
+    };
+
+    let rows: Vec<ParsedProxy> = match cached {
+        Some(rows) => rows,
         None => {
             if ctx.settings.offline {
                 #[cfg(feature = "log")]
-                log::warn!("offline: cache disabled; skipping {url}");
+                log::warn!("offline: no cached rows for {url}; skipping");
                 return Ok(());
             }
             let _permit = ctx
@@ -199,9 +179,13 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
                 .await
                 .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
             let mode = source.mode.clone();
-            tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
+            let rows = tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
                 .await
-                .context("provider parser task failed")??
+                .context("provider parser task failed")??;
+            if let Some(fetch_cache) = ctx.settings.fetch_cache.as_ref() {
+                fetch_cache.store_rows(&url, &rows).await;
+            }
+            rows
         }
     };
 
