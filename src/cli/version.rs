@@ -38,10 +38,7 @@ pub(crate) fn cache_latest_version(version: &str) {
     let Some(path) = version_cache_path() else {
         return;
     };
-    let tmp = path.with_file_name(format!(
-        ".version-check.tmp-{}",
-        std::process::id()
-    ));
+    let tmp = path.with_file_name(format!(".version-check.tmp-{}", std::process::id()));
     if std::fs::write(&tmp, format!("{version}\n")).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }

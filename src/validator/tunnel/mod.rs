@@ -355,6 +355,7 @@ mod tests {
             url: JUDGE_URL.to_owned(),
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
         })
         .unwrap();
         let result = time::timeout(
@@ -403,6 +404,7 @@ mod tests {
             url: JUDGE_URL.to_owned(),
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
         });
         let params = test_params(Duration::from_millis(50));
         let result = support_tunnel(&mut proxy, Protocol::Socks5, &pool, &params)
@@ -430,6 +432,7 @@ mod tests {
             url: JUDGE_URL.to_owned(),
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
         });
         let started = time::Instant::now();
         let params = test_params(Duration::from_millis(50));
@@ -480,6 +483,7 @@ mod tests {
             url: JUDGE_URL.to_owned(),
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
         })
         .unwrap();
         let deadline = time::Instant::now() + Duration::from_millis(50);
@@ -515,6 +519,7 @@ mod tests {
             url: JUDGE_URL.to_owned(),
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
         })
         .unwrap();
         let deadline = time::Instant::now() + Duration::from_secs(1);
@@ -564,6 +569,7 @@ mod tests {
             url: format!("http://{address}/"),
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
         });
         let params = test_params(Duration::from_millis(200));
         let result = support_tunnel(&mut proxy, Protocol::Connect(9), &pool, &params).await;
@@ -656,6 +662,7 @@ mod tests {
             url: JUDGE_URL.to_owned(),
             response_marker: "fluxy-test-token".to_owned(),
             request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
         })
         .unwrap();
         let result = time::timeout(

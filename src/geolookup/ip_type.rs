@@ -191,12 +191,12 @@ mod tests {
 
     #[test]
     fn keyword_match_is_case_insensitive_without_allocation() {
-        use super::{has_hosting_keyword, has_mobile_keyword, has_keyword, MOBILE_KEYWORDS};
+        use super::{has_hosting_keyword, has_keyword, has_mobile_keyword, MOBILE_KEYWORDS};
         // Uppercase / mixed-case occurrences must match like the old lowercase
         // scan did, and an absent keyword must not.
         assert!(has_mobile_keyword("PT Telkomsel Indonesia"));
         assert!(has_mobile_keyword("telkomsel"));
-        assert!(has_keyword("Azteca DEploy", MOBILE_KEYWORDS) == false);
+        assert!(!has_keyword("Azteca DEploy", MOBILE_KEYWORDS));
         assert!(has_hosting_keyword("AMAZON AWS"));
     }
 

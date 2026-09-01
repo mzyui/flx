@@ -109,17 +109,14 @@ fn pool_cache() -> &'static Mutex<HashMap<PoolKey, CachedJudgePool>> {
 
 fn cached_judge_pool(urls: &[String], insecure: bool) -> Option<Arc<checker::JudgePool>> {
     let mut cache = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
+    // Prune every expired entry, not just the requested key, so abandoned
+    // configurations cannot accumulate.
+    cache.retain(|_, entry| entry.created.elapsed() <= JUDGE_POOL_CACHE_TTL);
     let key = PoolKey {
         urls: urls.to_vec(),
         insecure,
     };
-    let entry = cache.get(&key)?;
-    if entry.created.elapsed() > JUDGE_POOL_CACHE_TTL {
-        cache.remove(&key);
-        None
-    } else {
-        Some(Arc::clone(&entry.pool))
-    }
+    cache.get(&key).map(|entry| Arc::clone(&entry.pool))
 }
 
 fn cache_judge_pool(urls: &[String], insecure: bool, pool: &Arc<checker::JudgePool>) {
@@ -150,7 +147,14 @@ async fn preflight_pool(
     const PREFLIGHT_RETRIES: usize = 1;
     const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
     if let Some(pool) = cached_judge_pool(urls, insecure) {
-        return Ok((pool, JudgeHealthReport::default()));
+        // Report real numbers so pass-2 does not print a misleading empty
+        // health report; no candidate failed again since none re-ran.
+        let report = JudgeHealthReport {
+            candidates: unique_count(urls),
+            healthy: pool.len(),
+            failed: Vec::new(),
+        };
+        return Ok((pool, report));
     }
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..=PREFLIGHT_RETRIES {

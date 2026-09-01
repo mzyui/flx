@@ -1,5 +1,5 @@
 use std::{
-    sync::LazyLock,
+    sync::{atomic::AtomicU64, Arc, LazyLock},
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -83,11 +83,23 @@ pub fn classify_anonymity(body: &str, my_ip: &str) -> Anonymity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ValidationTarget {
     pub(crate) url: String,
     pub(crate) response_marker: String,
     pub(crate) request_token: String,
+    // Shared through `Arc` so clones (and the pool's copy) update the same
+    // health state without the pool locking on every validation result.
+    pub(crate) health: Arc<TargetHealth>,
+}
+
+/// Lock-free per-judge health state; updated from hundreds of concurrent
+/// validation workers, so it must never sit behind the pool's judge-list lock.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+pub(crate) struct TargetHealth {
+    pub(crate) cooldown_until_ms: AtomicU64,
+    pub(crate) rtt_ema_ms: AtomicU64,
 }
 
 impl ValidationTarget {
@@ -114,6 +126,7 @@ impl ValidationTarget {
             url: url.to_owned(),
             response_marker: format!("HTTP_X_FLUXY_TOKEN = {token}"),
             request_token: token,
+            health: Arc::default(),
         })
     }
 
@@ -407,10 +420,14 @@ pub(crate) async fn support_http(
                 // (rank 3) so the result stays usable for min-anonymity filters.
                 let my_ip = match my_ip().await {
                     Ok(ip) => ip,
-                    Err(_e) => {
+                    Err(error) => {
                         #[cfg(feature = "log")]
-                        log::trace!("{}: my_ip lookup failed, degrading to unknown: {:#}", proxy, _e);
-                        let _ = _e;
+                        log::trace!(
+                            "{}: my_ip lookup failed, degrading to unknown: {:#}",
+                            proxy,
+                            error
+                        );
+                        let _ = error;
                         pool.report_success(&target, started.elapsed());
                         return Ok(Some(ProxyRuntimes {
                             inner: Protocol::Http(Anonymity::Unknown),

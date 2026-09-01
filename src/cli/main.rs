@@ -409,9 +409,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
                     cache_latest_version(&latest);
                 }
                 if check_version(&current, &latest) {
-                    eprintln!(
-                        "A new flx version is available: {latest} (you are on {current})."
-                    );
+                    eprintln!("A new flx version is available: {latest} (you are on {current}).");
                 }
             });
         }

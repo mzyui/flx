@@ -348,9 +348,8 @@ where
                     guard.after_write();
                     return Ok(RunOutcome::Finished);
                 }
-                write_error = Some(
-                    anyhow::Error::new(error).context("failed to write CSV header to stdout"),
-                );
+                write_error =
+                    Some(anyhow::Error::new(error).context("failed to write CSV header to stdout"));
             }
             guard.after_write();
         }

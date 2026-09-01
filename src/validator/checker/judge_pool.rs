@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -15,22 +15,10 @@ use super::support::ValidationTarget;
 const JUDGE_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 
 pub struct JudgePool {
-    inner: Mutex<PoolInner>,
+    judges: Mutex<Vec<Arc<ValidationTarget>>>,
     cursor: AtomicUsize,
     epoch: time::Instant,
 }
-
-struct PoolInner {
-    judges: Vec<Arc<ValidationTarget>>,
-    cooldown_until_ms: Vec<PaddedCooldown>,
-    rtt_ema_ms: Vec<PaddedRtt>,
-}
-
-#[repr(align(64))]
-struct PaddedCooldown(AtomicU64);
-
-#[repr(align(64))]
-struct PaddedRtt(AtomicU64);
 
 impl JudgePool {
     pub async fn build<F>(
@@ -110,63 +98,62 @@ impl JudgePool {
         Ok(pool)
     }
 
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
     #[cfg(test)]
     pub fn next(&self) -> Arc<ValidationTarget> {
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let now_ms = self.epoch.elapsed().as_millis() as u64;
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for offset in 0..inner.judges.len() {
-            let index = (start + offset) % inner.judges.len();
-            if inner.cooldown_until_ms[index].0.load(Ordering::Relaxed) <= now_ms {
-                return Arc::clone(&inner.judges[index]);
+        let now_ms = self.now_ms();
+        let judges = self.judges.lock().unwrap_or_else(|e| e.into_inner());
+        for offset in 0..judges.len() {
+            let index = (start + offset) % judges.len();
+            let target = &judges[index];
+            if target.health.cooldown_until_ms.load(Ordering::Relaxed) <= now_ms {
+                return Arc::clone(target);
             }
         }
-        Arc::clone(&inner.judges[start % inner.judges.len()])
+        Arc::clone(&judges[start % judges.len()])
     }
 
     pub(crate) fn candidates(&self) -> Vec<Arc<ValidationTarget>> {
-        let now_ms = self.epoch.elapsed().as_millis() as u64;
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut candidates: Vec<(usize, Arc<ValidationTarget>)> =
-            Vec::with_capacity(inner.judges.len());
-        for index in 0..inner.judges.len() {
-            if inner.cooldown_until_ms[index].0.load(Ordering::Relaxed) <= now_ms {
-                candidates.push((index, Arc::clone(&inner.judges[index])));
-            }
-        }
-        if candidates.is_empty() && !inner.judges.is_empty() {
-            let start = self.cursor.fetch_add(1, Ordering::Relaxed) % inner.judges.len();
-            candidates.push((start, Arc::clone(&inner.judges[start])));
+        let now_ms = self.now_ms();
+        let judges = self.judges.lock().unwrap_or_else(|e| e.into_inner());
+        let mut candidates: Vec<Arc<ValidationTarget>> = judges
+            .iter()
+            .filter(|target| target.health.cooldown_until_ms.load(Ordering::Relaxed) <= now_ms)
+            .cloned()
+            .collect();
+        if candidates.is_empty() && !judges.is_empty() {
+            let start = self.cursor.fetch_add(1, Ordering::Relaxed) % judges.len();
+            candidates.push(Arc::clone(&judges[start]));
         }
         // Fastest judges first so each proxy pays the minimal RTT. Unknown
         // judges (EMA 0) are treated as slow and sink to the end.
-        candidates.sort_by_key(|(idx, _)| {
-            let ema = inner.rtt_ema_ms[*idx].0.load(Ordering::Relaxed);
+        candidates.sort_unstable_by_key(|target| {
+            let ema = target.health.rtt_ema_ms.load(Ordering::Relaxed);
             if ema == 0 {
                 u64::MAX
             } else {
                 ema
             }
         });
-        candidates.into_iter().map(|(_, target)| target).collect()
+        candidates
     }
 
     pub fn report_failure(&self, target: &ValidationTarget) {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(index) = inner
-            .judges
-            .iter()
-            .position(|judge| judge.url == target.url)
-        {
-            let until = self
-                .epoch
-                .elapsed()
-                .saturating_add(JUDGE_FAILURE_COOLDOWN)
-                .as_millis() as u64;
-            inner.cooldown_until_ms[index]
-                .0
-                .store(until, Ordering::Relaxed);
-        }
+        let until = self
+            .epoch
+            .elapsed()
+            .saturating_add(JUDGE_FAILURE_COOLDOWN)
+            .as_millis() as u64;
+        // Lock-free: the health state lives on the target itself, so hot-path
+        // reports never contend on the judge-list lock.
+        target
+            .health
+            .cooldown_until_ms
+            .store(until, Ordering::Relaxed);
     }
 
     pub(crate) fn report_success(&self, target: &ValidationTarget, elapsed: Duration) {
@@ -174,30 +161,19 @@ impl JudgePool {
         if elapsed_ms == 0 {
             return;
         }
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(index) = inner
-            .judges
-            .iter()
-            .position(|judge| judge.url == target.url)
-        {
-            let ema = &inner.rtt_ema_ms[index].0;
-            let prev = ema.load(Ordering::Relaxed);
-            let next = if prev == 0 {
-                elapsed_ms
-            } else {
-                // EMA with alpha 0.3: ema = ema*0.7 + sample*0.3
-                (prev * 7 + elapsed_ms * 3) / 10
-            };
-            ema.store(next, Ordering::Relaxed);
-        }
+        let ema = &target.health.rtt_ema_ms;
+        let prev = ema.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            elapsed_ms
+        } else {
+            // EMA with alpha 0.3: ema = ema*0.7 + sample*0.3
+            (prev * 7 + elapsed_ms * 3) / 10
+        };
+        ema.store(next, Ordering::Relaxed);
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .judges
-            .len()
+        self.judges.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -206,38 +182,22 @@ impl JudgePool {
 
     pub(crate) fn empty() -> Self {
         Self {
-            inner: Mutex::new(PoolInner {
-                judges: Vec::new(),
-                cooldown_until_ms: Vec::new(),
-                rtt_ema_ms: Vec::new(),
-            }),
+            judges: Mutex::new(Vec::new()),
             cursor: AtomicUsize::new(0),
             epoch: time::Instant::now(),
         }
     }
 
     pub(crate) fn append(&self, target: Arc<ValidationTarget>) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.judges.push(target);
-        inner
-            .cooldown_until_ms
-            .push(PaddedCooldown(AtomicU64::new(0)));
-        inner.rtt_ema_ms.push(PaddedRtt(AtomicU64::new(0)));
+        self.judges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(target);
     }
 
     pub(crate) fn from_targets(targets: Vec<Arc<ValidationTarget>>) -> Self {
-        let cooldown_until_ms = (0..targets.len())
-            .map(|_| PaddedCooldown(AtomicU64::new(0)))
-            .collect();
-        let rtt_ema_ms = (0..targets.len())
-            .map(|_| PaddedRtt(AtomicU64::new(0)))
-            .collect();
         Self {
-            inner: Mutex::new(PoolInner {
-                judges: targets,
-                cooldown_until_ms,
-                rtt_ema_ms,
-            }),
+            judges: Mutex::new(targets),
             cursor: AtomicUsize::new(0),
             epoch: time::Instant::now(),
         }

@@ -221,7 +221,9 @@ fn cache_file_name(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_file_name, decode_rows, protocol_code, protocol_from_code, Cache, CACHE_MAGIC};
+    use super::{
+        cache_file_name, decode_rows, protocol_code, protocol_from_code, Cache, CACHE_MAGIC,
+    };
     use crate::proxy::models::Protocol;
     use std::{
         net::Ipv4Addr,
@@ -355,11 +357,7 @@ mod tests {
                 3128,
                 Some(Protocol::Http(crate::proxy::models::Anonymity::Elite)),
             ),
-            (
-                Ipv4Addr::new(9, 9, 9, 9),
-                1080,
-                Some(Protocol::Socks5),
-            ),
+            (Ipv4Addr::new(9, 9, 9, 9), 1080, Some(Protocol::Socks5)),
             (
                 Ipv4Addr::new(10, 0, 0, 1),
                 443,
@@ -368,7 +366,9 @@ mod tests {
             (
                 Ipv4Addr::new(10, 0, 0, 2),
                 8443,
-                Some(Protocol::Https(crate::proxy::models::Anonymity::Transparent)),
+                Some(Protocol::Https(
+                    crate::proxy::models::Anonymity::Transparent,
+                )),
             ),
         ];
         let parsed = decode_rows(&binary_rows(&rows)).expect("valid binary cache");
@@ -377,7 +377,11 @@ mod tests {
 
     #[test]
     fn truncated_binary_cache_is_rejected() {
-        let rows = [(Ipv4Addr::new(1, 2, 3, 4), 8080, Some(Protocol::Connect(443)))];
+        let rows = [(
+            Ipv4Addr::new(1, 2, 3, 4),
+            8080,
+            Some(Protocol::Connect(443)),
+        )];
         let full = binary_rows(&rows);
         // Turn a full row into a truncated one mid-row.
         assert!(decode_rows(&full[..full.len() - 1]).is_none());

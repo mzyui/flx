@@ -7,6 +7,26 @@ description = "Fast proxy scraper & validator with GeoIP filtering and 9 output 
 repository = "https://github.com/mzyui/flx"
 readme = "README.md"
 
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.test]
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+opt-level = 1
+
 [dependencies]
 anyhow = "1.0.93"
 thiserror = "2.0"
