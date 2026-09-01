@@ -1976,6 +1976,57 @@ fn run_stats_aggregates_protocol_families_and_countries() {
 }
 
 #[test]
+fn run_stats_caps_top_countries_and_collapses_the_remainder() {
+    let proxies: Vec<Proxy> = ["US", "DE", "HK", "KR", "CO"]
+        .iter()
+        .enumerate()
+        .map(|(i, iso)| {
+            let mut proxy = sample_proxy(i as u8 + 1);
+            proxy.geo = Arc::new(flx::GeoData {
+                iso_code: Some((*iso).into()),
+                ..flx::GeoData::default()
+            });
+            proxy
+        })
+        .collect();
+
+    let summary = run_with_stats(&proxies).expect("non-empty summary");
+    // Equal counts tie-break alphabetically.
+    assert_eq!(summary, "top: CO 1, DE 1, HK 1, +2 more");
+}
+
+#[test]
+fn format_duration_is_human_readable() {
+    use std::time::Duration;
+    assert_eq!(format_duration(Duration::from_millis(0)), "0ms");
+    assert_eq!(format_duration(Duration::from_millis(840)), "840ms");
+    assert_eq!(format_duration(Duration::from_nanos(2_591_368_644)), "2.6s");
+    assert_eq!(format_duration(Duration::from_secs(64)), "1m 4s");
+}
+
+#[test]
+fn validation_summary_puts_distribution_on_its_own_indented_line() {
+    let stats = ValidationStats {
+        passed: 37,
+        done: 365,
+        total: 865,
+        elapsed: std::time::Duration::from_nanos(2_591_368_644),
+    };
+    let rate = 333.8;
+    let mut report = format_validation_stats(&stats, rate, None);
+    report.push_str(&format!("\n  {}", "HTTP: 37 · top: US 6, DE 3, HK 3"));
+
+    let non_empty: Vec<&str> = report.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(non_empty.len(), 2, "{report}");
+    assert!(
+        non_empty[0].starts_with("37 valid · 328 failed · 865 total in 2.6s (333.8/s)"),
+        "{report}"
+    );
+    assert!(non_empty[0].ends_with("(333.8/s)"), "{report}");
+    assert_eq!(non_empty[1], "  HTTP: 37 · top: US 6, DE 3, HK 3");
+}
+
+#[test]
 fn run_stats_summary_is_none_for_an_empty_run() {
     assert!(run_with_stats(&[]).is_none());
 }

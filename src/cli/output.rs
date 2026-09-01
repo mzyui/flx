@@ -53,7 +53,7 @@ pub struct RunStats {
     countries: Mutex<HashMap<Box<str>, usize>>,
 }
 
-const RUN_STATS_TOP_COUNTRIES: usize = 5;
+const RUN_STATS_TOP_COUNTRIES: usize = 3;
 
 impl RunStats {
     pub(crate) fn new() -> Arc<Self> {
@@ -97,11 +97,15 @@ impl RunStats {
                 countries.iter().map(|(k, v)| (k.as_ref(), *v)).collect();
             counts.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
             if !counts.is_empty() {
-                let top: Vec<String> = counts
-                    .into_iter()
+                let mut top: Vec<String> = counts
+                    .iter()
                     .take(RUN_STATS_TOP_COUNTRIES)
                     .map(|(iso, n)| format!("{iso} {n}"))
                     .collect();
+                let remainder = counts.len().saturating_sub(RUN_STATS_TOP_COUNTRIES);
+                if remainder > 0 {
+                    top.push(format!("+{remainder} more"));
+                }
                 parts.push(format!("top: {}", top.join(", ")));
             }
         }

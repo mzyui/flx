@@ -39,40 +39,41 @@ pub(crate) use version::*;
 /// Formats the end-of-run stats line for `find`, colored under the
 /// `progress_bar` feature and plain otherwise.
 #[cfg(feature = "progress_bar")]
-fn format_validation_stats(
-    stats: &ValidationStats,
-    rate: f64,
-    dst: Option<&str>,
-    dist: Option<&str>,
-) -> String {
+fn format_validation_stats(stats: &ValidationStats, rate: f64, dst: Option<&str>) -> String {
     let v = format!("{} valid", stats.passed).green();
     let f = format!("{} failed", stats.done.saturating_sub(stats.passed)).red();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    let dist = dist.map(|d| format!(" · {d}")).unwrap_or_default();
     format!(
-        "{lead}{v} · {f} · {} total in {:?} ({rate:.1}/s){dist}{suffix}",
-        stats.total, stats.elapsed
+        "{lead}{v} · {f} · {} total in {} ({rate:.1}/s){suffix}",
+        stats.total,
+        format_duration(stats.elapsed)
     )
 }
 
 #[cfg(not(feature = "progress_bar"))]
-fn format_validation_stats(
-    stats: &ValidationStats,
-    rate: f64,
-    dst: Option<&str>,
-    dist: Option<&str>,
-) -> String {
+fn format_validation_stats(stats: &ValidationStats, rate: f64, dst: Option<&str>) -> String {
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    let dist = dist.map(|d| format!(" · {d}")).unwrap_or_default();
     format!(
-        "{lead}{} valid · {} failed · {} total in {:?} ({rate:.1}/s){dist}{suffix}",
+        "{lead}{} valid · {} failed · {} total in {} ({rate:.1}/s){suffix}",
         stats.passed,
         stats.done.saturating_sub(stats.passed),
         stats.total,
-        stats.elapsed
+        format_duration(stats.elapsed)
     )
+}
+
+/// Human-readable duration: sub-second in ms, one decimal in s, minutes split
+/// out — `840ms`, `2.6s`, `1m 4s`.
+fn format_duration(elapsed: std::time::Duration) -> String {
+    if elapsed.as_millis() < 1_000 {
+        format!("{}ms", elapsed.as_millis())
+    } else if elapsed.as_secs() < 60 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else {
+        format!("{}m {}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+    }
 }
 
 /// Formats the end-of-run line for `grab`, colored under the `progress_bar`
@@ -83,13 +84,14 @@ fn format_gathered_stats(
     elapsed: std::time::Duration,
     rate: f64,
     dst: Option<&str>,
-    dist: Option<&str>,
 ) -> String {
     let n = format!("{gathered} proxies").green();
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    let dist = dist.map(|d| format!(" · {d}")).unwrap_or_default();
-    format!("{lead}Gathered {n} in {elapsed:?} ({rate:.1}/s){dist}{suffix}")
+    format!(
+        "{lead}Gathered {n} in {} ({rate:.1}/s){suffix}",
+        format_duration(elapsed)
+    )
 }
 
 #[cfg(not(feature = "progress_bar"))]
@@ -98,12 +100,13 @@ fn format_gathered_stats(
     elapsed: std::time::Duration,
     rate: f64,
     dst: Option<&str>,
-    dist: Option<&str>,
 ) -> String {
     let suffix = dst.map(|d| format!(" → {d}")).unwrap_or_default();
     let lead = if dst.is_some() { "" } else { "\n" };
-    let dist = dist.map(|d| format!(" · {d}")).unwrap_or_default();
-    format!("{lead}Gathered {gathered} proxies in {elapsed:?} ({rate:.1}/s){dist}{suffix}")
+    format!(
+        "{lead}Gathered {gathered} proxies in {} ({rate:.1}/s){suffix}",
+        format_duration(elapsed)
+    )
 }
 
 #[cfg(unix)]
@@ -687,10 +690,11 @@ async fn run_grab(
             gathered as f64 / elapsed.as_secs_f64()
         };
         let dist = run_stats.summary();
-        eprintln!(
-            "{}",
-            format_gathered_stats(gathered, elapsed, rate, dst.as_deref(), dist.as_deref())
-        );
+        let mut report = format_gathered_stats(gathered, elapsed, rate, dst.as_deref());
+        if let Some(dist) = &dist {
+            report.push_str(&format!("\n  {dist}"));
+        }
+        eprintln!("{report}");
     }
     outcome
 }
@@ -1072,7 +1076,13 @@ fn report_validation_summary(
     } else {
         stats.total as f64 / stats.elapsed.as_secs_f64()
     };
-    eprintln!("{}", format_validation_stats(&stats, rate, dst, dist));
+    let mut report = format_validation_stats(&stats, rate, dst);
+    // The distribution gets its own indented line: mixing it into the counts
+    // line made both hard to scan.
+    if let Some(dist) = dist {
+        report.push_str(&format!("\n  {dist}"));
+    }
+    eprintln!("{report}");
 }
 
 // Forwards every candidate while appending a copy to the recordings buffer,
