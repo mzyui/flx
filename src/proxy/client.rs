@@ -80,9 +80,12 @@ pub fn https_connector() -> HttpsConnector {
 }
 
 pub(crate) fn https_connector_with_config(
-    http: hyper_util::client::legacy::connect::HttpConnector,
+    mut http: hyper_util::client::legacy::connect::HttpConnector,
     insecure: bool,
 ) -> HttpsConnector {
+    // hyper-rustls delegates the TCP dial for https URIs to the inner
+    // connector, so its http-only enforcement must be off.
+    http.enforce_http(false);
     hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config((**tls_client_config(insecure)).clone())
         .https_or_http()
