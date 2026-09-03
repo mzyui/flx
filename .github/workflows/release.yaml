@@ -129,6 +129,6 @@ jobs:
         with:
           bin: flx
           target: aarch64-linux-android
-          features: openssl/vendored
+          features: vendored-openssl
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.RELEASE_REF }}

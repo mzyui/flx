@@ -69,6 +69,9 @@ hyper-tls = "0.6.0"
 httparse = "1.9.5"
 native-tls = "0.2.12"
 tokio-native-tls = "0.3.1"
+# optional + vendored so the Android/Termux CI build can link OpenSSL statically;
+# native-tls reuses the same openssl crate instance via feature unification.
+openssl = { version = "0.10", optional = true, features = ["vendored"] }
 scraper = "0.27.0"
 regex = "1.13.1"
 base64 = "0.23.0"
@@ -102,3 +105,4 @@ default = ["log", "progress_bar", "clap"]
 log = ["stderrlog", "dep:log"]
 progress_bar = ["colored"]
 clap = ["dep:clap"]
+vendored-openssl = ["dep:openssl"]
