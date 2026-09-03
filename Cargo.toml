@@ -1,6 +1,6 @@
 [package]
 name = "flx"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 license = "MIT"
 description = "Fast proxy scraper & validator with GeoIP filtering and 9 output formats"
