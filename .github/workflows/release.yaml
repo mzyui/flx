@@ -36,8 +36,10 @@ jobs:
           ## Assets
           | File | Platform |
           |---|---|
-          | `flx-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
-          | `flx-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 |
+          | `flx-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc 2.38+) |
+          | `flx-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 (glibc 2.38+) |
+          | `flx-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 (static, any distro) |
+          | `flx-aarch64-unknown-linux-musl.tar.gz` | Linux ARM64 (static, any distro) |
           | `flx-aarch64-linux-android.tar.gz` | Android (Termux) |
           | `flx-x86_64-apple-darwin.tar.gz` | macOS Intel |
           | `flx-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
@@ -72,6 +74,12 @@ jobs:
             os: macos-latest
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zigbuild: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zigbuild: true
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
@@ -88,12 +96,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - if: matrix.zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           # (required) Comma-separated list of binary names (non-extension portion of filename) to build and upload.
           # Note that glob pattern is not supported yet.
           bin: flx
           target: ${{ matrix.target }}
+          build-tool: ${{ matrix.zigbuild && 'cargo-zigbuild' || 'cargo' }}
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.RELEASE_REF }}
