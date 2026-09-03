@@ -94,6 +94,7 @@ jobs:
           # Note that glob pattern is not supported yet.
           bin: flx
           target: ${{ matrix.target }}
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.RELEASE_REF }}
 
@@ -136,5 +137,6 @@ jobs:
         with:
           bin: flx
           target: aarch64-linux-android
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.RELEASE_REF }}
