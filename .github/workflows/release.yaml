@@ -31,7 +31,7 @@ jobs:
         run: |
           TAG="${RELEASE_REF#refs/tags/}"
           cat > /tmp/release-notes.md <<'EOF'
-          Fast proxy scraper & validator with GeoIP filtering and 9 output formats.
+          Fast proxy scraper & validator.
 
           ## Assets
           | File | Platform |
