@@ -12,7 +12,8 @@ use hyper::{
     Request, Response,
 };
 use hyper_util::rt::TokioIo;
-use native_tls::TlsConnector;
+use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::{net::TcpStream, time};
 
 use async_trait::async_trait;
@@ -24,19 +25,128 @@ use crate::{
 
 const CONNECTION_LINGER: Duration = Duration::from_secs(30);
 
-static TLS_CONNECTORS: LazyLock<[tokio_native_tls::TlsConnector; 2]> = LazyLock::new(|| {
-    let build = |insecure: bool| -> tokio_native_tls::TlsConnector {
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(insecure)
-            .build()
-            .expect("failed to build TLS connector");
-        tokio_native_tls::TlsConnector::from(connector)
-    };
-    [build(false), build(true)]
+pub(crate) type HttpsConnector =
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
+pub(crate) type TlsConnector = tokio_rustls::TlsConnector;
+
+static TLS_CONFIGS: LazyLock<[Arc<rustls::ClientConfig>; 2]> =
+    LazyLock::new(|| [build_client_config(false), build_client_config(true)]);
+
+static TLS_CONNECTORS: LazyLock<[TlsConnector; 2]> = LazyLock::new(|| {
+    let mut configs = TLS_CONFIGS.iter();
+    [
+        TlsConnector::from(Arc::clone(configs.next().expect("strict TLS config"))),
+        TlsConnector::from(Arc::clone(configs.next().expect("insecure TLS config"))),
+    ]
 });
 
-pub(crate) fn tls_connector(insecure: bool) -> tokio_native_tls::TlsConnector {
+fn build_client_config(insecure: bool) -> Arc<rustls::ClientConfig> {
+    let verifier: Arc<dyn ServerCertVerifier> = if insecure {
+        Arc::new(AcceptAnyServerCert)
+    } else {
+        let roots = rustls_native_certs::load_native_certs()
+            .expect("failed to load native root certificates");
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add_parsable_certificates(roots);
+        if root_store.is_empty() {
+            // Some minimal environments ship no OS store; fall back to the
+            // bundled webpki roots so HTTPS targets stay reachable.
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        rustls::client::WebPkiServerVerifier::builder_with_provider(root_store.into(), provider)
+            .build()
+            .expect("failed to build webpki verifier")
+    };
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS13,
+        &rustls::version::TLS12,
+    ])
+    .dangerous()
+    .with_custom_certificate_verifier(verifier)
+    .with_no_client_auth();
+    Arc::new(config)
+}
+
+pub(crate) fn tls_connector(insecure: bool) -> TlsConnector {
     TLS_CONNECTORS[insecure as usize].clone()
+}
+
+pub fn https_connector() -> HttpsConnector {
+    https_connector_with_config(
+        hyper_util::client::legacy::connect::HttpConnector::new(),
+        false,
+    )
+}
+
+pub(crate) fn https_connector_with_config(
+    http: hyper_util::client::legacy::connect::HttpConnector,
+    insecure: bool,
+) -> HttpsConnector {
+    hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config((**tls_client_config(insecure)).clone())
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http)
+}
+
+pub(crate) fn tls_client_config(insecure: bool) -> &'static Arc<rustls::ClientConfig> {
+    &TLS_CONFIGS[insecure as usize]
+}
+
+pub(crate) async fn tls_connect(
+    host: &str,
+    stream: TcpStream,
+    insecure: bool,
+) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let server_name = ServerName::try_from(host.to_owned())
+        .map_err(|_| anyhow::anyhow!("invalid TLS server name `{host}`"))?;
+    tls_connector(insecure)
+        .connect(server_name, stream)
+        .await
+        .map_err(|err| anyhow::anyhow!("TLS handshake with {host} failed: {err}"))
+}
+
+// `--insecure` parity with the previous native-tls behaviour: skip every
+// certificate validation step. Only reachable through an explicit opt-in.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 pub(crate) fn spawn_connection_driver<F, E>(
@@ -224,7 +334,6 @@ pub trait ProxyClient {
         if opts.tls {
             self.log_trace("Starting TLS connection");
 
-            let connector = tls_connector(opts.insecure);
             let sni_host = req
                 .uri()
                 .host()
@@ -232,8 +341,7 @@ pub trait ProxyClient {
                 .ok_or_else(|| {
                     anyhow::anyhow!("request URI `{}` has no target hostname", req.uri())
                 })?;
-            let tls_stream = connector
-                .connect(sni_host, stream)
+            let tls_stream = tls_connect(sni_host, stream, opts.insecure)
                 .await
                 .with_context(|| format!("TLS handshake with {} failed", host))?;
             self.log_trace("TLS connection established successfully");

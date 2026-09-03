@@ -19,7 +19,7 @@ use crate::validator::WorkParams;
 use crate::{
     negotiators::{HttpNegotiator, HttpsNegotiator},
     proxy::{
-        client::{tls_connector, ProxyClient, ProxyRuntimes},
+        client::{ProxyClient, ProxyRuntimes},
         models::{Anonymity, Protocol, Proxy, RuntimeStats},
     },
     resolver::my_ip,
@@ -131,7 +131,6 @@ impl ValidationTarget {
     }
 
     pub async fn verify_online(&self, timeout: Duration, insecure: bool) -> anyhow::Result<()> {
-        use hyper_tls::HttpsConnector;
         use hyper_util::{
             client::legacy::{connect::HttpConnector, Client},
             rt::TokioExecutor,
@@ -139,7 +138,7 @@ impl ValidationTarget {
 
         let mut http = HttpConnector::new();
         http.enforce_http(false);
-        let connector = HttpsConnector::from((http, tls_connector(insecure)));
+        let connector = crate::proxy::client::https_connector_with_config(http, insecure);
         let client = Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(connector);
         let request = Request::get(&self.url)
             .header("X-Fluxy-Token", &self.request_token)
@@ -676,14 +675,23 @@ mod tests {
     const SELF_SIGNED_KEY_PEM: &str = include_str!("../../../tests/fixtures/self_signed_key.pem");
 
     async fn spawn_self_signed_judge(echo_token: bool) -> String {
-        use native_tls::Identity;
-        use tokio_native_tls::TlsAcceptor;
-        let identity = Identity::from_pkcs8(
-            SELF_SIGNED_CERT_PEM.as_bytes(),
-            SELF_SIGNED_KEY_PEM.as_bytes(),
-        )
-        .expect("build self-signed identity");
-        let acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+        use rustls_pemfile::Item;
+        use tokio_rustls::TlsAcceptor;
+
+        let mut cert_reader = SELF_SIGNED_CERT_PEM.as_bytes();
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<_, _>>()
+            .expect("parse self-signed cert chain");
+        let mut key_reader = SELF_SIGNED_KEY_PEM.as_bytes();
+        let key = match rustls_pemfile::read_one(&mut key_reader).expect("parse judge key") {
+            Some(Item::Pkcs8Key(key)) => key,
+            other => panic!("unexpected judge key item: {other:?}"),
+        };
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))
+            .expect("build self-signed server config");
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {

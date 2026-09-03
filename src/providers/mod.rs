@@ -9,8 +9,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Request};
-use hyper_tls::HttpsConnector;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::Client;
 use models::{ScrapeContext, ScrapeMode, Source};
 use tokio::time;
 
@@ -124,7 +123,7 @@ pub trait ProxyProvider {
 
     async fn fetch(
         &self,
-        client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
+        client: Arc<Client<crate::proxy::client::HttpsConnector, Empty<Bytes>>>,
         url: &str,
         timeout: Duration,
     ) -> anyhow::Result<Cow<'static, str>> {
@@ -333,7 +332,6 @@ mod tests {
     use super::{select_providers, ProxyProvider, ScrapeContext, MAX_REDIRECTS};
     use http_body_util::Empty;
     use hyper::body::Bytes;
-    use hyper_tls::HttpsConnector;
     use hyper_util::{client::legacy::Client, rt::TokioExecutor};
     use std::sync::Arc;
     use std::{borrow::Cow, time::Duration};
@@ -355,11 +353,10 @@ mod tests {
         }
     }
 
-    fn test_client(
-    ) -> Arc<Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Empty<Bytes>>>
-    {
+    fn test_client() -> Arc<Client<crate::proxy::client::HttpsConnector, Empty<Bytes>>> {
         Arc::new(
-            Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new()),
+            Client::builder(TokioExecutor::new())
+                .build::<_, Empty<Bytes>>(crate::proxy::client::https_connector()),
         )
     }
 

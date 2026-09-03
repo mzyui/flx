@@ -73,12 +73,11 @@ pub fn check_version(current: &str, latest: &str) -> bool {
 pub async fn fetch_latest_version() -> anyhow::Result<String> {
     use http_body_util::{BodyExt, Empty};
     use hyper::body::Bytes;
-    use hyper_tls::HttpsConnector;
     use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 
     let client = Client::builder(TokioExecutor::new())
         .pool_idle_timeout(VERSION_CHECK_TIMEOUT)
-        .build::<_, Empty<Bytes>>(HttpsConnector::new());
+        .build::<_, Empty<Bytes>>(flx::proxy::client::https_connector());
     let request = hyper::Request::builder()
         .uri(VERSION_CHECK_URL)
         .header("User-Agent", format!("flx/{}", env!("CARGO_PKG_VERSION")))

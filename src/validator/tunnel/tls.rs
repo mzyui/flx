@@ -23,9 +23,8 @@ pub(super) async fn verify_tls_judge(
     use hyper::client::conn::http1::handshake;
     use hyper_util::rt::TokioIo;
 
-    let connector = crate::proxy::client::tls_connector(insecure);
-    let tls_stream = connector
-        .connect(&target.host, stream)
+    use crate::proxy::client::tls_connect;
+    let tls_stream = tls_connect(&target.host, stream, insecure)
         .await
         .with_context(|| format!("TLS handshake with judge {} failed", target.host))?;
     let (mut sender, connection) = handshake(TokioIo::new(tls_stream))

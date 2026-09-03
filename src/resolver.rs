@@ -14,7 +14,6 @@ use hickory_resolver::{
 };
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
-use hyper_tls::HttpsConnector;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::sync::OnceCell;
 use tokio::time;
@@ -86,10 +85,7 @@ fn parse_ip_body(body: &[u8]) -> anyhow::Result<String> {
 }
 
 async fn fetch_ip_endpoint(
-    client: Client<
-        HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-        Empty<Bytes>,
-    >,
+    client: Client<crate::proxy::client::HttpsConnector, Empty<Bytes>>,
     endpoint: &'static str,
     deadline: time::Instant,
 ) -> anyhow::Result<String> {
@@ -173,8 +169,8 @@ fn build_dns_resolver() -> TokioResolver {
 }
 
 async fn my_ip_via_https() -> anyhow::Result<String> {
-    let client =
-        Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new());
+    let client = Client::builder(TokioExecutor::new())
+        .build::<_, Empty<Bytes>>(crate::proxy::client::https_connector());
     let deadline = time::Instant::now() + LOOKUP_TIMEOUT;
     let mut requests = HTTP_IP_ENDPOINTS
         .into_iter()

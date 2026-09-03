@@ -65,13 +65,18 @@ hyper-util = { version = "0.1", features = [
   "http1",
 ] }
 http-body-util = "0.1.2"
-hyper-tls = "0.6.0"
 httparse = "1.9.5"
-native-tls = "0.2.12"
-tokio-native-tls = "0.3.1"
-# optional + vendored so the Android/Termux CI build can link OpenSSL statically;
-# native-tls reuses the same openssl crate instance via feature unification.
-openssl = { version = "0.10", optional = true, features = ["vendored"] }
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1",
+  "native-tokio",
+  "aws-lc-rs",
+  "tls12",
+] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 scraper = "0.27.0"
 regex = "1.13.1"
 base64 = "0.23.0"
@@ -105,4 +110,3 @@ default = ["log", "progress_bar", "clap"]
 log = ["stderrlog", "dep:log"]
 progress_bar = ["colored"]
 clap = ["dep:clap"]
-vendored-openssl = ["dep:openssl"]

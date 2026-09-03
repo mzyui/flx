@@ -91,9 +91,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.RELEASE_REF }}
 
-  # Termux/Android: cross-compile needs NDK, and native-tls (openssl) needs
-  # to be built from source for bionic — hence a dedicated job instead of
-  # the main matrix.
+  # Termux/Android: cross-compile only needs the NDK linker (rustls has no
+  # OpenSSL dependency), so this stays a dedicated job outside the matrix.
   upload-assets-android:
     needs: create-release
     runs-on: ubuntu-latest
@@ -122,13 +121,9 @@ jobs:
           TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           API="aarch64-linux-android$ANDROID_API_LEVEL"
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/$API-clang" >> "$GITHUB_ENV"
-          echo "CC_aarch64_linux_android=$TOOLCHAIN/$API-clang" >> "$GITHUB_ENV"
-          echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
-          echo "RANLIB_aarch64_linux_android=$TOOLCHAIN/llvm-ranlib" >> "$GITHUB_ENV"
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: flx
           target: aarch64-linux-android
-          features: vendored-openssl
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: ${{ env.RELEASE_REF }}

@@ -7,8 +7,7 @@ use std::{
 use anyhow::Context;
 use http_body_util::Empty;
 use hyper::body::Bytes;
-use hyper_tls::HttpsConnector;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::Client;
 use tokio::{
     sync::{mpsc, watch, Semaphore},
     task::JoinSet,
@@ -57,7 +56,7 @@ pub(crate) struct FetchJob {
 
 #[derive(Clone)]
 pub(crate) struct PhaseContext {
-    pub(crate) client: Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>>,
+    pub(crate) client: Arc<Client<crate::proxy::client::HttpsConnector, Empty<Bytes>>>,
     pub(crate) sem: Arc<Semaphore>,
     pub(crate) tx: mpsc::Sender<Proxy>,
     pub(crate) stop_rx: watch::Receiver<bool>,

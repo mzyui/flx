@@ -17,7 +17,6 @@ use anyhow::Context;
 use futures_util::{Stream, StreamExt};
 use http_body_util::{BodyExt, Empty};
 use hyper::{body::Bytes, Request};
-use hyper_tls::HttpsConnector;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use maxminddb::{
     geoip2::{Asn, City},
@@ -340,7 +339,7 @@ async fn fetch_database(
     if_none_match: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> anyhow::Result<(hyper::Response<hyper::body::Incoming>, Option<String>)> {
-    let https_connector = HttpsConnector::new();
+    let https_connector = crate::proxy::client::https_connector();
     let client = Client::builder(TokioExecutor::new()).build(https_connector);
 
     let mut builder = Request::builder().uri(url).header(

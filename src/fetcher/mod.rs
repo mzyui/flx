@@ -21,7 +21,6 @@ use futures_util::Stream;
 use hashbrown::HashSet;
 use http_body_util::Empty;
 use hyper::body::Bytes;
-use hyper_tls::HttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
@@ -159,8 +158,9 @@ impl ProxyFetcher {
             http.set_connect_timeout(Some(Duration::from_secs(6)));
             http.enforce_http(false);
             Arc::new(
-                Client::builder(TokioExecutor::new())
-                    .build::<_, Empty<Bytes>>(HttpsConnector::new_with_connector(http)),
+                Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(
+                    crate::proxy::client::https_connector_with_config(http, false),
+                ),
             )
         };
         let concurrency_limit = config.concurrency_limit;
@@ -578,11 +578,7 @@ mod tests {
     use crate::proxy::models::{Anonymity, Protocol, Proxy};
     use http_body_util::Empty;
     use hyper::body::Bytes;
-    use hyper_tls::HttpsConnector;
-    use hyper_util::{
-        client::legacy::{connect::HttpConnector, Client},
-        rt::TokioExecutor,
-    };
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
     use std::{
         net::Ipv4Addr,
         sync::{
@@ -607,9 +603,10 @@ mod tests {
         }
     }
 
-    fn test_client() -> Arc<Client<HttpsConnector<HttpConnector>, Empty<Bytes>>> {
+    fn test_client() -> Arc<Client<crate::proxy::client::HttpsConnector, Empty<Bytes>>> {
         Arc::new(
-            Client::builder(TokioExecutor::new()).build::<_, Empty<Bytes>>(HttpsConnector::new()),
+            Client::builder(TokioExecutor::new())
+                .build::<_, Empty<Bytes>>(crate::proxy::client::https_connector()),
         )
     }
 

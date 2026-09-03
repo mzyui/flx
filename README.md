@@ -11,7 +11,7 @@ flx is a fast proxy scraper & validator written in Rust. It collects free proxie
 ## Features
 
 - **Scrape** from 12 primary providers + GitHub raw mirrors, or plug in your own plaintext source
-- **Validate** with end-to-end deadlines over hand-rolled hyper + native-tls networking — anti-replay judge tokens keep fake judges out
+- **Validate** with end-to-end deadlines over hand-rolled hyper + rustls networking — anti-replay judge tokens keep fake judges out
 - **Filter & sort** by protocol, anonymity level, country, IP type (residential / datacenter / mobile), and response time
 - **GeoIP** via GeoLite2 City + ASN, with a one-command database sync
 - **9 output formats** including JSON, CSV, PAC, and proxychains config
@@ -147,7 +147,7 @@ A guided walkthrough of every sample lives in [`examples/README.md`](examples/RE
 
 ## Development
 
-Requires a Rust toolchain (edition 2021) plus `pkg-config` and `libssl-dev` for native-tls.
+Requires a Rust toolchain (edition 2021); TLS is pure-Rust (rustls), no OpenSSL dependency.
 
 ```bash
 cargo build                              # build library + binary
