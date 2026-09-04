@@ -1,6 +1,8 @@
 use anyhow::Context;
 use argument::Cli;
-use argument::{Command, ConfigAction, ConfigCmd, FetchArgs, FetcherArgs, FindArgs, ValidatorArgs};
+use argument::{
+    Command, ConfigAction, ConfigCmd, FetchArgs, FetcherArgs, FindArgs, ServeArgs, ValidatorArgs,
+};
 use clap::{CommandFactory, FromArgMatches};
 #[cfg(feature = "progress_bar")]
 use colored::Colorize;
@@ -453,6 +455,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         match command {
             Command::Grab(grab) => run_grab(grab, cli.quiet, cli.no_color, &download, cancel).await,
             Command::Find(find) => run_find(find, cli.quiet, cli.no_color, &download, cancel).await,
+            Command::Serve(serve) => run_serve(serve, &download, cancel).await,
             Command::GeoUpdate => run_geo_update(&download, cli.quiet, cli.no_color, cancel).await,
             Command::Config(config) => run_config(config, cli.no_config, cli.config.as_deref()),
         }
@@ -697,6 +700,125 @@ async fn run_grab(
         eprintln!("{report}");
     }
     outcome
+}
+
+fn parse_serve_credentials(raw: &str) -> anyhow::Result<(String, String)> {
+    let (user, pass) = raw
+        .split_once(':')
+        .context("--auth must be in `user:pass` form")?;
+    Ok((user.to_owned(), pass.to_owned()))
+}
+
+/// One validated feed: fetch (or read files) then validate, as a stream.
+async fn validated_stream(
+    serve: &ServeArgs,
+    protocols: Vec<Protocol>,
+    groups: Vec<Vec<Protocol>>,
+) -> anyhow::Result<BoxStream> {
+    let config = validator_config(&serve.validator, protocols, groups, false);
+    let source: BoxStream = if !serve.validator.files.is_empty() {
+        file_source(&serve.validator.files).await?
+    } else {
+        let fetch_cfg = fetcher_config(&serve.fetcher);
+        Box::pin(ProxySource::from_fetcher(fetch_cfg).await?)
+    };
+    Ok(Box::pin(ProxyValidator::validate(source, config).await?))
+}
+
+async fn run_serve(
+    serve: ServeArgs,
+    download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
+    cancel: Arc<tokio::sync::Notify>,
+) -> anyhow::Result<RunOutcome> {
+    let _ = download;
+    if serve.fetcher.dry_run || serve.fetcher.list_providers {
+        list_sources();
+        return Ok(RunOutcome::Finished);
+    }
+
+    let (mut protocols, groups) = split_type_groups(&serve.validator.types);
+    if protocols.is_empty() && groups.is_empty() {
+        // Omitted `TYPES` defaults to plain HTTP validation, like `flx find`.
+        protocols.push(Protocol::Http(Anonymity::Unknown));
+    }
+
+    let options = flx::ServeOptions {
+        bind: serve.bind,
+        port: serve.port,
+        strategy: flx::Strategy::parse(&serve.strategy).context("unknown rotation strategy")?,
+        pool_size: serve
+            .pool_size
+            .unwrap_or(flx::rotator::DEFAULT_POOL_SIZE)
+            .clamp(1, flx::rotator::MAX_POOL_SIZE),
+        refresh_secs: serve
+            .refresh_secs
+            .unwrap_or(flx::rotator::DEFAULT_REFRESH_SECS),
+        request_timeout: std::time::Duration::from_secs(
+            serve
+                .request_timeout
+                .unwrap_or(flx::rotator::DEFAULT_REQUEST_TIMEOUT.as_secs()),
+        ),
+        auth: serve
+            .auth
+            .as_deref()
+            .map(parse_serve_credentials)
+            .transpose()?,
+    };
+    let rotator = Arc::new(flx::Rotator::new(options));
+    let pool = rotator.pool();
+
+    // One Ctrl+C press must stop the feeder, the refill sleep, and the accept
+    // loop together, so the process cancel token feeds a watch that every
+    // serve task can observe.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn({
+        let cancel = Arc::clone(&cancel);
+        async move {
+            cancel.notified().await;
+            let _ = shutdown_tx.send(true);
+        }
+    });
+
+    let server = tokio::spawn({
+        let rotator = Arc::clone(&rotator);
+        async move { rotator.run().await }
+    });
+
+    // The endpoint binds as soon as MIN_POOL_READY proxies are up; this loop
+    // only keeps the pool stocked, so a refill pass never interrupts active
+    // client connections. A file pool is static: fill once, then wait.
+    let static_pool = !serve.validator.files.is_empty();
+    loop {
+        let mut stream = validated_stream(&serve, protocols.clone(), groups.clone()).await?;
+        while let Some(proxy) = tokio::select! {
+            next = stream.next() => next,
+            _ = shutdown_rx.changed() => None,
+        } {
+            pool.add(proxy);
+        }
+        rotator.force_ready();
+        eprintln!(
+            "flx serve listening on {}:{} (pool: {} proxies, strategy: {})",
+            serve.bind,
+            serve.port,
+            pool.len(),
+            serve.strategy
+        );
+        if static_pool {
+            break;
+        }
+        let refresh = std::time::Duration::from_secs(
+            serve
+                .refresh_secs
+                .unwrap_or(flx::rotator::DEFAULT_REFRESH_SECS),
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(refresh) => {}
+            _ = shutdown_rx.changed() => break,
+        }
+    }
+    let _ = server.await;
+    Ok(RunOutcome::Cancelled)
 }
 
 async fn run_find(

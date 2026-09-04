@@ -394,6 +394,26 @@ impl Flx {
         let stream = self.stream().await?;
         Ok(stream.collect::<Vec<_>>().await)
     }
+
+    /// Exposes the validated pool through a local rotating endpoint that runs
+    /// until the caller's runtime cancels it. The pool fills from the fetch and
+    /// validation pipeline; see [`crate::rotator::Rotator`] for manual setups.
+    pub async fn serve(self, options: crate::rotator::ServeOptions) -> Result<(), FlxError> {
+        let stream = self.stream().await?;
+        let rotator = Arc::new(crate::rotator::Rotator::new(options));
+        let pool = rotator.pool();
+        let server = tokio::spawn({
+            let rotator = Arc::clone(&rotator);
+            async move { rotator.run().await }
+        });
+        tokio::pin!(stream);
+        while let Some(proxy) = stream.next().await {
+            pool.add(proxy);
+        }
+        rotator.force_ready();
+        let _ = server.await;
+        Ok(())
+    }
 }
 
 /// Handle to a started pipeline: the result stream plus live counters and the

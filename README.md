@@ -16,7 +16,7 @@ flx is a fast proxy scraper & validator written in Rust. It collects free proxie
 - **GeoIP** via GeoLite2 City + ASN, with a one-command database sync
 - **9 output formats** including JSON, CSV, PAC, and proxychains config
 - **Streaming-first pipeline** with backpressure, atomic parse cache, and graceful Ctrl+C finalization
-- **Proxy rotating server** — expose validated proxies through a local rotating endpoint *(under active development, not yet available)*
+- **Proxy rotating server** — expose validated proxies through a local rotating endpoint (`flx serve`)
 
 ## Install
 
@@ -49,6 +49,17 @@ Validate proxies scraped from the providers, read from a file, or piped in from 
 flx find -l 5
 flx find -f proxies.txt
 cat list.txt | flx find -f -
+```
+
+## Serve (beta)
+
+Expose the validated pool as a local rotating proxy: point any client at the endpoint and every connection is forwarded through a different working proxy. Start it like `find` — every validation flag (`-a`, `-c`, `-m`, `--timeout`, protocol types, ...) applies — and the endpoint keeps revalidating in the background, rotating round-robin (default) or randomly and dropping proxies that die.
+
+```bash
+flx serve                                    # 127.0.0.1:8080, round-robin
+flx serve --port 9000 --strategy random      # random rotation
+flx serve --pool-size 200 --refresh-secs 120 # larger pool, faster revalidation
+flx serve --auth user:pass                   # require basic proxy authentication
 ```
 
 ## Protocol types

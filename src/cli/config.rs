@@ -74,6 +74,18 @@ pub struct ValidateSection {
     pub report_failures: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServeSection {
+    pub bind: Option<String>,
+    pub port: Option<u16>,
+    pub strategy: Option<String>,
+    pub pool_size: Option<usize>,
+    pub refresh_secs: Option<u64>,
+    pub request_timeout: Option<u64>,
+    pub auth: Option<String>,
+}
+
 // ── Top-level config ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -82,6 +94,7 @@ pub struct FileConfig {
     pub fetch: Option<FetchSection>,
     pub output: Option<OutputSection>,
     pub validate: Option<ValidateSection>,
+    pub serve: Option<ServeSection>,
     #[serde(skip)]
     pub unknown_sections: Vec<String>,
     #[serde(skip)]
@@ -166,6 +179,7 @@ pub fn parse(text: &str) -> Result<FileConfig, ConfigError> {
             "fetch" => cfg.fetch = Some(deser_section(value, "fetch")?),
             "output" => cfg.output = Some(deser_section(value, "output")?),
             "validate" => cfg.validate = Some(deser_section(value, "validate")?),
+            "serve" => cfg.serve = Some(deser_section(value, "serve")?),
             other => cfg.unknown_sections.push(other.to_owned()),
         }
     }
@@ -187,6 +201,7 @@ fn deser_section<T: serde::de::DeserializeOwned>(
 
 const LOG_LEVELS: &[&str] = &["off", "error", "warn", "info", "debug", "trace"];
 const IP_TYPES: &[&str] = &["residential", "datacenter", "mobile", "unknown"];
+const SERVE_STRATEGIES: &[&str] = &["round-robin", "random"];
 pub(crate) const FORMATS: &[&str] = &[
     "default",
     "text",
@@ -223,6 +238,16 @@ fn validate_enum_values(cfg: &FileConfig) -> Result<(), ConfigError> {
         }
         for token in o.exclude_types.iter().flatten() {
             ensure_valid_type(token, "output.exclude_types")?;
+        }
+    }
+    if let Some(s) = &cfg.serve {
+        ensure_member(s.strategy.as_deref(), SERVE_STRATEGIES, "serve.strategy")?;
+        if let Some(bind) = &s.bind {
+            if bind.parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::message(format!(
+                    "serve.bind: `{bind}` is not a valid IP address"
+                )));
+            }
         }
     }
     if let Some(v) = &cfg.validate {
@@ -336,6 +361,15 @@ overlay_section!(ValidateSection {
     support_referer,
     report_failures,
 });
+overlay_section!(ServeSection {
+    bind,
+    port,
+    strategy,
+    pool_size,
+    refresh_secs,
+    request_timeout,
+    auth,
+});
 
 /// Merges two configs: `project` values override `user` values per field.
 pub fn merge(project: FileConfig, user: FileConfig) -> FileConfig {
@@ -344,6 +378,7 @@ pub fn merge(project: FileConfig, user: FileConfig) -> FileConfig {
         fetch: merge_section(project.fetch, user.fetch),
         output: merge_section(project.output, user.output),
         validate: merge_section(project.validate, user.validate),
+        serve: merge_section(project.serve, user.serve),
         unknown_sections: {
             let mut all = project.unknown_sections;
             all.extend(user.unknown_sections);
@@ -416,7 +451,7 @@ fn warn_unknown_sections(cfg: &FileConfig) {
 
 // ── Apply to CLI ──────────────────────────────────────────────────────
 
-use crate::argument::{Cli, Command, FetcherArgs, OutputOptions, ValidatorArgs};
+use crate::argument::{Cli, Command, FetcherArgs, OutputOptions, ServeArgs, ValidatorArgs};
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 
@@ -433,6 +468,11 @@ pub fn apply_config(cli: &mut Cli, cfg: &FileConfig, matches: &ArgMatches) {
             apply_fetch(&mut find.fetcher, cfg.fetch.as_ref(), sub);
             apply_output(&mut find.output, cfg.output.as_ref(), sub);
             apply_validate(&mut find.validator, cfg.validate.as_ref(), sub);
+        }
+        Some(Command::Serve(serve)) => {
+            apply_fetch(&mut serve.fetcher, cfg.fetch.as_ref(), sub);
+            apply_validate(&mut serve.validator, cfg.validate.as_ref(), sub);
+            apply_serve(serve, cfg.serve.as_ref(), sub);
         }
         Some(Command::GeoUpdate) | Some(Command::Config(_)) | None => {}
     }
@@ -683,6 +723,39 @@ fn apply_validate(
     );
 }
 
+fn apply_serve(serve: &mut ServeArgs, cfg: Option<&ServeSection>, sub: Option<&ArgMatches>) {
+    let Some(cfg) = cfg else { return };
+    apply_field!(provided(sub, "bind"), &cfg.bind, serve.bind, |v: String| v
+        .parse()
+        .unwrap_or(flx::rotator::DEFAULT_BIND));
+    apply_field!(provided(sub, "port"), &cfg.port, serve.port, |v| v);
+    apply_field!(
+        provided(sub, "strategy"),
+        &cfg.strategy,
+        serve.strategy,
+        |v| v
+    );
+    apply_field!(
+        provided(sub, "pool_size"),
+        &cfg.pool_size,
+        serve.pool_size,
+        Some
+    );
+    apply_field!(
+        provided(sub, "refresh_secs"),
+        &cfg.refresh_secs,
+        serve.refresh_secs,
+        Some
+    );
+    apply_field!(
+        provided(sub, "request_timeout"),
+        &cfg.request_timeout,
+        serve.request_timeout,
+        Some
+    );
+    apply_field!(provided(sub, "auth"), &cfg.auth, serve.auth, Some);
+}
+
 // ── Template & show ───────────────────────────────────────────────────
 
 /// Static commented template for `flx config init`.
@@ -741,6 +814,15 @@ pub fn template() -> &'static str {
 # support_cookies = false
 # support_referer = false
 # report_failures = "failures.jsonl"
+
+[serve]
+# bind = "127.0.0.1"
+# port = 8080
+# strategy = "round-robin"              # round-robin|random
+# pool_size = 100
+# refresh_secs = 300                    # seconds between provider refills
+# request_timeout = 30                  # seconds per client connection
+# auth = "user:pass"                    # basic proxy auth required from clients
 "#
 }
 
@@ -886,8 +968,10 @@ http_judges = ["http://azenv.net/"]
     #[test]
     fn parse_collects_unknown_top_level_sections() {
         let cfg = parse("[serve]\nport = 8080\n[fetch]\nwith_geo = true\n").unwrap();
-        assert_eq!(cfg.unknown_sections, vec!["serve".to_owned()]);
+        assert_eq!(cfg.serve.unwrap().port, Some(8080));
         assert!(cfg.fetch.is_some());
+        let cfg = parse("[served]\nport = 8080\n").unwrap();
+        assert_eq!(cfg.unknown_sections, vec!["served".to_owned()]);
     }
 
     #[test]

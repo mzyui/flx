@@ -112,6 +112,8 @@ pub enum Command {
     Grab(FetchArgs),
     /// Validate proxies from a file or the built-in providers against online judges.
     Find(FindArgs),
+    /// Serve validated proxies through a local rotating endpoint.
+    Serve(ServeArgs),
     /// Download and verify the GeoLite2 GeoIP database.
     #[command(name = "geo-update")]
     GeoUpdate,
@@ -399,6 +401,53 @@ pub struct FindArgs {
 
     #[command(flatten)]
     pub validator: ValidatorArgs,
+}
+
+/// `flx serve`: expose validated proxies through a local rotating endpoint.
+#[derive(Args, Debug)]
+pub struct ServeArgs {
+    #[command(flatten)]
+    pub fetcher: FetcherArgs,
+
+    #[command(flatten)]
+    pub validator: ValidatorArgs,
+
+    /// Address for the rotating endpoint to bind.
+    #[arg(long, default_value = "127.0.0.1", help_heading = "Serve")]
+    pub bind: std::net::IpAddr,
+
+    /// Port for the rotating endpoint.
+    #[arg(
+        long,
+        default_value_t = flx::rotator::DEFAULT_PORT,
+        help_heading = "Serve"
+    )]
+    pub port: u16,
+
+    /// Rotation strategy for picking the upstream of each connection.
+    #[arg(
+        long,
+        value_parser(["round-robin", "random"]),
+        default_value = "round-robin",
+        help_heading = "Serve"
+    )]
+    pub strategy: String,
+
+    /// Maximum number of validated proxies kept in the rotation pool.
+    #[arg(long, help_heading = "Serve")]
+    pub pool_size: Option<usize>,
+
+    /// Seconds between pool refill runs against the providers.
+    #[arg(long, help_heading = "Serve")]
+    pub refresh_secs: Option<u64>,
+
+    /// End-to-end budget per client connection, in seconds.
+    #[arg(long, help_heading = "Serve")]
+    pub request_timeout: Option<u64>,
+
+    /// Require `user:pass` basic proxy authentication from clients.
+    #[arg(long, help_heading = "Serve")]
+    pub auth: Option<String>,
 }
 
 /// `flx config`: manage the configuration file.

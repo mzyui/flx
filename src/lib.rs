@@ -32,6 +32,7 @@ mod api;
 pub mod negotiators;
 pub mod providers;
 pub mod proxy;
+pub mod rotator;
 pub mod validator;
 
 mod resolver;
@@ -62,6 +63,7 @@ pub use providers::all_providers;
 pub use providers::models::{ProviderTier, ScrapeMode, Source};
 pub use providers::ProxyProvider;
 pub use proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
+pub use rotator::{Rotator, RotatorPool, ServeOptions, Strategy};
 pub use validator::{
     Config as ValidatorConfig, JudgeHealthReport, ProxyFailure, ProxyValidator, ValidationProgress,
     ValidationStatus,
