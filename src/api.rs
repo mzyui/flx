@@ -398,7 +398,8 @@ impl Flx {
     /// Exposes the validated pool through a local rotating endpoint that runs
     /// until the caller's runtime cancels it. The pool fills from the fetch and
     /// validation pipeline; the endpoint goes live once `options.min_ready`
-    /// proxies are validated. See [`crate::rotator::Rotator`] for manual setups.
+    /// proxies are validated, or right away when the feed ends short of that.
+    /// See [`crate::rotator::Rotator`] for manual setups.
     pub async fn serve(self, options: crate::rotator::ServeOptions) -> Result<(), FlxError> {
         let stream = self.stream().await?;
         let rotator = Arc::new(crate::rotator::Rotator::new(options));
@@ -411,6 +412,9 @@ impl Flx {
         while let Some(proxy) = stream.next().await {
             pool.add(proxy);
         }
+        // Mirrors the CLI: a finished feed is final, so don't stall callers
+        // for READY_WAIT_TIMEOUT when it ends short of min_ready.
+        rotator.force_ready();
         let _ = server.await;
         Ok(())
     }
