@@ -397,7 +397,8 @@ impl Flx {
 
     /// Exposes the validated pool through a local rotating endpoint that runs
     /// until the caller's runtime cancels it. The pool fills from the fetch and
-    /// validation pipeline; see [`crate::rotator::Rotator`] for manual setups.
+    /// validation pipeline; the endpoint goes live once `options.min_ready`
+    /// proxies are validated. See [`crate::rotator::Rotator`] for manual setups.
     pub async fn serve(self, options: crate::rotator::ServeOptions) -> Result<(), FlxError> {
         let stream = self.stream().await?;
         let rotator = Arc::new(crate::rotator::Rotator::new(options));
@@ -410,7 +411,6 @@ impl Flx {
         while let Some(proxy) = stream.next().await {
             pool.add(proxy);
         }
-        rotator.force_ready();
         let _ = server.await;
         Ok(())
     }
@@ -570,6 +570,16 @@ mod tests {
             flx.fetcher_config.cache_ttl,
             Some(std::time::Duration::from_secs(15 * 60))
         );
+        let serve = crate::rotator::ServeOptions::default();
+        assert_eq!(serve.pool_size, crate::rotator::DEFAULT_POOL_SIZE);
+        assert_eq!(serve.min_ready, crate::rotator::DEFAULT_MIN_READY);
+        assert_eq!(serve.refresh_secs, crate::rotator::DEFAULT_REFRESH_SECS);
+        assert_eq!(
+            serve.request_timeout,
+            crate::rotator::DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(serve.bind, crate::rotator::DEFAULT_BIND);
+        assert_eq!(serve.port, crate::rotator::DEFAULT_PORT);
     }
 
     #[test]

@@ -437,6 +437,14 @@ pub struct ServeArgs {
     #[arg(long, help_heading = "Serve")]
     pub pool_size: Option<usize>,
 
+    /// Validated proxies required before the endpoint starts serving.
+    #[arg(
+        long,
+        default_value_t = flx::rotator::DEFAULT_MIN_READY,
+        help_heading = "Serve"
+    )]
+    pub min_ready: usize,
+
     /// Seconds between pool refill runs against the providers.
     #[arg(long, help_heading = "Serve")]
     pub refresh_secs: Option<u64>,

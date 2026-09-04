@@ -26,8 +26,8 @@ pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_POOL_SIZE: usize = 100;
 pub const MAX_POOL_SIZE: usize = 1_000;
-/// The endpoint starts accepting once at least this many proxies are ready.
-pub const MIN_POOL_READY: usize = 10;
+/// The endpoint goes live once this many validated proxies are ready.
+pub const DEFAULT_MIN_READY: usize = 1;
 pub const DEFAULT_REFRESH_SECS: u64 = 300;
 /// Single end-to-end budget per client connection covering the upstream
 /// connect, the handshake, and the relay — never split per phase.
@@ -72,6 +72,8 @@ pub struct ServeOptions {
     pub port: u16,
     pub strategy: Strategy,
     pub pool_size: usize,
+    /// Validated proxies required before the endpoint starts serving.
+    pub min_ready: usize,
     pub refresh_secs: u64,
     /// `user`/`pass` pair required from clients via `Proxy-Authorization: Basic`.
     pub auth: Option<(String, String)>,
@@ -85,6 +87,7 @@ impl Default for ServeOptions {
             port: DEFAULT_PORT,
             strategy: Strategy::RoundRobin,
             pool_size: DEFAULT_POOL_SIZE,
+            min_ready: DEFAULT_MIN_READY,
             refresh_secs: DEFAULT_REFRESH_SECS,
             auth: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -115,33 +118,76 @@ impl Rotator {
     }
 
     /// Lets [`Rotator::run`] start serving even when the feed ended with fewer
-    /// than [`MIN_POOL_READY`] proxies (offline files, exhausted providers).
+    /// than [`ServeOptions::min_ready`] proxies (offline files, exhausted
+    /// providers).
     pub fn force_ready(&self) {
         self.ready_bypass.store(true, Ordering::Relaxed);
     }
 
-    /// Binds the endpoint and waits for the pool to hold [`MIN_POOL_READY`]
-    /// proxies (bounded by [`READY_WAIT_TIMEOUT`]) before serving, so early
-    /// clients are not bounced with an empty rotation. Runs until cancelled.
+    /// Binds the endpoint and waits until [`ServeOptions::min_ready`] proxies
+    /// are ready (bounded by [`READY_WAIT_TIMEOUT`] or [`Rotator::force_ready`])
+    /// before serving, so early clients are not bounced with an empty rotation.
+    /// Runs until cancelled.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let address = SocketAddr::new(self.options.bind, self.options.port);
         let listener = TcpListener::bind(address)
             .await
             .with_context(|| format!("failed to bind the rotating endpoint on {address}"))?;
 
-        let ready = async {
-            while !self.ready_bypass.load(Ordering::Relaxed) && self.pool.ready() < MIN_POOL_READY {
-                time::sleep(READY_POLL_INTERVAL).await;
-            }
-        };
-        tokio::select! {
-            _ = ready => {}
-            _ = time::sleep(READY_WAIT_TIMEOUT) => {}
-        }
+        wait_for_ready(
+            &self.pool,
+            &self.ready_bypass,
+            self.options.min_ready.min(MAX_POOL_SIZE),
+        )
+        .await;
 
         server::accept_loop(listener, Arc::clone(&self.pool), Arc::clone(&self.options)).await;
         Ok(())
     }
 }
 
+/// Polls until the pool holds `min_ready` available proxies, the caller flips
+/// the bypass flag, or [`READY_WAIT_TIMEOUT`] elapses — whichever comes first.
+async fn wait_for_ready(pool: &RotatorPool, bypass: &AtomicBool, min_ready: usize) {
+    let ready = async {
+        while !bypass.load(Ordering::Relaxed) && pool.ready() < min_ready {
+            time::sleep(READY_POLL_INTERVAL).await;
+        }
+    };
+    tokio::select! {
+        _ = ready => {}
+        _ = time::sleep(READY_WAIT_TIMEOUT) => {}
+    }
+}
+
 use anyhow::Context as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn single_ready_proxy_goes_live_immediately() {
+        let pool = RotatorPool::new(Strategy::RoundRobin);
+        assert!(pool.add(crate::Proxy::new(std::net::Ipv4Addr::LOCALHOST, 8081)));
+        let bypass = AtomicBool::new(false);
+        tokio::select! {
+            _ = wait_for_ready(&pool, &bypass, DEFAULT_MIN_READY) => {}
+            _ = time::sleep(Duration::from_secs(5)) => {
+                panic!("gate did not open for one ready proxy");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn force_ready_opens_the_gate_with_an_empty_pool() {
+        let pool = RotatorPool::new(Strategy::RoundRobin);
+        let bypass = AtomicBool::new(true);
+        tokio::select! {
+            _ = wait_for_ready(&pool, &bypass, 10) => {}
+            _ = time::sleep(Duration::from_secs(5)) => {
+                panic!("bypass flag did not open the gate");
+            }
+        }
+    }
+}

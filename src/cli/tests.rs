@@ -1927,6 +1927,11 @@ fn clap_defaults_match_facade_defaults_field_by_field() {
             .collect::<Vec<_>>(),
         "--https-judge-urls must track DEFAULT_HTTPS_JUDGE_URLS"
     );
+    assert_eq!(
+        clap_default(&command, "min_ready"),
+        flx::rotator::DEFAULT_MIN_READY.to_string(),
+        "--min-ready must track DEFAULT_MIN_READY"
+    );
 }
 
 fn run_with_stats(proxies: &[Proxy]) -> Option<String> {

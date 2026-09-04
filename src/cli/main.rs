@@ -750,6 +750,7 @@ async fn run_serve(
             .pool_size
             .unwrap_or(flx::rotator::DEFAULT_POOL_SIZE)
             .clamp(1, flx::rotator::MAX_POOL_SIZE),
+        min_ready: serve.min_ready.clamp(1, flx::rotator::MAX_POOL_SIZE),
         refresh_secs: serve
             .refresh_secs
             .unwrap_or(flx::rotator::DEFAULT_REFRESH_SECS),
@@ -784,9 +785,9 @@ async fn run_serve(
         async move { rotator.run().await }
     });
 
-    // The endpoint binds as soon as MIN_POOL_READY proxies are up; this loop
-    // only keeps the pool stocked, so a refill pass never interrupts active
-    // client connections. A file pool is static: fill once, then wait.
+    // The endpoint binds as soon as `--min-ready` validated proxies are up;
+    // this loop only keeps the pool stocked, so a refill pass never interrupts
+    // active client connections. A file pool is static: fill once, then wait.
     let static_pool = !serve.validator.files.is_empty();
     loop {
         let mut stream = validated_stream(&serve, protocols.clone(), groups.clone()).await?;

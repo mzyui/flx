@@ -59,6 +59,7 @@ Expose the validated pool as a local rotating proxy: point any client at the end
 flx serve                                    # 127.0.0.1:8080, round-robin
 flx serve --port 9000 --strategy random      # random rotation
 flx serve --pool-size 200 --refresh-secs 120 # larger pool, faster revalidation
+flx serve --min-ready 10                     # wait for 10 proxies before serving
 flx serve --auth user:pass                   # require basic proxy authentication
 ```
 

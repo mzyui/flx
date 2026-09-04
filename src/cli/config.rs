@@ -81,6 +81,7 @@ pub struct ServeSection {
     pub port: Option<u16>,
     pub strategy: Option<String>,
     pub pool_size: Option<usize>,
+    pub min_ready: Option<usize>,
     pub refresh_secs: Option<u64>,
     pub request_timeout: Option<u64>,
     pub auth: Option<String>,
@@ -366,6 +367,7 @@ overlay_section!(ServeSection {
     port,
     strategy,
     pool_size,
+    min_ready,
     refresh_secs,
     request_timeout,
     auth,
@@ -742,6 +744,12 @@ fn apply_serve(serve: &mut ServeArgs, cfg: Option<&ServeSection>, sub: Option<&A
         Some
     );
     apply_field!(
+        provided(sub, "min_ready"),
+        &cfg.min_ready,
+        serve.min_ready,
+        |v| v
+    );
+    apply_field!(
         provided(sub, "refresh_secs"),
         &cfg.refresh_secs,
         serve.refresh_secs,
@@ -820,6 +828,7 @@ pub fn template() -> &'static str {
 # port = 8080
 # strategy = "round-robin"              # round-robin|random
 # pool_size = 100
+# min_ready = 1                         # validated proxies required before serving
 # refresh_secs = 300                    # seconds between provider refills
 # request_timeout = 30                  # seconds per client connection
 # auth = "user:pass"                    # basic proxy auth required from clients
@@ -1183,6 +1192,26 @@ http_judges = ["http://azenv.net/"]
         let validator = crate::validator_config(&find.validator, Vec::new(), Vec::new(), false);
         assert_eq!(validator.request_timeout, 8);
         assert_eq!(validator.max_attempts, 3);
+    }
+
+    #[test]
+    fn apply_serve_min_ready_from_config() {
+        let cfg = parse("[serve]\nmin_ready = 5\npool_size = 50\n").unwrap();
+        let (mut cli, matches) = parse_cli(&["serve"]);
+        apply_config(&mut cli, &cfg, &matches);
+        let serve = match cli.command {
+            Some(Command::Serve(serve)) => serve,
+            _ => panic!("expected serve"),
+        };
+        assert_eq!(serve.min_ready, 5);
+        assert_eq!(serve.pool_size, Some(50));
+
+        let (cli, _) = parse_cli(&["serve"]);
+        let serve = match cli.command {
+            Some(Command::Serve(serve)) => serve,
+            _ => panic!("expected serve"),
+        };
+        assert_eq!(serve.min_ready, flx::rotator::DEFAULT_MIN_READY);
     }
 
     // ── to_toml ──
