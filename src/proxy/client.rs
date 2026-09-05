@@ -83,8 +83,7 @@ pub(crate) fn https_connector_with_config(
     mut http: hyper_util::client::legacy::connect::HttpConnector,
     insecure: bool,
 ) -> HttpsConnector {
-    // hyper-rustls delegates the TCP dial for https URIs to the inner
-    // connector, so its http-only enforcement must be off.
+    // Disable http-only enforcement so hyper-rustls can dial HTTPS.
     http.enforce_http(false);
     hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config((**tls_client_config(insecure)).clone())
@@ -110,8 +109,7 @@ pub(crate) async fn tls_connect(
         .map_err(|err| anyhow::anyhow!("TLS handshake with {host} failed: {err}"))
 }
 
-// `--insecure` parity with the previous native-tls behaviour: skip every
-// certificate validation step. Only reachable through an explicit opt-in.
+// Skip certificate validation only via explicit insecure opt-in.
 #[derive(Debug)]
 struct AcceptAnyServerCert;
 
@@ -204,8 +202,7 @@ pub struct ProxyRuntimes<T> {
 
 impl<T> ProxyRuntimes<T> {
     pub fn apply(&self, proxy: &mut Proxy) {
-        // The runtimes carry a single end-to-end sample recorded by the
-        // validator, so recording its average folds it into the proxy's stats.
+        // Fold single end-to-end sample into proxy stats.
         let avg = self.runtimes.avg();
         if avg > 0.0 {
             proxy.runtimes.record(avg);
@@ -233,8 +230,7 @@ pub trait ProxyClient {
             .await
             .with_context(|| format!("timed out connecting to {} after {:?}", host, timeout))?
             .with_context(|| format!("failed to connect to {}", host))?;
-        // Nagle's algorithm would otherwise buffer the small CONNECT/SOCKS
-        // greetings and TLS handshakes behind delayed ACKs.
+        // Disable Nagle to avoid buffering small handshake greetings.
         let _ = tcp_stream.set_nodelay(true);
         let elapsed_time = start_time.elapsed().as_secs_f64();
         self.log_trace(format!("Connected in {:.3}s", elapsed_time));
@@ -259,9 +255,7 @@ pub trait ProxyClient {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
         N: NegotiatorTrait + Sync + Send,
     {
-        // Single end-to-end deadline shared across connect, negotiate, and send
-        // so `--timeout N` bounds the whole request, not each phase separately
-        // (which previously allowed up to 3×N).
+        // Share one deadline across phases to bound total request time.
         let deadline = time::Instant::now() + timeout;
 
         let remaining = deadline
@@ -428,14 +422,12 @@ pub struct SendOptions {
 
 impl ProxyClient for Proxy {
     fn host(&self) -> Cow<'_, str> {
-        // `text` is a precomputed `ip:port` Arc<str> (see Proxy::new), so the
-        // borrowed form avoids a `String` allocation on every call.
+        // Borrow precomputed endpoint text to avoid allocation.
         Cow::Borrowed(self.as_text())
     }
 
     fn host_arc(&self) -> Arc<str> {
-        // Clone the precomputed endpoint instead of copying its bytes: the
-        // background connection driver gets an `Arc` without re-allocating.
+        // Clone precomputed endpoint Arc without reallocating.
         Arc::clone(&self.text)
     }
 }

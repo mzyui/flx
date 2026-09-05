@@ -1,6 +1,4 @@
-//! Interactive `flx config wizard`: ask the common options, then write a
-//! minimal config file. The question prompts run over an injectable
-//! reader/writer pair so the whole flow is unit-testable without a TTY.
+//! Ask common options and write a minimal config file.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -13,14 +11,13 @@ use crate::config::{
 };
 use crate::RunOutcome;
 
-// CLI-level defaults the wizard mirrors, so the generated file only carries
-// the values that actually change behaviour.
+// Mirror CLI defaults so generated files only carry changed values.
 const DEFAULT_FORMAT: &str = "default";
 const DEFAULT_LIMIT: usize = 0;
 const DEFAULT_CACHE_TTL: u64 = 15;
 const DEFAULT_TYPES: &[&str] = &["HTTP"];
 
-/// The answers collected from the questions (or all defaults in `--yes`).
+/// Collect answers from questions or `--yes` defaults.
 #[derive(Debug, Clone, PartialEq)]
 struct Answers {
     providers: Vec<String>,
@@ -218,7 +215,7 @@ fn run_questions<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> anyhow
     })
 }
 
-/// Turns answers into a config that only lists the non-default values.
+/// Build a config listing only non-default values.
 fn build_config(a: &Answers) -> FileConfig {
     let mut cfg = FileConfig::default();
     if a.quiet {
@@ -267,7 +264,7 @@ fn build_config(a: &Answers) -> FileConfig {
     cfg
 }
 
-/// Rejects answers that would fail at config load time.
+/// Reject answers that would fail at config load time.
 fn validate(a: &Answers) -> anyhow::Result<()> {
     if a.format != DEFAULT_FORMAT && !config::FORMATS.contains(&a.format.as_str()) {
         bail!(
@@ -473,7 +470,6 @@ mod tests {
     fn interactive_aborts_on_declined_confirm() {
         let dir = unique_dir("abort");
         let path = dir.join("wiz.toml");
-        // All defaults, but the final confirm says "no".
         let input = "\n\n\n\n\n\n\n\nn\n";
         let args = WizardArgs {
             path: Some(path.clone()),

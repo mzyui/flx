@@ -1,9 +1,4 @@
-//! Local rotating proxy endpoint.
-//!
-//! Exposes a pool of validated proxies through a plain HTTP proxy listener:
-//! every client connection is forwarded through the next available upstream,
-//! rotating per connection. Plain HTTP forwarding and CONNECT tunneling are
-//! supported; SOCKS upstreams are reached through the existing negotiators.
+//! Serve validated proxies through a local rotating endpoint.
 
 mod pool;
 mod server;
@@ -21,17 +16,15 @@ use tokio::{net::TcpListener, time};
 
 pub use pool::RotatorPool;
 
-/// Bind and port defaults for the serve endpoint.
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 pub const DEFAULT_PORT: u16 = 8080;
-/// Pool cap for the rotating endpoint; the feeder keeps refilling up to it.
+/// Cap pooled proxies; feeder refills up to it.
 pub const MAX_POOL_SIZE: usize = 25;
 pub const DEFAULT_POOL_SIZE: usize = MAX_POOL_SIZE;
-/// The endpoint goes live once this many validated proxies are ready.
+/// Gate serving until this many proxies are ready.
 pub const DEFAULT_MIN_READY: usize = 1;
 pub const DEFAULT_REFRESH_SECS: u64 = 300;
-/// Single end-to-end budget per client connection covering the upstream
-/// connect, the handshake, and the relay — never split per phase.
+/// Bound each connection end-to-end without per-phase splits.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -40,12 +33,9 @@ const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Upstream selection strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// Each connection takes the next proxy in pool order.
     RoundRobin,
-    /// Each connection takes a hash-sampled proxy.
     Random,
 }
 
@@ -66,17 +56,15 @@ impl Strategy {
     }
 }
 
-/// Configuration for the rotating endpoint.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub bind: IpAddr,
     pub port: u16,
     pub strategy: Strategy,
     pub pool_size: usize,
-    /// Validated proxies required before the endpoint starts serving.
     pub min_ready: usize,
     pub refresh_secs: u64,
-    /// `user`/`pass` pair required from clients via `Proxy-Authorization: Basic`.
+    /// Require Basic proxy auth from clients.
     pub auth: Option<(String, String)>,
     pub request_timeout: Duration,
 }
@@ -96,8 +84,10 @@ impl Default for ServeOptions {
     }
 }
 
-/// The rotating endpoint: fills the pool through [`Rotator::pool`] and serves
-/// client connections via [`Rotator::run`] until the shutdown token fires.
+/// Fill pools and serve connections until shutdown.
+///
+/// Created from [`ServeOptions`] via [`Rotator::new`]; feed it with
+/// [`Rotator::pool`] then drive with [`Rotator::run`].
 pub struct Rotator {
     pool: Arc<RotatorPool>,
     options: Arc<ServeOptions>,
@@ -105,6 +95,11 @@ pub struct Rotator {
 }
 
 impl Rotator {
+    /// Creates a rotator backed by a fresh pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Bind address, strategy, pool size, and timeouts.
     pub fn new(options: ServeOptions) -> Self {
         let strategy = options.strategy;
         Self {
@@ -114,21 +109,21 @@ impl Rotator {
         }
     }
 
+    /// Shares the pool fed by the validation pipeline.
     pub fn pool(&self) -> Arc<RotatorPool> {
         Arc::clone(&self.pool)
     }
 
-    /// Lets [`Rotator::run`] start serving even when the feed ended with fewer
-    /// than [`ServeOptions::min_ready`] proxies (offline files, exhausted
-    /// providers).
+    /// Bypass the readiness gate for exhausted feeds.
     pub fn force_ready(&self) {
         self.ready_bypass.store(true, Ordering::Relaxed);
     }
 
-    /// Binds the endpoint and waits until [`ServeOptions::min_ready`] proxies
-    /// are ready (bounded by [`READY_WAIT_TIMEOUT`] or [`Rotator::force_ready`])
-    /// before serving, so early clients are not bounced with an empty rotation.
-    /// Runs until cancelled.
+    /// Binds, waits for `min_ready` proxies, then serves until cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bind address cannot be claimed.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let address = SocketAddr::new(self.options.bind, self.options.port);
         let listener = TcpListener::bind(address)
@@ -147,8 +142,7 @@ impl Rotator {
     }
 }
 
-/// Polls until the pool holds `min_ready` available proxies, the caller flips
-/// the bypass flag, or [`READY_WAIT_TIMEOUT`] elapses — whichever comes first.
+/// Poll pool readiness until bypass or timeout.
 async fn wait_for_ready(pool: &RotatorPool, bypass: &AtomicBool, min_ready: usize) {
     let ready = async {
         while !bypass.load(Ordering::Relaxed) && pool.ready() < min_ready {

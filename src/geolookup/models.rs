@@ -2,7 +2,6 @@ use serde::Serialize;
 
 use super::ip_type::IpType;
 
-/// Geolocation data for a proxy IP address.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct GeoData {
     pub iso_code: Option<Box<str>>,

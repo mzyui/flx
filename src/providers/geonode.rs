@@ -24,8 +24,7 @@ impl ProxyProvider for GeonodeProvider {
                         "https://proxylist.geonode.com/api/proxy-list?limit={}&page={}&sort_by=lastChecked&sort_type=desc",
                         LIMIT, page
                     );
-                    // Protocols come from the payload, so the defaults are only
-                    // a fallback for rows that omit them.
+                    // Fall back to defaults only when payload rows omit protocols.
                     Source::all(&url).map(|source| {
                         source
                             .with_mode(ScrapeMode::GeonodeJson)

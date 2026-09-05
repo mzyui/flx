@@ -2,7 +2,6 @@ use std::{sync::Arc, time::Duration};
 
 use crate::geolookup::IpType;
 
-/// Configuration for the proxy fetcher.
 pub struct Config {
     pub enforce_unique_ip: bool,
     pub concurrency_limit: usize,

@@ -20,19 +20,15 @@ use crate::{
     proxy::models::Proxy,
 };
 
-/// Fetch-phase transitions observable by a consumer of the proxy stream.
+/// Report fetch-phase transitions to consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchStage {
-    /// Primary provider tier is being fetched.
     Primary,
-    /// Fallback provider tier is being fetched.
     Fallback,
-    /// Gathering finished or was skipped.
     Done,
 }
 
-// Reports the current gathering phase and always closes with `Done`, even
-// when the coordinator returns early (stop signal or threshold skip).
+// Always close with Done, even on early return.
 pub(crate) struct StageReporter {
     pub(crate) tx: mpsc::Sender<FetchStage>,
 }
@@ -83,7 +79,7 @@ pub(crate) fn spawn_phase(
     handles
 }
 
-/// Fetch behaviour shared by every source task.
+/// Share fetch behaviour across source tasks.
 #[derive(Clone)]
 pub(crate) struct FetchSettings {
     pub(crate) fetch_cache: Option<Arc<Cache>>,
@@ -94,9 +90,7 @@ pub(crate) struct FetchSettings {
 
 /// Serializes network requests to the same host.
 pub(crate) struct Throttle {
-    /// Projected earliest instant the host may see the next request. Storing
-    /// the projection (not the arrival time) keeps N concurrent callers one
-    /// `delay` apart instead of letting them cluster behind the first.
+    /// Project next request slot to space concurrent callers apart.
     next_slot: Mutex<HashMap<String, time::Instant>>,
 }
 
@@ -111,8 +105,7 @@ impl Throttle {
         let available_at = {
             let mut next_slot = self.next_slot.lock().unwrap_or_else(|e| e.into_inner());
             let now = time::Instant::now();
-            // Update the slot in place via `Borrow<str>` so a String key is only
-            // allocated the first time a host appears, not on every call.
+            // Reuse key allocation to avoid per-call String alloc.
             match next_slot.get_mut(host) {
                 Some(previous) => {
                     let avail_at = (*previous).max(now);

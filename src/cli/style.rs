@@ -1,6 +1,4 @@
-//! Minimal color styling for the CLI: the helpers the CLI uses with the same
-//! method names as before, plus the process-global override set from
-//! `--no-color`.
+//! Style CLI output with minimal color helpers.
 
 use std::fmt::Display;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -12,7 +10,7 @@ const RESET_COLOR: &str = "\x1b[0m";
 
 static COLOR_OVERRIDE: AtomicU8 = AtomicU8::new(OVERRIDE_UNSET);
 
-/// Forces the color decision for the whole process.
+/// Force the color decision for the whole process.
 pub(crate) fn set_override(enabled: bool) {
     let state = if enabled { OVERRIDE_ON } else { OVERRIDE_OFF };
     COLOR_OVERRIDE.store(state, Ordering::Relaxed);
@@ -24,9 +22,7 @@ fn should_colorize() -> bool {
         OVERRIDE_ON => true,
         OVERRIDE_OFF => false,
         _ => {
-            // Auto mode: tty stdout, `CLICOLOR != 0`, no `NO_COLOR`. The
-            // binary always sets an override, so this only shapes tests and
-            // library-only usage.
+            // Prefer TTY stdout unless NO_COLOR or CLICOLOR=0 disables it.
             std::env::var_os("NO_COLOR").is_none()
                 && std::env::var("CLICOLOR").is_ok_and(|value| value != "0")
                 && std::io::stdout().is_terminal()
@@ -56,8 +52,7 @@ fn style(text: impl Display, code: &'static str) -> Styled {
     }
 }
 
-/// Style helpers with the method names call sites already use, so adopting
-/// this module does not touch any formatting code.
+/// Expose color helpers used by call sites.
 pub(crate) trait Colorize {
     fn green(self) -> String;
     fn red(self) -> String;

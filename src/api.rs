@@ -1,4 +1,4 @@
-//! High-level [`Flx`] builder facade.
+//! Provides the Flx builder facade.
 
 use std::{
     fs::File,
@@ -19,20 +19,18 @@ use crate::{
     FetcherConfig, ProxySource, ProxyValidator, ValidationProgress, ValidatorConfig,
 };
 
-/// Path token that reads proxies from standard input.
+/// Marks stdin as a proxy source.
 const STDIN_PATH: &str = "-";
 
-/// Uniform proxy stream type.
 type BoxStream = std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>>;
 
-/// Where the proxies come from.
+/// Tracks the caller's validation choice.
 enum SourceKind {
     Fetcher,
     Files(Vec<PathBuf>),
 }
 
-/// Whether the caller picked a validation target; the terminal calls refuse
-/// to guess one silently.
+/// Tracks whether the caller picked a validation target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValidationChoice {
     Unset,
@@ -42,9 +40,13 @@ enum ValidationChoice {
 
 /// Builder for fetching and optionally validating proxies.
 ///
-/// # Examples
+/// Scrape from built-in providers or load from files, then validate against
+/// online judges. Call [`Flx::fetch`] for providers or [`Flx::from_files`]
+/// for local input, pick a validation target with [`Flx::types`],
+/// [`Flx::groups`], [`Flx::validate_http`] or [`Flx::no_validate`], then
+/// finish with [`Flx::stream`] or [`Flx::collect`].
 ///
-/// Fetch from the built-in providers and validate them as HTTP proxies:
+/// # Examples
 ///
 /// ```no_run
 /// use flx::{Anonymity, Flx, Protocol};
@@ -53,20 +55,6 @@ enum ValidationChoice {
 /// let proxies = Flx::fetch()
 ///     .types([Protocol::Http(Anonymity::Elite)])
 ///     .limit(20)
-///     .collect()
-///     .await?;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// Validate an existing `ip:port` file:
-///
-/// ```no_run
-/// use flx::{Flx, Protocol};
-///
-/// # async fn example() -> anyhow::Result<()> {
-/// let proxies = Flx::from_file("proxies.txt")?
-///     .types([Protocol::Socks5])
 ///     .collect()
 ///     .await?;
 /// # Ok(())
@@ -93,7 +81,14 @@ impl Default for Flx {
 }
 
 impl Flx {
-    /// Starts a builder that scrapes the built-in provider set.
+    /// Creates a builder that scrapes the built-in provider set.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use flx::Flx;
+    /// let flx = Flx::fetch();
+    /// ```
     pub fn fetch() -> Self {
         Self::default()
     }
@@ -102,9 +97,15 @@ impl Flx {
         Self::from_files([path.into()])
     }
 
-    /// Reads candidates from one or more `ip:port` files; the path `-` reads
-    /// standard input. Files are parsed on the blocking thread pool, so slow
-    /// input never stalls an async executor.
+    /// Loads candidates from files or stdin (`-`) without blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `paths` - Files to read; `-` reads stdin. Missing files fail fast.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlxError::Io`] when a file cannot be opened.
     pub fn from_files(
         paths: impl IntoIterator<Item = impl Into<PathBuf>>,
     ) -> Result<Self, FlxError> {
@@ -121,30 +122,26 @@ impl Flx {
         })
     }
 
-    /// Protocols to validate against every candidate.
+    /// Sets protocols validated against every candidate.
     pub fn types(mut self, types: impl Into<Vec<Protocol>>) -> Self {
         self.validator_config.types = types.into();
         self.validation_choice = ValidationChoice::Explicit;
         self
     }
 
-    /// AND groups of protocols to validate.
+    /// Sets AND groups validated together.
     pub fn groups(mut self, groups: impl Into<Vec<Vec<Protocol>>>) -> Self {
         self.validator_config.groups = groups.into();
         self.validation_choice = ValidationChoice::Explicit;
         self
     }
 
-    /// Validates every candidate as a plain HTTP proxy; the same default the
-    /// CLI applies when `TYPES` is omitted.
+    /// Validates every candidate as a plain HTTP proxy.
     pub fn validate_http(self) -> Self {
         self.types([Protocol::Http(Anonymity::Unknown)])
     }
 
-    /// Streams candidates without validating them.
-    ///
-    /// Clears any protocols or groups configured earlier: the last explicit
-    /// validation choice wins.
+    /// Skips validation and clears configured protocols.
     pub fn no_validate(mut self) -> Self {
         self.validator_config.types.clear();
         self.validator_config.groups.clear();
@@ -152,106 +149,105 @@ impl Flx {
         self
     }
 
-    /// Maximum number of proxies validated concurrently.
+    /// Limits concurrent validations.
     pub fn concurrency(mut self, concurrency: usize) -> Self {
         self.validator_config.concurrency_limit = concurrency;
         self
     }
 
-    /// Maximum number of provider sources fetched concurrently.
+    /// Limits concurrent provider fetches.
     pub fn fetch_concurrency(mut self, concurrency: usize) -> Self {
         self.fetcher_config.concurrency_limit = concurrency;
         self
     }
 
-    /// Per-validation timeout in seconds.
+    /// Sets the per-validation timeout in seconds.
     pub fn timeout(mut self, seconds: u64) -> Self {
         self.validator_config.request_timeout = seconds;
         self
     }
 
-    /// Maximum validation attempts per advertised protocol.
+    /// Sets max attempts per advertised protocol.
     pub fn max_attempts(mut self, attempts: usize) -> Self {
         self.validator_config.max_attempts = attempts;
         self
     }
 
-    /// Pause in milliseconds between validation attempts of the same proxy.
+    /// Sets retry delay between attempts of the same proxy.
     pub fn retry_delay(mut self, milliseconds: u64) -> Self {
         self.validator_config.retry_delay = Duration::from_millis(milliseconds);
         self
     }
 
-    /// Emit a machine-readable record for every failed probe.
+    /// Enables machine-readable records for failed probes.
     pub fn report_failures(mut self) -> Self {
         self.validator_config.report_failures = true;
         self
     }
 
-    /// Disable TLS certificate validation for judge connections.
+    /// Disables TLS verification for judge connections.
     pub fn insecure(mut self, insecure: bool) -> Self {
         self.validator_config.insecure = insecure;
         self
     }
 
-    /// Require proxies to forward cookie headers to the judge.
+    /// Requires proxies to forward cookie headers.
     pub fn support_cookies(mut self) -> Self {
         self.validator_config.support_cookies = true;
         self
     }
 
-    /// Require proxies to forward referer headers to the judge.
+    /// Requires proxies to forward referer headers.
     pub fn support_referer(mut self) -> Self {
         self.validator_config.support_referer = true;
         self
     }
 
-    /// Annotate fetched proxies with GeoIP country data.
+    /// Enables GeoIP country annotation.
     pub fn with_geo(mut self) -> Self {
         self.fetcher_config.enable_geo_lookup = true;
         self
     }
 
-    /// Restrict scraping to these named providers; empty keeps all of them.
+    /// Restricts scraping to the named providers.
     pub fn providers(mut self, names: impl Into<Vec<String>>) -> Self {
         self.fetcher_config.providers = Arc::from(names.into());
         self
     }
 
-    /// Skip these providers even when included by name.
+    /// Excludes the named providers.
     pub fn exclude_providers(mut self, names: impl Into<Vec<String>>) -> Self {
         self.fetcher_config.excluded_providers = Arc::from(names.into());
         self
     }
 
-    /// Additional raw source URLs scraped alongside the built-in providers.
+    /// Adds raw source URLs alongside built-in providers.
     pub fn source_urls(mut self, urls: impl Into<Vec<String>>) -> Self {
         self.fetcher_config.custom_sources = Arc::from(urls.into());
         self
     }
 
-    /// Skip fallback providers once this many proxies are already collected.
+    /// Skips fallbacks once this many proxies exist.
     pub fn fallback_threshold(mut self, threshold: usize) -> Self {
         self.fetcher_config.fallback_threshold = Some(threshold);
         self
     }
 
-    /// Cap the fallback provider phase in seconds (0 = unbounded).
+    /// Caps the fallback phase in seconds (0 means unbounded).
     pub fn fetch_phase_timeout(mut self, seconds: u64) -> Self {
         self.fetcher_config.fallback_phase_timeout =
             (seconds > 0).then(|| Duration::from_secs(seconds));
         self
     }
 
-    /// Annotate fetched proxies with their IP class (residential, datacenter,
-    /// mobile, unknown).
+    /// Enables IP class annotation.
     pub fn with_ip_type(mut self) -> Self {
         self.fetcher_config.enable_geo_lookup = true;
         self.fetcher_config.enable_ip_type = true;
         self
     }
 
-    /// Keep only fetched proxies whose IP class matches `ip_type`.
+    /// Filters fetched proxies by IP class.
     pub fn ip_type(mut self, ip_type: crate::geolookup::IpType) -> Self {
         self.fetcher_config.enable_geo_lookup = true;
         self.fetcher_config.enable_ip_type = true;
@@ -259,79 +255,88 @@ impl Flx {
         self
     }
 
-    /// Filter fetched proxies by ISO country code.
+    /// Filters fetched proxies by ISO country code.
     pub fn countries(mut self, countries: impl Into<Vec<String>>) -> Self {
         self.fetcher_config.enable_geo_lookup = true;
         self.fetcher_config.countries = Arc::from(countries.into());
         self
     }
 
-    /// Freshness window for the source cache, in minutes.
+    /// Sets source cache freshness in minutes.
     pub fn cache_ttl(mut self, minutes: u64) -> Self {
         self.fetcher_config.cache_ttl =
             (minutes > 0).then(|| Duration::from_secs(minutes.saturating_mul(60)));
         self
     }
 
-    /// Bypass the source cache and refetch.
+    /// Bypasses the source cache.
     pub fn refresh_cache(mut self) -> Self {
         self.fetcher_config.refresh_cache = true;
         self
     }
 
-    /// Serve providers only from the local cache, skipping uncached sources.
+    /// Serves providers only from the local cache.
     pub fn offline(mut self) -> Self {
         self.fetcher_config.offline = true;
         self
     }
 
-    /// Minimum delay in milliseconds between requests to the same host.
+    /// Sets min delay between requests to the same host.
     pub fn fetch_delay(mut self, milliseconds: u64) -> Self {
         self.fetcher_config.fetch_delay =
             (milliseconds > 0).then(|| Duration::from_millis(milliseconds));
         self
     }
 
-    /// Override the per-source fetch timeout in seconds.
+    /// Overrides the per-source fetch timeout in seconds.
     pub fn provider_timeout(mut self, seconds: u64) -> Self {
         self.fetcher_config.provider_timeout = (seconds > 0).then(|| Duration::from_secs(seconds));
         self
     }
 
-    /// Custom HTTP judges for plain HTTP validation.
+    /// Sets custom HTTP judges.
     pub fn http_judges(mut self, urls: impl Into<Vec<String>>) -> Self {
         self.validator_config.http_judge_urls = urls.into();
         self
     }
 
-    /// Custom online judges for HTTPS and tunnel validation.
+    /// Sets custom HTTPS judges.
     pub fn https_judges(mut self, urls: impl Into<Vec<String>>) -> Self {
         self.validator_config.https_judge_urls = urls.into();
         self
     }
 
-    /// Probe requested types that the proxy's advertised set does not cover.
+    /// Probes requested types outside the advertised set.
     pub fn probe_missed_types(mut self, enable: bool) -> Self {
         self.validator_config.probe_missed_types = enable;
         self
     }
 
-    /// Stop after at most `limit` validated proxies.
+    /// Caps output at `limit` validated proxies.
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
     }
 
-    /// Runs the pipeline and yields validated proxies as a stream.
+    /// Runs the pipeline as a proxy stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlxError::Config`] when no validation target was selected,
+    /// or [`FlxError::Fetch`]/[`FlxError::Validate`] when scraping or
+    /// validation fails to start.
     pub async fn stream(self) -> Result<BoxStream, FlxError> {
         Ok(self.stream_with_progress().await?.stream)
     }
 
     /// Runs the pipeline with live validation counters.
     ///
-    /// The returned [`ValidationRun`] is itself a `Stream`; it also carries
-    /// the progress handle and, when `.report_failures()` was requested, the
-    /// feed of failed probes.
+    /// Use this when you need progress or the failure feed; otherwise prefer
+    /// [`Flx::stream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FlxError::Config`] when no validation target was selected.
     pub async fn stream_with_progress(self) -> Result<ValidationRun, FlxError> {
         let Flx {
             source,
@@ -371,9 +376,7 @@ impl Flx {
                     .await
                     .map_err(FlxError::Validate)?;
                 let progress = validator.progress();
-                // Take before boxing: once erased behind the stream trait the
-                // concrete validator is unreachable, and an undrained receiver
-                // would silently drop failures past the channel capacity.
+                // Takes failures before boxing; undrained receivers drop buffered items.
                 let failures = validator.take_failures();
                 (Box::pin(validator) as BoxStream, progress, failures)
             };
@@ -389,17 +392,38 @@ impl Flx {
         })
     }
 
-    /// Runs the pipeline and collects validated proxies.
+    /// Runs the pipeline and collects the results.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the same errors as [`Flx::stream`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use flx::Flx;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let proxies = Flx::fetch().no_validate().collect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn collect(self) -> Result<Vec<Proxy>, FlxError> {
         let stream = self.stream().await?;
         Ok(stream.collect::<Vec<_>>().await)
     }
 
-    /// Exposes the validated pool through a local rotating endpoint that runs
-    /// until the caller's runtime cancels it. The pool fills from the fetch and
-    /// validation pipeline; the endpoint goes live once `options.min_ready`
-    /// proxies are validated, or right away when the feed ends short of that.
-    /// See [`crate::rotator::Rotator`] for manual setups.
+    /// Serves validated proxies via a local rotating endpoint.
+    ///
+    /// Feeds the pipeline into a [`Rotator`](crate::rotator::Rotator) pool
+    /// and blocks until shutdown. Forces readiness when the feed ends.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Bind address, pool size, and request timeout.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`FlxError`] from [`Flx::stream`] or bind failures.
     pub async fn serve(self, options: crate::rotator::ServeOptions) -> Result<(), FlxError> {
         let stream = self.stream().await?;
         let rotator = Arc::new(crate::rotator::Rotator::new(options));
@@ -412,16 +436,14 @@ impl Flx {
         while let Some(proxy) = stream.next().await {
             pool.add(proxy);
         }
-        // Mirrors the CLI: a finished feed is final, so don't stall callers
-        // for READY_WAIT_TIMEOUT when it ends short of min_ready.
+        // Forces readiness; finished feeds never wait for min_ready.
         rotator.force_ready();
         let _ = server.await;
         Ok(())
     }
 }
 
-/// Handle to a started pipeline: the result stream plus live counters and the
-/// optional failure feed enabled by `.report_failures()`.
+/// Holds a started pipeline with its counters and failure feed.
 pub struct ValidationRun {
     stream: BoxStream,
     progress: ValidationProgress,
@@ -429,14 +451,11 @@ pub struct ValidationRun {
 }
 
 impl ValidationRun {
-    /// Live validation counters.
     pub fn progress(&self) -> ValidationProgress {
         self.progress.clone()
     }
 
-    /// Takes the receiver for machine-readable probe failures. Returns `None`
-    /// unless `.report_failures()` was set; skipping the drain silently drops
-    /// failures once the channel buffer fills.
+    /// Takes the failure feed when reporting is enabled.
     pub fn take_failures(&mut self) -> Option<mpsc::Receiver<crate::ProxyFailure>> {
         self.failures.take()
     }
@@ -450,8 +469,15 @@ impl Stream for ValidationRun {
     }
 }
 
-/// Reads every proxy from `paths` (`-` = stdin) on the blocking thread pool,
-/// so slow input never stalls an async executor.
+/// Loads proxies from files or stdin on the blocking pool.
+///
+/// # Arguments
+///
+/// * `paths` - Files to parse; `-` reads stdin.
+///
+/// # Errors
+///
+/// Returns an error when a file is missing or its contents cannot be parsed.
 pub async fn load_proxy_files(paths: Vec<PathBuf>) -> anyhow::Result<Vec<Proxy>> {
     tokio::task::spawn_blocking(move || {
         let mut proxies = Vec::new();
@@ -806,7 +832,6 @@ mod tests {
         assert!(run.next().await.is_none());
         let _ = std::fs::remove_file(&path);
 
-        // Without validation there is nothing to count; the handle is zeroed.
         let progress = run.progress();
         assert_eq!(progress.total(), 0);
         assert_eq!(progress.done(), 0);
@@ -839,8 +864,7 @@ mod tests {
         );
     }
 
-    // Offline echo judge: answers the preflight with the request token, so a
-    // full validation run needs no external network.
+    // Spawns an offline echo judge for validation tests.
     async fn spawn_echo_judge() -> String {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio::net::TcpListener;
@@ -891,8 +915,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        // Privileged ports are effectively never bound locally, so every
-        // candidate fails fast without external network.
+        // Uses closed local ports so candidates fail fast offline.
         let body: String = (1..=count)
             .map(|port| format!("127.0.0.1:{port}\n"))
             .collect();
@@ -953,11 +976,9 @@ mod tests {
             )
             .await
             .expect("first item must arrive promptly");
-            // Abandon the remaining work mid-stream.
         }
 
-        // A fresh pipeline must complete afterwards: the aborted run may not
-        // wedge the shared runtime or leak blocking state.
+        // Verifies a fresh pipeline still completes after abort.
         let judge = spawn_echo_judge().await;
         let second_path = write_candidate_file("drop-second", 2).await;
         let started = std::time::Instant::now();

@@ -14,9 +14,7 @@ use super::filters::ProxyFilter;
 use super::guard::OutputGuard;
 use super::RunOutcome;
 
-// Resolves the output format when the user left `--format` at `default`: an
-// explicit `-o` path infers the format from its file extension and a piped
-// stdout switches to `json-lines`.
+// Resolve `default` format from `-o` extension or piped stdout.
 pub(crate) fn effective_format<'a>(
     format: &'a str,
     output_path: Option<&std::path::Path>,
@@ -46,7 +44,7 @@ pub(crate) fn effective_format<'a>(
     }
 }
 
-// Aggregated per-item distribution feeding the end-of-run summary line.
+// Aggregate per-item distribution for the end-of-run summary.
 #[derive(Default)]
 pub struct RunStats {
     protocols: Mutex<HashMap<&'static str, usize>>,
@@ -80,8 +78,7 @@ impl RunStats {
         }
     }
 
-    /// One-line distribution (`http: 12 · socks5: 3 · top: US 10, ID 4`),
-    /// `None` when nothing was emitted.
+    /// Summarize protocol and country distribution in one line.
     pub fn summary(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         {
@@ -117,8 +114,7 @@ impl RunStats {
     }
 }
 
-// Item counter shared by chained output passes so a fallback pass extends
-// the array opened by an earlier pass instead of starting a new document.
+// Count items across chained passes sharing one JSON array.
 #[derive(Default)]
 pub struct JsonDoc {
     items: AtomicUsize,
@@ -134,26 +130,21 @@ impl JsonDoc {
     }
 }
 
-// Links one pass to a shared `JsonDoc`. `leave_open` keeps the closing `]`
-// unwritten so a later chained pass can append more items to the array.
+// Link one pass to a shared JsonDoc for chained output.
 #[derive(Clone)]
 pub struct JsonContinuation {
     pub doc: Arc<JsonDoc>,
     pub leave_open: bool,
 }
 
-// Controls document finalization when `process_result` chains one output
-// pass after another. Empty JSON is only suppressed on the first pass, and
-// the CSV header is only emitted once.
+// Control document finalization across chained output passes.
 #[derive(Clone)]
 pub struct FinalizeOpts {
     pub suppress_empty_json: bool,
     pub emit_csv_header: bool,
-    // A chained pass also opens its output file in append mode so bytes
-    // written by earlier passes are never truncated away.
+    // Chained passes append so earlier bytes survive.
     pub continue_json: Option<JsonContinuation>,
-    // Shared per-item distribution collector for the end-of-run summary;
-    // chained passes share one instance so both passes count into it.
+    // Shared distribution collector across chained passes.
     pub stats: Option<Arc<RunStats>>,
 }
 
@@ -168,8 +159,7 @@ impl Default for FinalizeOpts {
     }
 }
 
-// Sorts proxies by the requested field, honoring `--order`. The string flags
-// are a CLI concern; the ordering itself lives in the shared library module.
+// Sort proxies by the requested field and order.
 fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
     let key = match sort {
         "avg-response" | "response-time" => flx::SortKey::AvgResponseTime,
@@ -184,7 +174,7 @@ fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
     flx::sort_proxies(proxies, key, order);
 }
 
-/// Maps a proxy's best protocol to a proxychains type string.
+/// Map a proxy to its proxychains type string.
 fn proxychains_type(proxy: &Proxy) -> &'static str {
     for pt in &proxy.proxy_types {
         match pt.protocol {
@@ -202,8 +192,7 @@ fn proxychains_type(proxy: &Proxy) -> &'static str {
     "http"
 }
 
-/// Maps a proxy's best protocol to the URI scheme used by the `prefix`
-/// format, with the same SOCKS-over-HTTP preference as `proxychains_type`.
+/// Map a proxy to the `prefix` URI scheme.
 fn prefix_scheme(proxy: &Proxy) -> &'static str {
     for pt in &proxy.proxy_types {
         match pt.protocol {
@@ -215,7 +204,7 @@ fn prefix_scheme(proxy: &Proxy) -> &'static str {
     "http"
 }
 
-/// Renders a PAC `FindProxyForURL` function from a list of proxies.
+/// Render a PAC `FindProxyForURL` function.
 fn render_pac(proxies: &[Proxy]) -> String {
     let mut out = String::from("function FindProxyForURL(url, host) {\n    return \"");
     for (i, proxy) in proxies.iter().enumerate() {
@@ -278,8 +267,7 @@ where
             if matches!(tokio::fs::metadata(file_path).await, Ok(metadata) if metadata.len() > 0));
 
     let json = matches!(format, "json" | "pretty-json");
-    // A chained pass resumes the array opened by an earlier one: the first
-    // item emits a `,` separator when earlier passes already wrote items.
+    // Resume chained arrays with a `,` separator when items exist.
     let leave_open = finalize
         .continue_json
         .as_ref()
@@ -293,10 +281,7 @@ where
     let filter = Arc::new(ProxyFilter::from_options(&options));
     let source: std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>> =
         if options.sort.is_some() || options.shuffle {
-            // Sorted/shuffled output cannot stream, so collection must stay
-            // interruptible: without this select a Ctrl+C pressed during the
-            // whole upstream run (fetch+validate) would be swallowed until
-            // every item had arrived. A cancel keeps what already arrived.
+            // Buffer sorted output interruptibly so cancel keeps arrivals.
             let mut buffered: Vec<Proxy> = Vec::new();
             let mut src = std::pin::pin!(source);
             loop {
@@ -307,9 +292,7 @@ where
                     }
                     item = src.next() => {
                         let Some(proxy) = item else { break };
-                        // The limit counts filtered results, so the filter has
-                        // to run here too — otherwise buffering would keep the
-                        // upstream running long after enough results existed.
+                        // Filter while buffering so limits count kept results.
                         if filter.matches(&proxy) {
                             buffered.push(proxy);
                             if options.limit > 0 && buffered.len() >= options.limit {
@@ -329,8 +312,7 @@ where
         } else {
             Box::pin(source)
         };
-    // The filter runs twice on the sorted/shuffled path (above and here); it
-    // is a pure predicate, so the second pass is a no-op on kept items.
+    // Reapply the pure filter on the sorted path as a no-op.
     let mut source = std::pin::pin!(source
         .filter_map(move |proxy| {
             let filter = Arc::clone(&filter);
@@ -338,7 +320,7 @@ where
         })
         .enumerate());
 
-    // PAC needs all proxies up front to render FindProxyForURL.
+    // Collect all proxies before rendering PAC output.
     if format == "pac" {
         let mut proxies: Vec<Proxy> = Vec::new();
         loop {
@@ -367,8 +349,6 @@ where
             } else {
                 guard.before_write();
                 if let Err(error) = std::io::stdout().lock().write_all(pac.as_bytes()) {
-                    // A downstream consumer (e.g. `head`) closing the pipe is
-                    // normal termination, not a defect.
                     if error.kind() == std::io::ErrorKind::BrokenPipe {
                         guard.after_write();
                         return Ok(RunOutcome::Finished);
@@ -387,27 +367,17 @@ where
         }
         return Ok(RunOutcome::Finished);
     }
-    // One stdout lock for the whole run instead of `print!` re-acquiring the
-    // global lock (`std::io::_print`) for every proxy.
+    // Hold one stdout lock for the whole run.
     let mut stdout = std::io::stdout().lock();
 
-    // Reusable per-item buffer: each proxy's bytes are assembled here (no
-    // per-item `String` allocation) and written in a single call, so stdout
-    // issues one syscall per proxy.
+    // Assemble each proxy in a reusable buffer with one write per item.
     let mut buf: Vec<u8> = Vec::new();
-    // Scratch for serializing one item before it is committed to `buf`, so a
-    // failed serialization can be discarded without undoing prefix bytes.
+    // Stage serializations in scratch space before committing to `buf`.
     let mut body: Vec<u8> = Vec::new();
 
-    // When `cancel` resolves (Ctrl+C in the real binary), the run finalizes a
-    // valid JSON document instead of leaving an unterminated array behind.
-
-    // Collects the write error, if any, so the document can still be closed
-    // before the error is reported to the caller.
     let mut write_error: Option<anyhow::Error> = None;
 
-    // Emit the CSV header once before the stream starts so the output is
-    // always valid even when the stream is empty.
+    // Emit the CSV header once even for empty streams.
     if _csv && finalize.emit_csv_header && !appending_to_existing {
         buf.extend_from_slice(b"ip,port,type,response_time,country,ip_type\n");
         if let Some(ref mut file) = output_file {
@@ -419,7 +389,6 @@ where
         } else {
             guard.before_write();
             if let Err(error) = stdout.write_all(&buf) {
-                // `head` (or any early-closing consumer) is expected termination.
                 if error.kind() == std::io::ErrorKind::BrokenPipe {
                     guard.after_write();
                     return Ok(RunOutcome::Finished);
@@ -442,9 +411,7 @@ where
                 let Some((index, proxy)) = item else { break };
                 let should_end = options.limit > 0 && index + 1 >= options.limit;
                 buf.clear();
-                // JSON arms clear this on a failed serialization; such an
-                // item is skipped entirely instead of leaving a dangling
-                // separator behind.
+                // Skip failed items without leaving dangling separators.
                 let mut emitted = true;
                 match format {
                     "text" => {
@@ -452,9 +419,6 @@ where
                         buf.push(b'\n');
                     }
                     "json" => {
-                        // Serialize first so a failed item leaves no trace:
-                        // writing the `[`/`,` prefix beforehand would strand
-                        // it in the document when serialization aborts.
                         if !write_json_item(&mut buf, &mut body, item_count, &proxy) {
                             emitted = false;
                         }
@@ -480,8 +444,6 @@ where
                             buf.extend_from_slice(&body);
                             buf.push(b'\n');
                         } else {
-                            // Drop the item entirely: partial bytes without a
-                            // trailing newline would fuse with the next line.
                             emitted = false;
                         }
                     }
@@ -518,8 +480,6 @@ where
                         }
                     } else {
                         guard.before_write();
-                        // A downstream consumer closing the pipe (e.g. `head`)
-                        // is normal, so end the run cleanly instead of panicking.
                         if let Err(error) = stdout.write_all(&buf) {
                             if error.kind() == std::io::ErrorKind::BrokenPipe {
                                 guard.after_write();
@@ -551,11 +511,7 @@ where
     }
 
     if json {
-        // Finalizing is best-effort: an interrupted or failing run must still
-        // yield valid JSON, but a failure here is only interesting when nothing
-        // else already went wrong. A chained pass leaves the array open for a
-        // later one, except when cancelled or already failing — an unterminated
-        // document is worse than a doubled closer.
+        // Finalize JSON best-effort without masking prior errors.
         guard.before_write();
         let close_document = !leave_open || cancelled || write_error.is_some();
         if write_error.is_none() {
@@ -583,14 +539,10 @@ where
     if let Some(file) = output_file.as_mut() {
         let _ = file.flush().await;
     }
-    // Flush stdout explicitly so a cancelled/failed run still delivers the
-    // final bytes (e.g. the closing `]`) before we exit or report an error.
+    // Flush stdout so cancelled runs still deliver final bytes.
     let _ = stdout.flush();
 
     if cancelled {
-        // Ctrl+C: the document above has been finalized; report the
-        // interruption so `main` can exit with the conventional SIGINT status
-        // (128 + 2) after the terminal settings have been restored on drop.
         return Ok(RunOutcome::Cancelled);
     }
 
@@ -608,7 +560,6 @@ async fn finalize_json_output(
     close_document: bool,
 ) -> anyhow::Result<()> {
     let close = if !close_document {
-        // A later chained pass owns the closer.
         ""
     } else if item_count > 0 {
         "\n]\n"
@@ -637,10 +588,7 @@ async fn write_output(
     Ok(())
 }
 
-// Closes a chained JSON document once no further pass will run: appends the
-// closer when an earlier pass already wrote items and a complete empty array
-// otherwise; other formats need no finalization. The output file is opened in
-// append mode so bytes written by earlier passes survive.
+// Close chained JSON documents without truncating earlier passes.
 pub async fn close_chained_json(options: &OutputOptions, item_count: usize) -> anyhow::Result<()> {
     let format = effective_format(
         &options.format,
@@ -684,10 +632,7 @@ fn ip_type_str(proxy: &Proxy) -> &'static str {
 }
 
 fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
-    // Written field-by-field straight into `buf`: intermediate `String`s here
-    // would be pure allocator churn on the hottest output path. The numeric
-    // and protocol fields can never contain CSV-special characters, so only
-    // the free-form country and ip-type fields go through `csv_quote`.
+    // Write rows directly into buf to avoid allocations.
     let _ = write!(buf, "{},{}", proxy.ip, proxy.port);
     buf.push(b',');
     for (i, pt) in proxy.proxy_types.iter().enumerate() {
@@ -712,7 +657,6 @@ fn csv_quote(buf: &mut Vec<u8>, field: &str) {
             if ch == '"' {
                 buf.extend_from_slice(b"\"\"");
             } else {
-                // CSV fields are ASCII-safe; non-ASCII is written as-is.
                 let mut b = [0u8; 4];
                 let encoded = ch.encode_utf8(&mut b);
                 buf.extend_from_slice(encoded.as_bytes());
@@ -724,9 +668,7 @@ fn csv_quote(buf: &mut Vec<u8>, field: &str) {
     }
 }
 
-// Serializes one item into the scratch buffer and, on success, commits it to
-// `buf` with the array opener/continuation separator. On failure nothing is
-// written: a dangling `[` or `,` would render the document invalid.
+// Commit JSON items only after successful serialization.
 fn write_json_item<T: ?Sized + serde::Serialize>(
     buf: &mut Vec<u8>,
     body: &mut Vec<u8>,
@@ -750,8 +692,6 @@ fn write_json_item<T: ?Sized + serde::Serialize>(
 mod tests {
     use super::*;
 
-    // Serializes to an error unconditionally, standing in for any future
-    // `Proxy` field that serde_json cannot render.
     struct Unserializable;
 
     impl serde::Serialize for Unserializable {

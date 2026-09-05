@@ -1,6 +1,4 @@
-// Test-only judge fixtures shared by validator test modules: loopback HTTP
-// servers around the anti-replay token check, so preflight and probe tests
-// never touch the network. Not compiled outside `cargo test`.
+// Provides loopback judge fixtures for validator tests.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -8,8 +6,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Spawns a one-shot judge that echoes the request's `X-Fluxy-Token` back in
-/// the marker format the checks require.
+/// Spawns a one-shot judge echoing the request token.
 pub async fn spawn_echo_judge() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -21,8 +18,7 @@ pub async fn spawn_echo_judge() -> String {
     judge_url(address)
 }
 
-/// Drops the first connection and echoes the token on the second, exercising
-/// the preflight retry path.
+/// Spawns a judge dropping the first connection to test retries.
 pub async fn spawn_flaky_echo_judge() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -37,7 +33,7 @@ pub async fn spawn_flaky_echo_judge() -> String {
     judge_url(address)
 }
 
-/// Answers 200 without echoing the token, producing a "did not echo" failure.
+/// Spawns a judge omitting the token to force failures.
 pub async fn spawn_no_echo_judge() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -55,7 +51,6 @@ pub async fn spawn_no_echo_judge() -> String {
     judge_url(address)
 }
 
-/// Serves a single echo-judge response on `stream`.
 pub async fn serve_echo_judge(mut stream: TcpStream) {
     let received = read_request_head(&mut stream).await;
     let token = extract_token(&received);

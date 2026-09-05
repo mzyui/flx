@@ -1,4 +1,4 @@
-//! Library error types.
+//! Defines library error types.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -6,13 +6,21 @@ use std::net::AddrParseError;
 use std::num::ParseIntError;
 
 /// Top-level library error.
+///
+/// Each variant preserves its source; match on it to decide retry vs abort.
 #[derive(Debug)]
 pub enum FlxError {
+    /// Fetching from providers failed; safe to retry with backoff.
     Fetch(anyhow::Error),
+    /// Validation startup failed (bad config or dead judges).
     Validate(anyhow::Error),
+    /// GeoIP lookup or database sync failed; results may lack country data.
     Geo(anyhow::Error),
+    /// File or cache I/O failed.
     Io(std::io::Error),
+    /// Invalid builder combination (e.g. no validation target selected).
     Config(String),
+    /// Proxy text could not be parsed.
     Parse(anyhow::Error),
 }
 
@@ -32,8 +40,7 @@ impl fmt::Display for FlxError {
 impl StdError for FlxError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            // `anyhow::Error` derefs to `dyn StdError + Send + Sync`, which
-            // coerces to the plain trait object `#[source]` produced before.
+            // Derefs anyhow errors to plain std errors.
             FlxError::Fetch(error) => Some(&**error),
             FlxError::Validate(error) => Some(&**error),
             FlxError::Geo(error) => Some(&**error),
@@ -44,11 +51,14 @@ impl StdError for FlxError {
     }
 }
 
-/// Error parsing a proxy from text.
+/// Rejects malformed proxy text.
 #[derive(Debug)]
 pub enum ProxyParseError {
+    /// Reports a missing separator.
     MissingSeparator(String),
+    /// Reports an invalid IP address.
     InvalidIp(String, AddrParseError),
+    /// Reports an invalid port.
     InvalidPort(String, ParseIntError),
 }
 
@@ -74,10 +84,12 @@ impl StdError for ProxyParseError {
     }
 }
 
-/// Error parsing a protocol from text.
+/// Rejects malformed protocol text.
 #[derive(Debug)]
 pub enum ProtocolParseError {
+    /// Reports an unknown protocol.
     Unknown(String),
+    /// Reports an invalid CONNECT port.
     InvalidConnectPort(String),
 }
 

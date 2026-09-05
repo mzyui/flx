@@ -1,4 +1,4 @@
-//! Proxy model types and HTTP/TLS client.
+//! Expose proxy models and HTTP/TLS clients.
 
 pub mod client;
 pub mod models;

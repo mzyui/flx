@@ -1,14 +1,8 @@
-//! Config file support: TOML defaults layered over CLI flags.
-//!
-//! A config file is a **patch** — it fills values the CLI didn't explicitly
-//! set.  CLI flags always win.  Project `.flx.toml` overrides the user XDG
-//! config key-by-key.
+//! Layer TOML defaults under CLI flags.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-
-// ── Section patch structs ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -87,8 +81,6 @@ pub struct ServeSection {
     pub auth: Option<String>,
 }
 
-// ── Top-level config ──────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FileConfig {
     pub global: Option<GlobalSection>,
@@ -102,21 +94,19 @@ pub struct FileConfig {
     pub source: Option<PathBuf>,
 }
 
-// ── Discovery ─────────────────────────────────────────────────────────
-
 pub struct Discovery {
     pub project: Option<PathBuf>,
     pub user: Option<PathBuf>,
 }
 
-/// The config files that would be read, in precedence order.
+/// List config files `load` would read without reading them.
 pub struct EffectivePaths {
     pub primary: Option<PathBuf>,
     pub project: Option<PathBuf>,
     pub user: Option<PathBuf>,
 }
 
-/// Resolves the files `load` would read, without reading them.
+/// Resolve files `load` would read without reading them.
 pub fn paths_in_effect(
     config_flag: Option<&Path>,
     env_path: Option<&str>,
@@ -146,10 +136,7 @@ pub fn paths_in_effect(
     }
 }
 
-/// Scans the standard locations for config files without touching the filesystem.
-///
-/// `config_home` is the XDG config directory (`~/.config`); `cwd` is the
-/// current working directory where `.flx.toml` is checked.
+/// Discover configs without touching the filesystem.
 pub fn discover(config_home: &Path, cwd: &Path) -> Discovery {
     let project = cwd.join(".flx.toml");
     let user = config_home.join("flx").join("config.toml");
@@ -159,13 +146,7 @@ pub fn discover(config_home: &Path, cwd: &Path) -> Discovery {
     }
 }
 
-// ── Parse ─────────────────────────────────────────────────────────────
-
-/// Parses a TOML config string, validating every known value.
-///
-/// Unknown top-level **sections** are collected (not rejected) so future
-/// extensions like `[serve]` do not break; unknown **keys** inside a known
-/// section are rejected (`deny_unknown_fields`).
+/// Parse TOML configs while collecting unknown sections.
 pub fn parse(text: &str) -> Result<FileConfig, ConfigError> {
     let value: toml::Value = toml::from_str(text).map_err(ConfigError::parse)?;
     let table = match value {
@@ -197,8 +178,6 @@ fn deser_section<T: serde::de::DeserializeOwned>(
         .try_into()
         .map_err(|e: toml::de::Error| ConfigError::message(format!("[{section}] {e}")))
 }
-
-// ── Value validation ──────────────────────────────────────────────────
 
 const LOG_LEVELS: &[&str] = &["off", "error", "warn", "info", "debug", "trace"];
 const IP_TYPES: &[&str] = &["residential", "datacenter", "mobile", "unknown"];
@@ -292,8 +271,6 @@ fn ensure_judge_urls(urls: &Option<Vec<String>>, key: &str) -> Result<(), Config
     Ok(())
 }
 
-// ── Merge (layering) ──────────────────────────────────────────────────
-
 trait Overlay {
     fn overlay(self, base: Self) -> Self;
 }
@@ -373,7 +350,7 @@ overlay_section!(ServeSection {
     auth,
 });
 
-/// Merges two configs: `project` values override `user` values per field.
+/// Merge project configs over user configs per field.
 pub fn merge(project: FileConfig, user: FileConfig) -> FileConfig {
     FileConfig {
         global: merge_section(project.global, user.global),
@@ -399,13 +376,7 @@ fn merge_section<T: Overlay>(project: Option<T>, user: Option<T>) -> Option<T> {
     }
 }
 
-// ── Load from disk ────────────────────────────────────────────────────
-
-/// Loads and merges config files following the standard precedence.
-///
-/// 1. `config_flag` (`--config <path>`) or `env_path` (`$FLX_CONFIG`)
-/// 2. `.flx.toml` in `cwd` (project) + `~/.config/flx/config.toml` (user)
-/// 3. `no_config` → `Ok(None)`
+/// Load and merge configs by precedence.
 pub fn load(
     config_flag: Option<&Path>,
     env_path: Option<&str>,
@@ -451,13 +422,11 @@ fn warn_unknown_sections(cfg: &FileConfig) {
     }
 }
 
-// ── Apply to CLI ──────────────────────────────────────────────────────
-
 use crate::argument::{Cli, Command, FetcherArgs, OutputOptions, ServeArgs, ValidatorArgs};
 use clap::parser::ValueSource;
 use clap::ArgMatches;
 
-/// Applies `cfg` values to `cli` for every field the CLI did **not** set.
+/// Apply unset CLI fields from file configs.
 pub fn apply_config(cli: &mut Cli, cfg: &FileConfig, matches: &ArgMatches) {
     apply_global(cli, cfg.global.as_ref(), matches);
     let sub = matches.subcommand().map(|(_, m)| m);
@@ -764,9 +733,7 @@ fn apply_serve(serve: &mut ServeArgs, cfg: Option<&ServeSection>, sub: Option<&A
     apply_field!(provided(sub, "auth"), &cfg.auth, serve.auth, Some);
 }
 
-// ── Template & show ───────────────────────────────────────────────────
-
-/// Static commented template for `flx config init`.
+/// Render the commented template for `flx config init`.
 pub fn template() -> &'static str {
     r#"# flx configuration file.
 # CLI flags always win over values here.
@@ -835,7 +802,7 @@ pub fn template() -> &'static str {
 "#
 }
 
-/// Serialises the merged config back to TOML for `flx config show`.
+/// Serialize the merged config back to TOML.
 pub fn to_toml(cfg: &FileConfig) -> String {
     let s = toml::to_string(cfg).unwrap_or_default();
     if s.trim().is_empty() {
@@ -844,8 +811,6 @@ pub fn to_toml(cfg: &FileConfig) -> String {
         s
     }
 }
-
-// ── Error type ────────────────────────────────────────────────────────
 
 use std::fmt;
 
@@ -890,8 +855,6 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-// ── Tests ─────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,8 +881,6 @@ mod tests {
         (cli, matches)
     }
 
-    // ── parse ──
-
     #[test]
     fn parse_empty_config_is_a_no_op() {
         let cfg = parse("").unwrap();
@@ -928,7 +889,6 @@ mod tests {
         assert!(cfg.output.is_none());
         assert!(cfg.validate.is_none());
         assert!(cfg.unknown_sections.is_empty());
-        // comment-only
         assert!(parse("# just a comment\n").unwrap().fetch.is_none());
     }
 
@@ -1006,8 +966,6 @@ http_judges = ["http://azenv.net/"]
         assert!(parse("[validate]\nhttps_judges = [\"not a url\"]\n").is_err());
     }
 
-    // ── merge ──
-
     #[test]
     fn merge_project_overrides_user_per_field() {
         let user =
@@ -1027,8 +985,6 @@ http_judges = ["http://azenv.net/"]
         );
         assert!(merged.unknown_sections.is_empty());
     }
-
-    // ── discover ──
 
     #[test]
     fn discover_finds_project_and_user_files() {
@@ -1050,8 +1006,6 @@ http_judges = ["http://azenv.net/"]
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    // ── load ──
 
     #[test]
     fn load_no_config_returns_none() {
@@ -1104,8 +1058,6 @@ http_judges = ["http://azenv.net/"]
         assert_eq!(fetch.concurrency, Some(5));
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    // ── apply ──
 
     #[test]
     fn apply_cli_flags_beat_config_values() {
@@ -1214,8 +1166,6 @@ http_judges = ["http://azenv.net/"]
         assert_eq!(serve.min_ready, flx::rotator::DEFAULT_MIN_READY);
     }
 
-    // ── to_toml ──
-
     #[test]
     fn to_toml_round_trips_set_values() {
         let cfg = parse("[global]\nquiet = true\n[fetch]\nwith_geo = true\n").unwrap();
@@ -1226,8 +1176,6 @@ http_judges = ["http://azenv.net/"]
         assert_eq!(reparsed.global.unwrap().quiet, Some(true));
         assert_eq!(reparsed.fetch.unwrap().with_geo, Some(true));
     }
-
-    // ── template ──
 
     #[test]
     fn template_mentions_every_section() {

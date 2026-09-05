@@ -1,5 +1,4 @@
-//! Client-facing listener: parses proxy requests, picks an upstream from the
-//! pool, and relays the connection through it.
+//! Relay client connections through pooled upstreams.
 
 use std::{sync::Arc, time::Instant};
 
@@ -34,16 +33,13 @@ const RESPONSE_BAD_GATEWAY: &[u8] =
 const RESPONSE_UNAUTHORIZED: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
     Proxy-Authenticate: Basic realm=\"flx\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-/// Accepts connections until the shutdown flag flips; each accepted
-/// connection is handled on its own task so one stalled client cannot hold
-/// the accept loop.
+/// Accept connections until shutdown without head-of-line blocking.
 pub(super) async fn accept_loop(
     listener: TcpListener,
     pool: Arc<RotatorPool>,
     options: Arc<ServeOptions>,
 ) {
-    // This loop never exits: it runs as a background task aborted by the
-    // runtime teardown when the process shuts down.
+    // Run until runtime teardown aborts the task.
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -67,9 +63,7 @@ async fn handle_connection(
     options: Arc<ServeOptions>,
 ) {
     let _ = client.set_nodelay(true);
-    // One absolute deadline for the whole connection: request head, upstream
-    // connect, handshake, and relay share it, so a stalled client cannot hold
-    // this task (or an upstream slot) beyond the budget.
+    // Share one deadline across head, connect, handshake, and relay.
     let deadline = Instant::now() + options.request_timeout;
     let expected_auth = options.auth.as_ref().map(|(user, pass)| {
         let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
@@ -140,8 +134,7 @@ struct ClientRequest {
     host: String,
     port: u16,
     authorized: bool,
-    /// Bytes to forward upstream once connected: the full request for plain
-    /// HTTP, or only the tunnel bytes that rode alongside the CONNECT head.
+    /// Forward full requests or CONNECT tails upstream.
     forward: Vec<u8>,
 }
 
@@ -193,9 +186,7 @@ async fn read_request(
         (host, uri.port_u16().unwrap_or(DEFAULT_TARGET_PORT))
     };
 
-    // Whatever rode past the head must not be lost. Plain HTTP re-forwards the
-    // whole request (head included); a CONNECT tunnel consumes the head and
-    // carries only the trailing bytes through the established tunnel.
+    // Preserve bytes trailing the head for upstream replay.
     let body_start = consumed.min(head_end);
     if tunnel {
         bytes.drain(..body_start);
@@ -278,8 +269,6 @@ async fn open_upstream(
         _ if request.tunnel => {
             connect_http(&mut stream, &request.host, request.port, remaining()?).await?
         }
-        // Plain HTTP forwarding through an HTTP-style proxy needs no handshake:
-        // the client already sent an absolute-form request.
         _ => {}
     }
     Ok(stream)
@@ -290,8 +279,7 @@ fn target_uri(scheme: &str, host: &str, port: u16) -> anyhow::Result<hyper::Uri>
         .with_context(|| format!("invalid target authority {host}:{port}"))
 }
 
-/// CONNECT handshake toward an HTTP-style upstream, mirroring the validator's
-/// tunnel handshake but leaving the stream raw for the relay.
+/// Tunnel HTTP-style upstreams and leave streams raw for relay.
 async fn connect_http(
     stream: &mut TcpStream,
     host: &str,
@@ -350,7 +338,6 @@ mod tests {
     pub(super) const ECHO_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     const EXCHANGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// Raw echo target: answers every connection with a fixed reply.
     pub(super) async fn spawn_echo_target() -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -366,7 +353,6 @@ mod tests {
         address
     }
 
-    /// Dumb TCP relay standing in for an HTTP proxy upstream.
     pub(super) async fn spawn_relay_upstream(target: SocketAddr) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -454,8 +440,6 @@ mod auth_tests {
     use crate::rotator::Strategy;
     use std::net::SocketAddr;
 
-    /// Relay that speaks a minimal CONNECT for tunneling tests: on a CONNECT
-    /// request it dials the target, answers 200, and relays.
     async fn spawn_connect_upstream(target: SocketAddr) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -541,7 +525,6 @@ mod auth_tests {
         assert!(response.starts_with(b"HTTP/1.1 200 OK"), "{response:?}");
     }
 
-    /// Relay whose upstream target refuses connections.
     async fn spawn_dead_upstream(target: SocketAddr) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -570,9 +553,6 @@ mod auth_tests {
 
         let request = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let response = exchange(address, request.as_bytes()).await.unwrap();
-        // A relay that accepts TCP but closes without answering yields an
-        // empty response; a clean close is not distinguishable from a normal
-        // no-keep-alive reply, so the pool keeps the endpoint eligible.
         assert!(response.is_empty(), "{response:?}");
         assert_eq!(pool.ready(), 1, "a clean close must not evict the endpoint");
     }

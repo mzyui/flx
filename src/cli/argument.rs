@@ -6,8 +6,7 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 pub(crate) fn is_valid_type_value(value: &str) -> bool {
-    // Accept every token the protocol parser understands (including the
-    // `HTTP:Elite`-style anonymity annotations) in any `+` combination.
+    // Accept protocol tokens with anonymity annotations in `+` combinations.
     value
         .split('+')
         .all(|part| !part.is_empty() && flx::Protocol::from_str(part).is_ok())
@@ -321,8 +320,7 @@ pub struct FetchArgs {
     pub output: OutputOptions,
 }
 
-/// Judge defaults joined once for clap's `default_value`, so the CLI and the
-/// library cannot drift apart.
+/// Share judge defaults between CLI and library.
 static HTTP_JUDGE_DEFAULTS: LazyLock<String> =
     LazyLock::new(|| flx::validator::DEFAULT_HTTP_JUDGE_URLS.join(","));
 static HTTPS_JUDGE_DEFAULTS: LazyLock<String> =

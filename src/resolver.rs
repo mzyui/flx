@@ -22,9 +22,7 @@ static HTTP_IP_ENDPOINTS: [&str; 3] = [
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IP_BODY_BYTES: usize = 64;
 
-// DNS discovery (LOOKUP_TIMEOUT) is followed by the HTTPS fallback
-// (LOOKUP_TIMEOUT again) end-to-end, so the whole lookup is bounded to give
-// it a fixed budget independent of any probe deadline.
+// Bounds DNS plus HTTPS fallback within a fixed budget.
 const MY_IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PUBLIC_IP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -213,8 +211,7 @@ fn build_a_query(
     Ok(len + DNS_QUESTION_TAIL_LEN)
 }
 
-// The parser only reads A records, so an A-only name like `myip.opendns.com`
-// cannot fail the whole lookup the way an AAAA-querying strategy would.
+// Reads only A records; avoids AAAA-query failure modes.
 fn parse_dns_a_response(message: &[u8], query_id: u16) -> anyhow::Result<Ipv4Addr> {
     if message.len() < DNS_HEADER_LEN {
         anyhow::bail!("DNS response is shorter than its header");
@@ -307,10 +304,15 @@ pub fn cached_my_ip() -> Option<String> {
     MY_IP_CACHE.get().cloned()
 }
 
+/// Resolves the public IP, caching successes for the process lifetime.
+///
+/// Races DNS plus HTTPS endpoints within a fixed budget.
+///
+/// # Errors
+///
+/// Returns an error when every source fails or the lookup times out.
 pub async fn my_ip() -> anyhow::Result<String> {
-    // Cache the first successful resolution for the lifetime of the process.
-    // Failures are not stored, so a transient outage can be retried. Replaces
-    // the `cached` crate with a single `OnceCell`.
+    // Caches successes only; retries transient failures.
     MY_IP_CACHE
         .get_or_try_init(|| async {
             time::timeout(MY_IP_LOOKUP_TIMEOUT, resolve_public_ip())
@@ -324,10 +326,7 @@ pub async fn my_ip() -> anyhow::Result<String> {
 async fn resolve_public_ip() -> anyhow::Result<String> {
     let start_time = Instant::now();
 
-    // Race the live sources concurrently so the lookup finishes as soon as the
-    // fastest one succeeds, hiding at most one RTT behind the validator
-    // preflight. The disk cache is consulted only as a last resort so a stale
-    // entry never silently corrupts the anonymity label.
+    // Races live sources; consults disk cache only as last resort.
     let live = race_live_ip_sources().await;
     let ip = match live {
         Ok(ip) => {
@@ -530,7 +529,7 @@ mod tests {
         message.extend_from_slice(&name);
         message.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
         message.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
-        // CNAME answer whose rdata is a compressed name; must be skipped whole.
+        // Skips CNAME answers carrying compressed names.
         message.extend_from_slice(&[0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 0, 1, 0, 2, 0xC0, 0x0C]);
         message.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 10, 1, 2, 3]);
         assert_eq!(
@@ -569,7 +568,6 @@ mod tests {
         let plain = [1, b'a', 2, b'b', b'c', 0, 9];
         assert_eq!(skip_dns_name(&plain, 0), Some(6));
         assert_eq!(skip_dns_name(&plain, 5), Some(6));
-        // A label that overruns the buffer is malformed.
         assert_eq!(skip_dns_name(&plain, 6), None);
         assert_eq!(skip_dns_name(&plain, 100), None);
         let pointer = [3, b'w', b'w', b'w', 0xC0, 0x0C];

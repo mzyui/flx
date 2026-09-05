@@ -1,4 +1,4 @@
-//! Browser User-Agent rotation.
+//! Rotates browser User-Agent strings.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -15,7 +15,6 @@ static USER_AGENTS: [&str; 8] = [
 
 static CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-/// Returns the next browser User-Agent string from the pool.
 pub fn next_user_agent() -> &'static str {
     let index = CURSOR.fetch_add(1, Ordering::Relaxed) % USER_AGENTS.len();
     USER_AGENTS[index]

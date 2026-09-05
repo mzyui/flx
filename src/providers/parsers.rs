@@ -1,5 +1,3 @@
-//! Body parsers for proxy sources.
-
 use std::{borrow::Cow, cell::Cell, collections::HashMap, net::Ipv4Addr, sync::LazyLock};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -14,8 +12,7 @@ use crate::proxy::models::{Anonymity, Protocol};
 
 pub type ParsedProxy = (Ipv4Addr, u16, Option<Protocol>);
 const VISITOR_STOPPED: &str = "flx parser visitor stopped";
-// Longest IPv4 literal is 15 bytes ("255.255.255.255"); headroom covers a
-// UTF-8 char mid-sequence before the overflow guard rejects the payload.
+// Reserve headroom for split UTF-8 sequences before rejecting overflow.
 const PROXYNOVA_IP_BUFFER_LEN: usize = 64;
 const BASE64_ROW_BUFFER_LEN: usize = 256;
 
@@ -167,15 +164,11 @@ where
     .deserialize(&mut deserializer);
     match result {
         Ok(()) => Ok(()),
-        // The visitor aborted the walk on purpose (early stop); every other
-        // error is a genuine parse problem. Detecting the stop via the flag
-        // avoids formatting the error message just to compare strings.
+        // Treat visitor-initiated stop as success; other errors are parse failures.
         Err(_error) if stopped.get() => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
-
-// ── Compile-once regexes ──────────────────────────────────────────────
 
 static RE_PROXYNOVA_OFFSET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"code\s*-\s*(\d+)").unwrap());
@@ -233,11 +226,9 @@ pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
         .next()
         .unwrap_or(text)
         .trim();
-    // Strip a scheme prefix such as `http://1.2.3.4:8080`.
     let head = head.rsplit("//").next().unwrap_or(head);
 
-    // Take the first two colon-separated fields so that any further trailer
-    // (country name, latency, ...) is discarded rather than read as the port.
+    // Discard trailing fields like country or latency after ip:port.
     let mut fields = head.split(':');
     let ip = fields.next()?.trim().parse().ok()?;
     let port = fields.next()?.trim().parse().ok()?;
@@ -245,8 +236,7 @@ pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
 }
 
 pub fn visit_plaintext(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
-    // Some sources prepend a UTF-8 BOM to the first line, which would corrupt
-    // the first `ip:port` pair.
+    // Strip leading BOM corrupting the first ip:port pair.
     let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     for row in body
         .lines()
@@ -260,9 +250,6 @@ pub fn visit_plaintext(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
 
 #[derive(Deserialize)]
 struct GeonodeRow<'a> {
-    // `Cow` borrows when the JSON string has no escapes (always, in practice)
-    // and falls back to an owned copy only for escaped sequences, which plain
-    // `&'a str` cannot represent.
     ip: Cow<'a, str>,
     port: Cow<'a, str>,
     #[serde(default)]
@@ -288,18 +275,12 @@ pub fn visit_geonode(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) -> 
 
 #[derive(Deserialize)]
 struct ProxyNovaRow<'a> {
-    // `Cow` borrows when the JSON string has no escapes; the obfuscated ip
-    // payload routinely contains escaped quotes, so a bare `&'a str` would
-    // reject rows the owned parser previously accepted.
     ip: Cow<'a, str>,
     #[serde(deserialize_with = "deserialize_port")]
     port: Option<u16>,
 }
 
-/// ProxyNova ships the port as either a JSON string or number; the visitor
-/// parses both without buffering a `serde_json::Value` (one owned String per
-/// row in the old path). Non-parseable ports become `None`, mirroring the old
-/// `Number::as_u64` fallback for negative/float numbers.
+/// Accept string or numeric ProxyNova ports without buffering JSON values.
 fn deserialize_port<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
 where
     D: Deserializer<'de>,
@@ -361,10 +342,9 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
     let mut buffer = [0u8; PROXYNOVA_IP_BUFFER_LEN];
     let mut len = 0usize;
 
-    // Leading char-code array, e.g. `[51,49,51].map(code => fromCharCode(code-1))`.
+    // Decode leading char-code array like `[51,49].map(code => fromCharCode(code-1))`.
     if let Some(start) = raw.find('[') {
         if let Some(end) = raw[start..].find(']').map(|i| start + i) {
-            // The `code-N` offset applied to every entry (defaults to 0).
             let offset: i64 = RE_PROXYNOVA_OFFSET
                 .captures(raw)
                 .and_then(|caps| caps.get(1)?.as_str().parse().ok())
@@ -385,7 +365,6 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
         }
     }
 
-    // Trailing `atob("...")` base64 literal.
     if let Some(caps) = RE_PROXYNOVA_ATOB.captures(raw) {
         if let Some(text) = caps.get(1) {
             if let Ok(written) = BASE64.decode_slice(text.as_str(), &mut buffer[len..]) {
@@ -456,8 +435,7 @@ fn find_column(by_text: &HashMap<&str, usize>, lower: &[String], names: &[&str])
         .position(|cell| names.iter().any(|name| cell.contains(name)))
 }
 
-/// Parses a port cell, falling back to its last whitespace token when the
-/// full text fails (proxydb hides a numeric prefix in a `display:none` div).
+/// Parse port cell using last token to skip proxydb hidden prefix.
 fn parse_port(text: &str) -> Result<u16, std::num::ParseIntError> {
     let trimmed = text.trim();
     match trimmed.parse::<u16>() {
@@ -545,8 +523,7 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
             let mut https_cell: Option<Cow<'_, str>> = None;
             let mut anon_cell: Option<Cow<'_, str>> = None;
 
-            // Normalize only the columns we actually need, instead of
-            // materializing a Vec<String> for every cell of every row.
+            // Normalize only needed columns to avoid allocating every cell.
             for (index, cell) in row.select(&CELL_SELECTOR).enumerate() {
                 if index == columns.ip {
                     ip_cell = Some(normalized_text(cell));
@@ -570,7 +547,6 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
                 continue;
             };
 
-            // Prefer an explicit protocol column, then the yes/no "Https" column.
             let mut protocol = type_cell.as_deref().and_then(protocol_from_str);
             if protocol.is_none() {
                 if let Some(cell) = https_cell.as_deref() {
@@ -579,10 +555,7 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
                     }
                 }
             }
-            // Carry the source-claimed anonymity through for HTTP and HTTPS
-            // rows alike: the table's anonymity column describes the proxy
-            // regardless of connect scheme. Other protocols have no anonymity
-            // notion.
+            // Apply anonymity column to HTTP/HTTPS rows; other protocols ignore it.
             if let (Some(current), Some(cell)) = (protocol, anon_cell.as_deref()) {
                 let level = anonymity_from_str(cell);
                 protocol = match current {
@@ -801,8 +774,6 @@ mod tests {
 
     #[test]
     fn plaintext_ignores_colon_delimited_trailer() {
-        // hideip.me ships `ip:port:Country`; the country must not be read
-        // as the port.
         let body = "186.182.6.191:3129:Argentina\n119.93.83.106:8082:Philippines\n";
         let parsed = parse_plaintext(body);
         assert_eq!(parsed.len(), 2);
@@ -821,8 +792,6 @@ mod tests {
 
     #[test]
     fn proxynova_decodes_charcode_and_atob_halves() {
-        // Real payload shape: `[..]` char codes offset by 1, concatenated with
-        // an atob() base64 tail. Decodes to 202.137.8.148.
         let body = r#"{"data":[{"ip":"[51,49,51,47,50,52,56,47,57,47].map((code) => String.fromCharCode(code-1)).join(\"\").concat(atob(\"MTQ4\"))","port":8080}]}"#;
         let parsed = parse_proxynova(body).unwrap();
         assert_eq!(parsed.len(), 1);
@@ -846,15 +815,11 @@ mod tests {
         let parsed = parse_html_table(body);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].1, 8080);
-        // The anonymity column describes the proxy regardless of the connect
-        // scheme, so an HTTPS row carries it just like an HTTP one.
         assert_eq!(parsed[0].2, Some(Protocol::Https(Anonymity::Elite)));
     }
 
     #[test]
     fn html_table_https_yes_without_anonymity_column_stays_unknown() {
-        // No anonymity column at all: the HTTPS flag alone must not invent a
-        // level.
         let body = r#"<table><tr><th>IP Address</th><th>Port</th><th>Https</th></tr>
             <tr><td>1.2.3.4</td><td>8080</td><td>yes</td></tr></table>"#;
         let parsed = parse_html_table(body);
@@ -863,7 +828,6 @@ mod tests {
 
     #[test]
     fn html_table_socks_rows_ignore_the_anonymity_column() {
-        // SOCKS has no anonymity notion; the cell must not be forced onto it.
         let body = r#"<table><tr><th>Proxy Type</th><th>IP ADDRESS</th><th>Port</th><th>Anonymity</th></tr>
             <tr><td>socks4</td><td>1.2.3.4</td><td>1080</td><td>elite proxy</td></tr></table>"#;
         let parsed = parse_html_table(body);
@@ -872,9 +836,6 @@ mod tests {
 
     #[test]
     fn html_table_columns_resolve_by_exact_name_and_substring_fallback() {
-        // "IP ADDRESS" hits the exact-match map; "Proxy Type" only matches by
-        // substring, exercising the linear-scan fallback over the
-        // pre-lowercased header cells.
         let body = r#"<table><tr><th>Proxy Type</th><th>IP ADDRESS</th><th>Port</th><th>Anonymity</th></tr>
             <tr><td>http</td><td>1.2.3.4</td><td>8080</td><td>elite proxy</td></tr>
             <tr><td>bad</td><td>x</td><td></td><td></td></tr></table>"#;
@@ -887,8 +848,7 @@ mod tests {
 
     #[test]
     fn html_table_defaults_to_first_two_columns_when_header_unknown() {
-        // A header row that matches no known name falls back to ip=0/port=1,
-        // matching the pre-fix `header_index(..).unwrap_or(..)` behavior.
+        // Fall back to ip=0/port=1 matching legacy header_index behavior.
         let body = r#"<table><tr><th>Foo</th><th>Bar</th></tr>
             <tr><td>1.2.3.4</td><td>8080</td></tr></table>"#;
         let parsed = parse_html_table(body);
@@ -954,8 +914,7 @@ mod tests {
 
     #[test]
     fn json_string_array_non_string_element_fails_the_whole_parse() {
-        // Locked parity with the owned `String` path: a non-string element
-        // aborts the stream (documented fail-fast, not skipped).
+        // Fail whole parse on non-string elements to match owned String path.
         let body = r#"["1.2.3.4:8080",42]"#;
         assert!(parse_json_strings(body).is_err());
     }

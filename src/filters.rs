@@ -1,5 +1,4 @@
-//! Post-validation filtering and ordering of proxy streams, shared by the
-//! library API and the CLI.
+//! Provides post-validation filtering and ordering.
 
 use std::{pin::Pin, sync::Arc, task::Poll};
 
@@ -7,28 +6,25 @@ use futures_util::Stream;
 
 use crate::proxy::models::{Anonymity, Protocol, Proxy};
 
-/// Field a buffered sort orders by.
+/// Selects the field a buffered sort orders by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortKey {
-    /// Aggregated average response time, fastest first when ascending.
+    /// Orders by average response time, fastest first.
     AvgResponseTime,
-    /// GeoIP country code.
+    /// Orders by GeoIP country code.
     Country,
-    /// Best anonymity rank across validated types.
+    /// Orders by best anonymity rank.
     Anonymity,
 }
 
-/// Direction a buffered sort applies to its key.
+/// Selects the direction a buffered sort applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortOrder {
     Asc,
     Desc,
 }
 
-/// Sorts proxies in place by `key`.
-///
-/// The CLI maps its string flags onto this; the stream API exposes it via
-/// [`ProxyStreamExt::into_sorted`].
+/// Sorts proxies in place by key.
 pub fn sort_proxies(proxies: &mut [Proxy], key: SortKey, order: SortOrder) {
     match key {
         SortKey::AvgResponseTime => proxies.sort_by(|a, b| {
@@ -46,8 +42,7 @@ pub fn sort_proxies(proxies: &mut [Proxy], key: SortKey, order: SortOrder) {
 
 const XSHIFT_GOLDEN: u64 = 0x9e3779b97f4a7c15;
 
-/// Fisher-Yates shuffle driven by a xorshift64 PRNG seeded from wall-clock
-/// time and the pid: one flag does not justify a `rand` dependency.
+/// Shuffles proxies via pid-seeded xorshift without rand.
 pub fn shuffle_proxies(proxies: &mut [Proxy]) {
     let mut state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -69,8 +64,7 @@ pub fn shuffle_proxies(proxies: &mut [Proxy]) {
     }
 }
 
-/// Best anonymity rank across a proxy's validated types; types without an
-/// anonymity level (SOCKS, CONNECT) count as `Unknown`.
+/// Ranks proxies by best anonymity, defaulting to Unknown.
 pub fn proxy_anonymity_rank(proxy: &Proxy) -> u8 {
     proxy
         .proxy_types
@@ -83,8 +77,7 @@ pub fn proxy_anonymity_rank(proxy: &Proxy) -> u8 {
         .unwrap_or_else(|| Anonymity::Unknown.rank())
 }
 
-/// Maps any protocol to the anonymity-agnostic form of its family, so an
-/// exclude-type filter naming `HTTP` also drops `HTTP:Elite` results.
+/// Strips anonymity so family filters match all levels.
 pub fn protocol_family(protocol: Protocol) -> Protocol {
     match protocol {
         Protocol::Http(_) => Protocol::Http(Anonymity::Unknown),
@@ -97,7 +90,7 @@ fn is_excluded(excluded: &[Protocol], proxy: &Proxy) -> bool {
     if excluded.is_empty() {
         return false;
     }
-    // Proxies without validated results are judged on their advertised set.
+    // Judges unvalidated proxies by their advertised set.
     let types: Vec<Protocol> = if proxy.proxy_types.is_empty() {
         proxy.expected_types.to_vec()
     } else {
@@ -110,22 +103,15 @@ fn is_excluded(excluded: &[Protocol], proxy: &Proxy) -> bool {
     })
 }
 
-/// Composable post-validation filters and buffered ordering over any
-/// `Stream<Item = Proxy>`, delivered via a blanket impl.
-///
-/// Filtering is lazy per item; [`into_sorted`](ProxyStreamExt::into_sorted)
-/// and [`shuffled`](ProxyStreamExt::shuffled) must buffer the whole upstream
-/// before emitting anything — an O(n) cost the names make explicit.
+/// Extends proxy streams with filters and buffered ordering.
 pub trait ProxyStreamExt: Stream<Item = Proxy> + Sized {
-    /// Keeps proxies whose best anonymity rank reaches `min`. SOCKS and
-    /// CONNECT count as `Anonymity::Unknown` (the highest rank).
+    /// Keeps proxies reaching the minimum anonymity rank.
     fn filter_min_anonymity(self, min: Anonymity) -> Filtered<Self> {
         let min_rank = min.rank();
         Filtered::new(self, move |proxy| proxy_anonymity_rank(proxy) >= min_rank)
     }
 
-    /// Keeps proxies with at least one HTTP/HTTPS type whose anonymity is in
-    /// `levels`.
+    /// Keeps proxies with an HTTP(S) type in levels.
     fn filter_levels(self, levels: impl IntoIterator<Item = Anonymity>) -> Filtered<Self> {
         let levels: Arc<[Anonymity]> = levels.into_iter().collect();
         Filtered::new(self, move |proxy| {
@@ -139,29 +125,28 @@ pub trait ProxyStreamExt: Stream<Item = Proxy> + Sized {
         })
     }
 
-    /// Keeps proxies whose average response time is at least `seconds`.
+    /// Keeps proxies averaging at least the given seconds.
     fn filter_min_response_time(self, seconds: f64) -> Filtered<Self> {
         Filtered::new(self, move |proxy| proxy.avg_response_time() >= seconds)
     }
 
-    /// Keeps proxies whose average response time is at most `seconds`.
+    /// Keeps proxies averaging at most the given seconds.
     fn filter_max_response_time(self, seconds: f64) -> Filtered<Self> {
         Filtered::new(self, move |proxy| proxy.avg_response_time() <= seconds)
     }
 
-    /// Drops proxies matching any excluded protocol family. Unvalidated
-    /// proxies fall back to their advertised types, mirroring the CLI.
+    /// Drops proxies matching any excluded protocol family.
     fn exclude_types(self, excluded: impl IntoIterator<Item = Protocol>) -> Filtered<Self> {
         let excluded: Arc<[Protocol]> = excluded.into_iter().collect();
         Filtered::new(self, move |proxy| !is_excluded(&excluded, proxy))
     }
 
-    /// Buffers everything upstream, sorts by `key`, then emits the result.
+    /// Buffers upstream, then emits sorted proxies.
     fn into_sorted(self, key: SortKey, order: SortOrder) -> BufferedStream<Self> {
         BufferedStream::new(self, Finish::Sort(key, order))
     }
 
-    /// Buffers everything upstream, shuffles it, then emits the result.
+    /// Buffers upstream, then emits shuffled proxies.
     fn shuffled(self) -> BufferedStream<Self> {
         BufferedStream::new(self, Finish::Shuffle)
     }
@@ -169,7 +154,7 @@ pub trait ProxyStreamExt: Stream<Item = Proxy> + Sized {
 
 impl<T: Stream<Item = Proxy>> ProxyStreamExt for T {}
 
-/// A stream adapter applying a synchronous per-item predicate.
+/// Applies a per-item predicate to a proxy stream.
 pub struct Filtered<S> {
     inner: Pin<Box<S>>,
     predicate: Box<dyn Fn(&Proxy) -> bool>,
@@ -217,7 +202,7 @@ enum BufferedState {
     Emitting(std::vec::IntoIter<Proxy>),
 }
 
-/// Stream adapter that buffers its upstream before re-emitting.
+/// Buffers upstream before re-emitting proxies.
 pub struct BufferedStream<S> {
     inner: Pin<Box<S>>,
     state: BufferedState,
@@ -322,15 +307,12 @@ mod tests {
 
     #[tokio::test]
     async fn min_anonymity_filter_keeps_unknown_ranked_proxies() {
-        // Unknown (SOCKS/CONNECT) ranks highest on purpose; see AGENTS invariants.
         let proxies = vec![
             validated(1, Protocol::Http(Anonymity::Transparent), 0.1),
             validated(2, Protocol::Http(Anonymity::Elite), 0.1),
             validated(3, Protocol::Socks5, 0.1),
         ];
         let kept = collect(stream::iter(proxies).filter_min_anonymity(Anonymity::Elite)).await;
-        // Elite (rank 2) and SOCKS/CONNECT-as-Unknown (rank 3) survive; only
-        // Transparent falls below the bar.
         assert_eq!(
             kept.iter().map(|p| p.port).collect::<Vec<_>>(),
             [8082, 8083]

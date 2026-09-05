@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-/// IP address class distinguishing residential from hosted networks.
+/// Classify addresses as residential, hosted, or mobile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IpType {
@@ -11,8 +11,7 @@ pub enum IpType {
     Unknown,
 }
 
-// Curated seed of well-known cloud and hosting ASNs; maintenance required as
-// provider assignments shift over time.
+// Curated hosting ASNs; refresh when assignments shift.
 const HOSTING_ASNS: &[u32] = &[
     174, 2906, 8075, 8560, 12222, 12876, 13335, 13415, 14061, 14618, 15169, 16265, 16276, 16509,
     16625, 19318, 19551, 20454, 20473, 20940, 21859, 24940, 26496, 29802, 31898, 33070, 35540,
@@ -99,8 +98,7 @@ fn has_keyword(name: &str, keywords: &[&str]) -> bool {
     let name_bytes = name.as_bytes();
     keywords.iter().any(|keyword| {
         let keyword_bytes = keyword.as_bytes();
-        // Case-insensitive substring scan without allocating a lowercase copy
-        // on every classification.
+        // Scan case-insensitively without allocating a lowercase copy.
         keyword_bytes.is_empty()
             || name_bytes
                 .windows(keyword_bytes.len())
@@ -192,8 +190,6 @@ mod tests {
     #[test]
     fn keyword_match_is_case_insensitive_without_allocation() {
         use super::{has_hosting_keyword, has_keyword, has_mobile_keyword, MOBILE_KEYWORDS};
-        // Uppercase / mixed-case occurrences must match like the old lowercase
-        // scan did, and an absent keyword must not.
         assert!(has_mobile_keyword("PT Telkomsel Indonesia"));
         assert!(has_mobile_keyword("telkomsel"));
         assert!(!has_keyword("Azteca DEploy", MOBILE_KEYWORDS));

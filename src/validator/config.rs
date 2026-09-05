@@ -14,7 +14,6 @@ pub const DEFAULT_HTTPS_JUDGE_URLS: &[&str] = &[
     "https://wfuchs.de/azenv.php",
 ];
 
-/// Configuration for the proxy validator.
 pub struct Config {
     pub concurrency_limit: usize,
     pub request_timeout: u64,
@@ -24,15 +23,15 @@ pub struct Config {
     pub http_judge_urls: Vec<String>,
     pub https_judge_urls: Vec<String>,
     pub insecure: bool,
-    /// Probe requested types that the proxy's advertised set does not cover.
+    /// Probe requested types missing from advertised set.
     pub probe_missed_types: bool,
-    /// Require the judge to echo back the request's cookie header.
+    /// Require judge to echo request cookie header.
     pub support_cookies: bool,
-    /// Require the judge to echo back the request's referer header.
+    /// Require judge to echo request referer header.
     pub support_referer: bool,
-    /// Pause between validation attempts of the same proxy.
+    /// Delay retries of the same proxy.
     pub retry_delay: Duration,
-    /// Emit a machine-readable report for every failed probe.
+    /// Emit machine-readable report for every failed probe.
     pub report_failures: bool,
 }
 

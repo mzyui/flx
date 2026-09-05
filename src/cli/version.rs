@@ -6,8 +6,7 @@ use std::{
 
 const VERSION_CHECK_URL: &str = "https://raw.githubusercontent.com/mzyui/flx/main/Cargo.toml";
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-// Skip the network round-trip for a day so a repeated run does not hit the
-// upstream on every invocation.
+// Cache version checks for a day to avoid per-run network hits.
 const VERSION_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn version_cache_path() -> Option<PathBuf> {
@@ -16,7 +15,7 @@ fn version_cache_path() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Latest known version from a fresh on-disk cache, if any.
+/// Load the latest known version from fresh on-disk cache.
 pub(crate) fn cached_latest_version() -> Option<String> {
     let path = version_cache_path()?;
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
@@ -33,7 +32,7 @@ pub(crate) fn cached_latest_version() -> Option<String> {
     }
 }
 
-/// Persist the latest known version atomically for `VERSION_CACHE_TTL`.
+/// Persist the latest known version atomically.
 pub(crate) fn cache_latest_version(version: &str) {
     let Some(path) = version_cache_path() else {
         return;
@@ -44,7 +43,7 @@ pub(crate) fn cache_latest_version(version: &str) {
     }
 }
 
-/// Returns true when `latest` is a newer release than `current`.
+/// Report whether `latest` is newer than `current`.
 pub fn check_version(current: &str, latest: &str) -> bool {
     fn parse(version: &str) -> Vec<u64> {
         version

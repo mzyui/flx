@@ -10,9 +10,7 @@ use serde::{Serialize, Serializer};
 
 use crate::{error::ProtocolParseError, error::ProxyParseError, geolookup::models::GeoData};
 
-// ── RuntimeStats ──────────────────────────────────────────────────────
-
-/// Running statistics for response-time tracking.
+/// Track running response-time statistics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RuntimeStats {
     pub count: u32,
@@ -22,7 +20,7 @@ pub struct RuntimeStats {
 }
 
 impl RuntimeStats {
-    /// Records a timing sample.
+    /// Record timing sample.
     pub fn record(&mut self, secs: f64) {
         self.count += 1;
         self.total += secs;
@@ -34,7 +32,6 @@ impl RuntimeStats {
         }
     }
 
-    /// Average response time in seconds.
     pub fn avg(&self) -> f64 {
         if self.count == 0 {
             0.0
@@ -44,9 +41,6 @@ impl RuntimeStats {
     }
 }
 
-// ── Anonymity ─────────────────────────────────────────────────────────
-
-/// Anonymity level of a proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Anonymity {
     Elite,
@@ -56,7 +50,7 @@ pub enum Anonymity {
 }
 
 impl Anonymity {
-    /// Numeric rank from least to most anonymous.
+    /// Rank anonymity from least to most anonymous.
     pub fn rank(self) -> u8 {
         match self {
             Anonymity::Transparent => 0,
@@ -67,9 +61,6 @@ impl Anonymity {
     }
 }
 
-// ── Protocol ─────────────────────────────────────────────────────────
-
-/// Protocol that a proxy supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Protocol {
     Http(Anonymity),
@@ -132,9 +123,6 @@ impl FromStr for Protocol {
     }
 }
 
-// ── ProxyType ─────────────────────────────────────────────────────────
-
-/// A proxy type with protocol and checked status.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyType {
     pub protocol: Protocol,
@@ -144,7 +132,6 @@ pub struct ProxyType {
 }
 
 impl ProxyType {
-    /// Creates a new ProxyType with the specified protocol.
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
@@ -152,7 +139,7 @@ impl ProxyType {
             checked_on: 0.0,
         }
     }
-    /// Creates a checked ProxyType with the current timestamp.
+    /// Mark protocol checked with current timestamp.
     pub fn checked(protocol: Protocol) -> Self {
         Self {
             protocol,
@@ -165,10 +152,7 @@ impl ProxyType {
     }
 }
 
-// ── Serialization helpers ─────────────────────────────────────────────
-
-// Newtype so the `type` key can be serialized from a borrowed field inside
-// the manual `Proxy` serializer.
+// Serialize borrowed type key inside manual Proxy serializer.
 struct TypesRef<'a>(&'a [ProxyType]);
 
 impl serde::Serialize for TypesRef<'_> {
@@ -184,9 +168,7 @@ impl serde::Serialize for TypesRef<'_> {
     }
 }
 
-// ── Proxy ─────────────────────────────────────────────────────────────
-
-/// A validated proxy endpoint with metadata.
+/// Represent validated proxy endpoint with metadata.
 #[derive(Debug, Clone)]
 pub struct Proxy {
     pub ip: Ipv4Addr,
@@ -198,8 +180,7 @@ pub struct Proxy {
     pub(crate) text: Arc<str>,
 }
 
-// Hand-written instead of derived so the latency statistics split out of the
-// single `runtimes` field while keeping every historical JSON key intact.
+// Split latency stats while keeping historical JSON keys intact.
 impl serde::Serialize for Proxy {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -242,7 +223,7 @@ impl Proxy {
         proxy
     }
 
-    /// Fastest recorded end-to-end response time in seconds (0 when unsampled).
+    /// Report fastest response time, or 0 when unsampled.
     pub fn min_response_time(&self) -> f64 {
         if self.runtimes.count == 0 {
             0.0
@@ -251,12 +232,12 @@ impl Proxy {
         }
     }
 
-    /// Slowest recorded end-to-end response time in seconds (0 when unsampled).
+    /// Report slowest response time, or 0 when unsampled.
     pub fn max_response_time(&self) -> f64 {
         self.runtimes.max
     }
 
-    /// Number of recorded response-time samples.
+    /// Count recorded response-time samples.
     pub fn sample_count(&self) -> u32 {
         self.runtimes.count
     }
@@ -281,17 +262,16 @@ impl Default for Proxy {
 }
 
 impl Proxy {
-    /// Average response time in seconds.
     pub fn avg_response_time(&self) -> f64 {
         self.runtimes.avg()
     }
 
-    /// Returns the proxy in ip:port format.
+    /// Format proxy as ip:port text.
     pub fn as_text(&self) -> &str {
         &self.text
     }
 
-    /// Serializes the proxy as compact JSON.
+    /// Serialize proxy as compact JSON.
     pub fn as_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|error| {
             #[cfg(feature = "log")]
@@ -302,7 +282,7 @@ impl Proxy {
         })
     }
 
-    /// Serializes the proxy as pretty-printed JSON.
+    /// Serialize proxy as pretty-printed JSON.
     pub fn as_pretty_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|error| {
             #[cfg(feature = "log")]
@@ -341,12 +321,11 @@ impl Display for Proxy {
 impl FromStr for Proxy {
     type Err = ProxyParseError;
 
-    /// Parses a proxy from text like "1.2.3.4:8080" or "http://1.2.3.4:8080".
+    /// Parse proxy from "1.2.3.4:8080" or scheme-prefixed text.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
 
-        // Detect a scheme prefix so the protocol can be extracted, then strip
-        // it so the parse_pair helper sees a clean `ip:port` head.
+        // Strip scheme prefix so helper sees clean ip:port head.
         let (scheme, rest) = if let Some(rest) = s.strip_prefix("http://") {
             (Some("http"), rest)
         } else if let Some(rest) = s.strip_prefix("https://") {
@@ -473,8 +452,7 @@ mod tests {
 
     #[test]
     fn typo_qualifier_falls_back_to_unknown_wildcard() {
-        // Regression test: a misspelled anonymity qualifier falls back to
-        // `Unknown` instead of inventing a concrete anonymity.
+        // Guard fallback to Unknown on misspelled qualifier.
         assert_eq!(
             "HTTP:Elit".parse::<Protocol>().unwrap(),
             Protocol::Http(Anonymity::Unknown)
@@ -483,12 +461,10 @@ mod tests {
             "HTTPS:Anonimous".parse::<Protocol>().unwrap(),
             Protocol::Https(Anonymity::Unknown)
         );
-        // A well-formed qualifier still parses to a concrete anonymity.
         assert_eq!(
             "HTTP:Elite".parse::<Protocol>().unwrap(),
             Protocol::Http(Anonymity::Elite)
         );
-        // A missing qualifier defaults to Unknown wildcard.
         assert_eq!(
             "HTTP".parse::<Protocol>().unwrap(),
             Protocol::Http(Anonymity::Unknown)

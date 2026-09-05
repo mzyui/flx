@@ -43,22 +43,25 @@ use crate::{
 
 pub(crate) const FETCH_CHANNEL_CAPACITY: usize = 2_048;
 
-/// Hard budget for the primary provider phase before the fallback decides.
+/// Bound primary phase runtime before fallback decision.
 pub const PRIMARY_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Async stream of scraped proxy candidates.
+/// Stream scraped proxy candidates to consumers.
+///
+/// Build with [`ProxyFetcher::gather`]; the stream yields deduplicated
+/// proxies until providers are exhausted or `stop` fires.
 pub struct ProxyFetcher {
-    receiver: mpsc::Receiver<Proxy>, // Channel receiver for receiving proxies.
-    counter: usize,                  // Counter for tracking the number of fetched proxies.
-    timer: time::Instant,            // Timer for measuring elapsed time.
-    elapsed: Option<Duration>,       // Duration of the fetcher operation.
-    geolookup: Option<GeoLookup>,    // Optional GeoIP instance for location lookups.
-    countries: HashSet<String>,      // Normalized ISO country filter.
-    excluded_countries: HashSet<String>, // Normalized ISO country exclusion filter.
-    ip_type_filter: Option<IpType>,  // Optional IP-type filter.
+    receiver: mpsc::Receiver<Proxy>,
+    counter: usize,
+    timer: time::Instant,
+    elapsed: Option<Duration>,
+    geolookup: Option<GeoLookup>,
+    countries: HashSet<String>,
+    excluded_countries: HashSet<String>,
+    ip_type_filter: Option<IpType>,
     unique_ips: DedupTable,
     coordinator: JoinHandle<()>,
-    config: Config, // Configuration for the proxy fetcher.
+    config: Config,
     accepted: Arc<AtomicUsize>,
     drain_notify: Arc<Notify>,
     prefetched: Option<Proxy>,
@@ -68,12 +71,21 @@ pub struct ProxyFetcher {
 }
 
 impl ProxyFetcher {
+    /// Scrapes providers and streams deduplicated candidates.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Providers, timeouts, cache, and GeoIP filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid configs (zero concurrency, country or
+    /// IP-type filter without GeoIP) or GeoIP init failures.
     pub async fn gather(config: Config) -> anyhow::Result<Self> {
         if config.concurrency_limit == 0 {
             anyhow::bail!("config.concurrency_limit must be greater than zero");
         }
-        // A country filter is meaningless without GeoIP lookup, so reject the
-        // combination up front instead of silently dropping every proxy.
+        // Reject country filter without GeoIP instead of dropping everything.
         if (!config.countries.is_empty() || !config.excluded_countries.is_empty())
             && !config.enable_geo_lookup
         {
@@ -152,9 +164,7 @@ impl ProxyFetcher {
 
         let client = {
             let mut http = HttpConnector::new();
-            // Dead hosts hang on TCP connect far longer than the per-source
-            // deadline would wait; cap the connect phase so blocked providers
-            // fail in seconds instead of burning their full fetch timeout.
+            // Cap TCP connect so dead hosts fail fast.
             http.set_connect_timeout(Some(Duration::from_secs(6)));
             http.enforce_http(false);
             Arc::new(
@@ -169,8 +179,7 @@ impl ProxyFetcher {
         let offline = config.offline;
         let fetch_delay = config.fetch_delay;
 
-        // The local body cache is optional and best-effort: if the cache dir
-        // cannot be prepared the run simply proceeds without caching.
+        // Proceed without caching when the cache dir is unusable.
         let fetch_cache = match config.cache_ttl {
             Some(ttl) => match cache::Cache::new(ttl, config.refresh_cache) {
                 Ok(cache) => Some(Arc::new(cache)),
@@ -186,10 +195,7 @@ impl ProxyFetcher {
 
         let throttle = Arc::new(Throttle::new());
 
-        // Proxies are counted by the consumer as they are accepted, so the
-        // coordinator can size up the primary phase without any extra channel
-        // hop or forwarding task. The tally reflects proxies that survived
-        // dedup and country filtering, which is what a threshold should mean.
+        // Size primary phase from accepted count without extra channel hop.
         let produced = Arc::clone(&accepted);
 
         let drain_notify = Arc::new(Notify::new());
@@ -202,10 +208,7 @@ impl ProxyFetcher {
 
         let (stage_tx, stages) = mpsc::channel(16);
 
-        // Coordinator: runs the primary phase to completion (bounded by
-        // PRIMARY_PHASE_TIMEOUT), then decides whether to run the fallback.
-        // A `watch` stop-signal lets the consumer abort the primary phase
-        // early when the threshold is already satisfied.
+        // Run primary phase, then decide fallback; stop signal aborts early.
         let coordinator = tokio::spawn({
             let sender = sender.clone();
             async move {
@@ -231,7 +234,6 @@ impl ProxyFetcher {
                 let mut primary_aborted = false;
                 tokio::select! {
                     _ = async { while primary_handles.join_next().await.is_some() {} } => {
-                        // primary phase completed naturally
                     }
                     _ = stop_rx_coordinator.changed() => {
                         primary_handles.abort_all();
@@ -260,10 +262,7 @@ impl ProxyFetcher {
                     return;
                 }
 
-                // Wait until the consumer has drained the channel so the
-                // primary counter is stable before evaluating the fallback
-                // threshold.  Notify is a zero-cost signal: the consumer
-                // calls `notify_one` when it detects the channel is empty.
+                // Drain channel before threshold check to stabilize counter.
                 wait_for_drain(&sender, &drain_notify_coordinator).await;
 
                 let found = produced.load(Ordering::Relaxed);
@@ -337,10 +336,7 @@ impl ProxyFetcher {
     }
 }
 
-// Waits until the consumer has emptied the channel buffer so the produced
-// counter is stable. A `notify_one` fired before this task registered as a
-// waiter leaves a stale stored permit, so every wakeup must re-verify the
-// real condition (empty buffer) instead of trusting the signal alone.
+// Reverify empty buffer on wakeup; stale permits must not end the wait.
 async fn wait_for_drain(tx: &mpsc::Sender<Proxy>, notify: &Notify) {
     while tx.capacity() < tx.max_capacity() {
         let drained = notify.notified();
@@ -384,15 +380,12 @@ impl ProxyFetcher {
         }
     }
 
-    /// Cloneable handle to the number of proxies accepted so far.
-    ///
-    /// The count grows as candidates survive dedup and country filtering; read
-    /// it after the stream ends to report a final tally.
+    /// Share accepted-proxy count with consumers.
     pub fn accepted_handle(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.accepted)
     }
 
-    /// Consumes this fetcher's gathering-phase events for this run.
+    /// Take gathering-phase events for this run.
     pub fn stage_events(&mut self) -> Option<mpsc::Receiver<FetchStage>> {
         self.stages.take()
     }
@@ -420,11 +413,7 @@ impl ProxyFetcher {
         };
         let result = accept_proxy(&mut ctx, proxy, |ip| {
             self.geolookup.as_ref().map(|geolookup| {
-                // mmdb reads are memory-mapped binary searches (µs each, two
-                // per proxy). On the multi-thread runtime move them off the
-                // worker's task accounting so a cold page-cache hit does not
-                // stall the executor; `block_in_place` would panic on a
-                // current-thread runtime, so fall back to a direct read there.
+                // Move mmdb reads off async workers; read directly inline otherwise.
                 let do_lookup = || geolookup.lookup(ip);
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle)
@@ -439,9 +428,7 @@ impl ProxyFetcher {
         });
         if result.is_some() {
             if let Some(threshold) = self.config.fallback_threshold {
-                // Signal the stop atomically: `compare_exchange` ensures
-                // only the first caller crossing the threshold sends, so the
-                // watch version is bumped exactly once per run.
+                // Bump stop version exactly once via atomic compare-exchange.
                 if self.accepted.load(Ordering::Relaxed) >= threshold
                     && self
                         .stop_signaled
@@ -550,8 +537,7 @@ impl Stream for ProxyFetcher {
 
 impl Drop for ProxyFetcher {
     fn drop(&mut self) {
-        // Closing the receiver makes every pending `send` fail, which unwinds
-        // the producing tasks on their own so they don't outlive us.
+        // Fail pending sends to unwind producers before aborting coordinator.
         self.receiver.close();
 
         self.coordinator.abort();
@@ -706,8 +692,7 @@ mod tests {
 
     #[test]
     fn protocol_hash_preserves_protocol_set_equality() {
-        // Regression test: the dedup key is a `u64` hash of the advertised
-        // protocol set, so identical sets collide and distinct sets stay distinct.
+        // Guard u64 dedup key: identical sets collide, distinct sets differ.
         let http = Arc::from([Protocol::Http(Anonymity::Unknown)]);
         let socks5 = Arc::from([Protocol::Socks5]);
         let both = Arc::from([Protocol::Socks5, Protocol::Http(Anonymity::Unknown)]);
@@ -723,8 +708,7 @@ mod tests {
 
     #[test]
     fn dedup_table_is_bounded_and_evicts_oldest() {
-        // Regression test: the dedup table has a fixed capacity and drops the
-        // oldest entry, so an evicted endpoint can be accepted again.
+        // Guard bounded dedup table evicting oldest entries.
         let mut table = DedupTable::with_capacity(2);
         let base = Ipv4Addr::new(192, 0, 2, 1);
         let key = |offset: u16| (base, offset, 7u64);
@@ -859,11 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_wait_survives_stale_notify_permits() {
-        // Regression test: the consumer signals a drain whenever it finds
-        // the channel empty; a signal fired before the coordinator
-        // registered as a waiter leaves one stored permit behind. The old
-        // single `notified().await` consumed it instantly and evaluated the
-        // fallback threshold while items were still buffered.
+        // Guard drain wait against stale notify permits.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Proxy>(4);
         for port in 8000u16..8003 {
             tx.send(Proxy::new(Ipv4Addr::new(192, 0, 2, 1), port))
@@ -881,13 +861,10 @@ mod tests {
             "a stale permit must not end the drain wait while items are buffered"
         );
 
-        // A real drain followed by a fresh signal must release the wait. The
-        // consumer runs as a task so the waiter is woken by the signal rather
-        // than by the short-circuit empty-buffer check.
+        // Release the wait only on real drain plus fresh signal.
         let consumer_notify = Arc::clone(&notify);
         let consumer = tokio::spawn(async move {
-            // `recv` parks forever on an empty-but-open channel, so drain
-            // with `try_recv`.
+            // Drain with try_recv; recv would park forever on open channel.
             while rx.try_recv().is_ok() {}
             consumer_notify.notify_one();
         });
@@ -913,8 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn gather_rejects_country_filter_without_geo_lookup() {
-        // Regression test: requesting a country filter while GeoIP lookup
-        // is disabled must fail fast instead of silently dropping every proxy.
+        // Guard fast failure for country filter without GeoIP.
         let config = Config {
             countries: Arc::from(vec!["ID".to_owned()]),
             enable_geo_lookup: false,
@@ -941,15 +917,13 @@ mod tests {
 
     #[tokio::test]
     async fn gather_allows_country_filter_with_geo_lookup() {
-        // Happy path: with GeoIP on, the config check passes before
-        // `GeoLookup::new()`, so a missing DB surfaces a different error and
-        // never the guard error.
+        // Pass guard with GeoIP on; only geo-DB errors may surface.
         let config = Config {
             countries: Arc::from(vec!["ID".to_owned()]),
             enable_geo_lookup: true,
             ..Config::default()
         };
-        // Expect either success or a geo-DB error, but NOT the guard error.
+        // Accept success or geo-DB error, never the guard error.
         match ProxyFetcher::gather(config).await {
             Ok(_) => {}
             Err(e) => assert!(
@@ -1021,8 +995,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_events_report_phases_then_done() {
-        // `cache_ttl: None` keeps the run fully offline (no cached rows can
-        // stall the coordinator on the drain wait the test never performs).
+        // Disable cache to keep the run fully offline.
         let mut fetcher = ProxyFetcher::gather(Config {
             offline: true,
             cache_ttl: None,
@@ -1139,10 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn finish_phase_returns_true_when_primary_completes() {
-        // Regression test: when the primary phase finishes within the
-        // timeout (no stall), `finish_phase` must report success so the
-        // coordinator proceeds to the fallback phase with a stable primary
-        // counter rather than aborting healthy tasks.
+        // Guard fallback proceeding when primary finishes in time.
         let mut handles = JoinSet::new();
         handles.spawn(async {});
         assert!(finish_phase(handles, Duration::from_secs(5)).await);
@@ -1180,9 +1150,7 @@ mod tests {
 
     #[tokio::test]
     async fn throttle_spaces_concurrent_same_host_requests_cumulatively() {
-        // Regression test: each caller used to record its own arrival time,
-        // so three concurrent arrivals all woke around t0+delay together.
-        // Projected slots must space them one `delay` apart instead.
+        // Guard cumulative spacing for concurrent same-host requests.
         let throttle = Arc::new(Throttle::new());
         let delay = Duration::from_millis(100);
         let start = tokio::time::Instant::now();

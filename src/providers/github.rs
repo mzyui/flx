@@ -140,8 +140,7 @@ impl ProxyProvider for GithubRepoProvider {
                         Protocol::Http(_) | Protocol::Https(_) => Source::http(&url),
                         _ => Source::typed(&url, *protocol),
                     };
-                    // Some of these lists are multi-megabyte; the 3s default
-                    // truncates them mid-download.
+                    // Extend timeout; some lists are multi-megabyte and exceed default.
                     source.map(|source| source.with_timeout(Duration::from_secs(20)))
                 })
                 .collect(),

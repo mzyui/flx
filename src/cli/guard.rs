@@ -8,7 +8,7 @@ use tokio::sync::watch;
 #[cfg(feature = "progress_bar")]
 use super::progress;
 
-/// A hook that hides the progress UI around each stdout write.
+/// Hide progress UI around stdout writes.
 pub trait OutputGuard {
     fn before_write(&self);
     fn after_write(&self);
@@ -44,12 +44,7 @@ impl<B: OutputGuard> OutputGuard for OutputGuardEither<B> {
     }
 }
 
-/// Whether stdout is a pipe (FIFO) rather than a terminal or a regular file.
-///
-/// A piped stdout means a downstream process writes to the shared terminal (or
-/// `2>&1` routes our own stderr into the pipe), so a stderr summary would mix
-/// with that output. Regular-file redirects (`> out`) leave the terminal free
-/// and are safe to keep the summary.
+/// Detect piped stdout sharing the terminal.
 #[cfg(unix)]
 pub(crate) fn stdout_is_pipe() -> bool {
     use std::os::unix::io::AsRawFd as _;
@@ -111,7 +106,6 @@ pub fn make_warmup(
     None
 }
 
-// No-op warmup bar for builds without the `progress_bar` feature.
 #[cfg(not(feature = "progress_bar"))]
 pub struct WarmupBar;
 

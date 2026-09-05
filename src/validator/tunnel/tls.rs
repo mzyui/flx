@@ -46,8 +46,7 @@ pub(super) async fn verify_tls_judge(
     if body.len() > MAX_JUDGE_RESPONSE_BYTES {
         anyhow::bail!("TLS judge response exceeds validation limit");
     }
-    // The token is pure ASCII, so a lossy string scan finds it with one O(n)
-    // sub-string search.
+    // Scan ASCII token with single substring search.
     let body = String::from_utf8_lossy(&body);
     if !body.contains(&target.response_marker) {
         anyhow::bail!("response did not originate from the TLS judge");

@@ -1,4 +1,4 @@
-//! Plain HTTP negotiation.
+//! Negotiate plain HTTP connections.
 
 use super::NegotiatorTrait;
 

@@ -1,9 +1,4 @@
-//! Minimal replacement for the unmaintained `status-line` crate.
-//!
-//! Repaints a `Display` value on stderr at a fixed cadence from a
-//! background thread and erases it on drop. Terminal detection uses
-//! `std::io::IsTerminal` instead of `atty`, which carries an unpatched
-//! unaligned-read advisory and is abandoned upstream.
+//! Repaint status lines on stderr at a fixed cadence.
 
 use std::fmt::Display;
 use std::io::{IsTerminal as _, Write};
@@ -13,9 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-// Same escapes the `ansi-escapes` crate emitted for the original
-// implementation: erase from cursor to screen end, jump to start of line,
-// then walk back up once per embedded newline.
+// Erase to screen end, return to line start, then step up per newline.
 const ERASE_DOWN: &str = "\x1b[J";
 const CURSOR_LEFT: &str = "\x1b[1000D";
 const CURSOR_PREV_LINE: &str = "\x1b[F";
@@ -47,15 +40,10 @@ fn clear(ansi: bool) {
     clear_to(&mut std::io::stderr().lock(), ansi);
 }
 
-/// Controls how the status line renders.
+/// Control how the status line renders.
 pub struct Options {
-    /// Refresh period of the background redraw thread. Defaults to 100 ms on
-    /// a TTY stderr and 1 s when stderr is redirected.
     pub refresh_period: Duration,
-    /// Whether the line shows as soon as the `StatusLine` is created.
     pub initially_visible: bool,
-    /// Enables ANSI escapes (erase-and-rewrite). When off, every refresh
-    /// prints the value on a fresh line instead.
     pub enable_ansi_escapes: bool,
 }
 
@@ -75,19 +63,19 @@ struct State<D> {
     visible: AtomicBool,
 }
 
-/// Wraps arbitrary displayable data and repaints it on stderr periodically.
+/// Repaint displayable data on stderr periodically.
 pub struct StatusLine<D: Display> {
     state: Arc<State<D>>,
     options: Options,
 }
 
 impl<D: Display + Send + Sync + 'static> StatusLine<D> {
-    /// Creates a status line with default options, visible immediately.
+    /// Create a status line with default options.
     pub fn new(data: D) -> StatusLine<D> {
         Self::with_options(data, Options::default())
     }
 
-    /// Creates a status line with custom options.
+    /// Create a status line with custom options.
     pub fn with_options(data: D, options: Options) -> StatusLine<D> {
         let state = Arc::new(State {
             data,
@@ -95,8 +83,7 @@ impl<D: Display + Send + Sync + 'static> StatusLine<D> {
         });
         let state_ref = Arc::clone(&state);
         thread::spawn(move || {
-            // Runs while the `StatusLine` is alive; dropping it drops the
-            // thread's only peer strong reference and ends the loop.
+            // Stop when the StatusLine drops its last external reference.
             while Arc::strong_count(&state_ref) > 1 {
                 if state_ref.visible.load(Ordering::Acquire) {
                     redraw(options.enable_ansi_escapes, &state_ref.data);
@@ -109,12 +96,12 @@ impl<D: Display + Send + Sync + 'static> StatusLine<D> {
 }
 
 impl<D: Display> StatusLine<D> {
-    /// Repaints immediately, skipping the background thread's cadence.
+    /// Repaint immediately without waiting for the cadence.
     pub fn refresh(&self) {
         redraw(self.options.enable_ansi_escapes, &self.state.data);
     }
 
-    /// Shows or hides the status line, clearing it when hidden.
+    /// Show or hide the status line.
     pub fn set_visible(&self, visible: bool) {
         let was_visible = self.state.visible.swap(visible, Ordering::Release);
         if !visible && was_visible {
@@ -124,7 +111,6 @@ impl<D: Display> StatusLine<D> {
         }
     }
 
-    /// Returns whether the status line is currently visible.
     pub fn is_visible(&self) -> bool {
         self.state.visible.load(Ordering::Acquire)
     }

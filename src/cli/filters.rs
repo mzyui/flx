@@ -23,7 +23,7 @@ fn anonymity_from_name(name: &str) -> Option<Anonymity> {
     }
 }
 
-/// Post-validation filters applied before a proxy is rendered.
+/// Filter validated proxies before rendering.
 pub struct ProxyFilter {
     min_anonymity_rank: Option<u8>,
     levels: Vec<Anonymity>,

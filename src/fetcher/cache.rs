@@ -1,4 +1,4 @@
-//! Local cache of parsed proxy rows.
+//! Cache parsed proxy rows on disk.
 
 use std::{
     net::Ipv4Addr,
@@ -14,12 +14,9 @@ use crate::{
 };
 
 const ORPHANED_TMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-// Binary cache header. `CACHE_MAGIC` guards the row encoding described in
-// `decode_rows`; bump it any time that encoding or a source parser changes so
-// stale rows are rejected instead of replayed.
+// Bump on encoding or parser changes to reject stale rows.
 const CACHE_MAGIC: &[u8; 8] = b"FLXPCW02";
 
-/// Local cache of parsed proxy rows.
 pub struct Cache {
     dir: PathBuf,
     ttl: Duration,
@@ -122,17 +119,7 @@ impl Cache {
     }
 }
 
-// ── Binary row encoding (see CACHE_MAGIC) ─────────────────────────────
-//
-// Row layout: [4 bytes IP octets][2 bytes port LE][1 byte protocol code],
-// plus 2 extra bytes for the CONNECT port code.
-//
-// Protocol code table:
-//   0 = none
-//   1..=4 = HTTP(Elite|Transparent|Anonymous|Unknown)
-//   5..=8 = HTTPS(Elite|Transparent|Anonymous|Unknown)
-//   9 = SOCKS4, 10 = SOCKS5
-//   11 = CONNECT (followed by u16 LE port)
+// Row layout: IP(4) + port(2 LE) + proto code(1) + optional CONNECT port(2).
 
 fn anon_code(anonymity: Anonymity) -> u8 {
     match anonymity {
@@ -383,7 +370,6 @@ mod tests {
             Some(Protocol::Connect(443)),
         )];
         let full = binary_rows(&rows);
-        // Turn a full row into a truncated one mid-row.
         assert!(decode_rows(&full[..full.len() - 1]).is_none());
     }
 

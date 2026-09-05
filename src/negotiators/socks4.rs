@@ -74,20 +74,16 @@ impl NegotiatorTrait for Socks4Negotiator {
             })
             .context("SOCKS4 target URI has no port")?;
 
-        // SOCKS4 CONNECT request: VN=4, CD=1, DST.PORT (big-endian), DST.IP,
-        // USERID, NULL terminator. A non-IPv4 host goes through the 0.0.0.1
-        // domain-name fallback. Built into a stack buffer; no heap unless the
-        // host is pathologically long.
+        // Build SOCKS4 CONNECT request; use domain fallback for non-IPv4 hosts.
         let mut packet_buf = [0u8; 512];
         let packet = Self::build_connect_request(&mut packet_buf, host, port);
 
-        // Transmit the request, then read the 8-byte reply.
         stream.write_all(&packet).await?;
 
         let mut response = [0u8; 8];
         stream.read_exact(&mut response).await?;
 
-        // The reply is [VN, CD, DST.PORT, DST.IP] with CD signalling success.
+        // Reply layout is [VN, CD, DST.PORT, DST.IP]; CD signals success.
         let mut response_slice = &response[..];
         if response_slice.read_u8().await? != 0 {
             anyhow::bail!("InvalidData: invalid response version");

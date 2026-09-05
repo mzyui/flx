@@ -1,4 +1,4 @@
-//! Rotating proxy pool shared by the local serve endpoint.
+//! Share validated proxies across serve connections.
 
 use std::{
     collections::hash_map::RandomState,
@@ -26,11 +26,10 @@ impl PoolEntry {
     }
 }
 
-/// Thread-safe pool of validated proxies with rotation and health tracking.
+/// Rotates validated proxies with failure cooldowns.
 ///
-/// Selection is O(1) under contention-free reads: a cursor (round-robin) or a
-/// hash sample (random) picks the starting index and at most one lock-held scan
-/// skips proxies in cooldown.
+/// Picks via [`RotatorPool::pick`]; unhealthy proxies cool down instead of
+/// being dropped immediately.
 pub struct RotatorPool {
     entries: Mutex<Vec<PoolEntry>>,
     cursor: AtomicUsize,
@@ -46,7 +45,7 @@ impl RotatorPool {
         }
     }
 
-    /// Adds a proxy, rejecting duplicates and entries beyond the pool cap.
+    /// Add a proxy while rejecting duplicates and over-cap inserts.
     pub fn add(&self, proxy: Proxy) -> bool {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= MAX_POOL_SIZE {
@@ -72,7 +71,7 @@ impl RotatorPool {
         self.len() == 0
     }
 
-    /// Number of proxies outside their failure cooldown.
+    /// Count proxies outside failure cooldown.
     pub fn ready(&self) -> usize {
         self.entries
             .lock()
@@ -82,7 +81,9 @@ impl RotatorPool {
             .count()
     }
 
-    /// Picks the next available proxy, scanning past cooldown entries.
+    /// Picks the next available proxy, skipping cooldown entries.
+    ///
+    /// Returns `None` when the pool is empty or all entries are cooling down.
     pub fn pick(&self) -> Option<Arc<Proxy>> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.is_empty() {
@@ -107,8 +108,7 @@ impl RotatorPool {
             entry.cooldown_until = None;
         }
     }
-    /// Counts a failure; repeated failures cool the proxy down and finally
-    /// evict it so dead endpoints cannot dominate the rotation.
+    /// Cool down repeated failures and evict dead endpoints.
     pub fn report_failure(&self, proxy: &Proxy) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let text = proxy.as_text();
@@ -126,8 +126,7 @@ impl RotatorPool {
 }
 
 fn random_below(total: usize) -> usize {
-    // No `rand` dependency: a fresh `RandomState` per draw is enough entropy
-    // for rotation and costs a few multiplications, not a syscall.
+    // Sample RandomState without a rand dependency.
     let hash = RandomState::new().hash_one(total);
     (hash % total as u64) as usize
 }

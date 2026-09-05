@@ -39,7 +39,6 @@ impl NegotiatorTrait for HttpsNegotiator {
         proxy_host: &str,
         uri: &Uri,
     ) -> anyhow::Result<()> {
-        // Configure the connect authority from the target URI.
         if let Some(host) = uri.host() {
             let port = uri.port_u16().unwrap_or(443);
             let mut authority_buf = [0u8; 256];
@@ -47,7 +46,7 @@ impl NegotiatorTrait for HttpsNegotiator {
             let mut request_buf = [0u8; 1024];
             let connect_request = Self::write_connect_request(&mut request_buf, &authority);
 
-            // CONNECT only makes sense when tunnelling to an HTTPS target.
+            // CONNECT only applies when tunnelling to an HTTPS target.
             if !uri.scheme().is_some_and(|s| s.as_str() == "https") {
                 anyhow::bail!("Scheme is empty or not https");
             }

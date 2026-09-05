@@ -25,16 +25,12 @@ fn find_from(args: &[&str]) -> FindArgs {
 
 #[test]
 fn bare_flx_has_no_subcommand() {
-    // A bare invocation parses with no command; `run_application` turns
-    // that into a help message instead of an implicit run.
     let cli = Cli::parse_from(["flx"]);
     assert!(cli.command.is_none());
 }
 
 #[test]
 fn bare_flx_rejects_fetch_flags() {
-    // Fetch-only flags must be spelled `flx grab ...`; a bare invocation
-    // that carries no subcommand cannot carry subcommand-scoped flags.
     assert!(Cli::try_parse_from(["flx", "--dry-run"]).is_err());
 }
 
@@ -448,7 +444,6 @@ fn https_judge_urls_flag_parses_custom_value() {
         cli.validator.https_judge_urls,
         vec!["https://example.com/azenv.php".to_owned()]
     );
-    // default still intact when flag omitted
     let defaults = find_from(&["SOCKS5"]);
     assert_eq!(
         defaults.validator.https_judge_urls,
@@ -573,7 +568,6 @@ fn and_group_deduplicates_repeated_members() {
 fn default_format_switches_to_json_lines_when_piped() {
     assert_eq!(effective_format("default", None, true), "default");
     assert_eq!(effective_format("default", None, false), "json-lines");
-    // Explicit formats are never overridden.
     assert_eq!(effective_format("json", None, false), "json");
     assert_eq!(effective_format("pretty-json", None, false), "pretty-json");
 }
@@ -594,7 +588,6 @@ fn default_format_follows_output_file_extension() {
     assert_eq!(effective_format("default", f("a.csv"), true), "csv");
     assert_eq!(effective_format("default", f("a.pac"), true), "pac");
     assert_eq!(effective_format("default", f("a.txt"), true), "default");
-    // The extension only infers when the format is still `default`.
     assert_eq!(effective_format("json", f("a.txt"), true), "json");
 }
 
@@ -602,7 +595,6 @@ fn default_format_follows_output_file_extension() {
 fn geo_update_subcommand_is_accepted() {
     let cli = Cli::parse_from(["flx", "geo-update"]);
     assert!(matches!(cli.command, Some(Command::GeoUpdate)));
-    // a bare invocation carries no command
     let bare = Cli::parse_from(["flx"]);
     assert!(bare.command.is_none());
 }
@@ -666,7 +658,6 @@ fn run_json(proxies: &[Proxy], limit: usize) -> String {
     let (options, path) = output_options("json", limit);
     rt.block_on(async {
         let s = stream::iter(proxies.to_vec());
-        // Tests never cancel: use a notify that never fires.
         process_result(
             s,
             options,
@@ -686,7 +677,6 @@ fn run_json(proxies: &[Proxy], limit: usize) -> String {
 fn json_empty_yields_empty_array() {
     let out = run_json(&[], 0);
     assert_eq!(out, "[]\n", "empty source must produce valid []");
-    // must parse as JSON
     serde_json::from_str::<serde_json::Value>(&out).unwrap();
 }
 
@@ -713,12 +703,10 @@ fn json_empty_is_suppressed_when_requested() {
     });
     let content = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
-    // The empty document is left to a later pass, so nothing is written.
     assert_eq!(content, "");
 }
 
-// Runs the two chained passes of `find`'s fallback flow against one output
-// file and returns the resulting file contents.
+// Run chained find passes against one output file.
 fn run_chained_passes(format: &str, pass1: &[Proxy], pass2: &[Proxy]) -> String {
     let rt = runtime::Builder::new_current_thread().build().unwrap();
     let (options, path) = output_options(format, 0);
@@ -867,8 +855,6 @@ fn tee_recorder_forwards_and_records_candidates() {
         .map(|port| Proxy::new(std::net::Ipv4Addr::LOCALHOST, port))
         .collect();
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
-    // Plain `Proxy::new` candidates advertise nothing, so every one of them
-    // is a missed-probe candidate regardless of the requested list.
     let requested: Arc<[Protocol]> = Arc::from(vec![Protocol::Http(Anonymity::Unknown)]);
     let rt = runtime::Builder::new_current_thread().build().unwrap();
     let forwarded = rt.block_on(async {
@@ -889,8 +875,6 @@ fn tee_recorder_forwards_and_records_candidates() {
 
 #[test]
 fn tee_recorder_skips_candidates_the_fallback_would_discard() {
-    // An advertised set covering every requested type can never yield a
-    // missed probe, so the recorder must not pay a deep copy for it.
     let covering = Proxy::with_expected_types(
         std::net::Ipv4Addr::new(192, 168, 0, 9),
         9000,
@@ -943,9 +927,7 @@ fn json_multiple_is_valid_array() {
 
 #[test]
 fn json_one_entry_per_line_with_trailing_commas() {
-    // Regression: entries used to leave a blank line and put the comma on
-    // its own removed line. Each proxy must sit on its own line with the
-    // comma at the end of the previous line and `]` alone on the last.
+    // Guard one-entry-per-line JSON layout without blank lines.
     let proxies = [sample_proxy(1), sample_proxy(2), sample_proxy(3)];
     let out = run_json(&proxies, 0);
     let lines: Vec<&str> = out.lines().collect();
@@ -969,7 +951,6 @@ fn json_limit_truncates_without_trailing_comma() {
         sample_proxy(3),
         sample_proxy(4),
     ];
-    // limit 2 -> exactly 2 elements, valid JSON, no trailing comma
     let out = run_json(&proxies, 2);
     let parsed: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed.len(), 2);
@@ -1011,7 +992,6 @@ fn json_lines_one_proxy_produces_one_line() {
     let out = run_json_lines(&[sample_proxy(1)], 0);
     let parsed = parse_json_lines(&out);
     assert_eq!(parsed.len(), 1);
-    // No array brackets, no trailing comma
     assert!(!out.contains('['));
     assert!(!out.contains(']'));
 }
@@ -1368,7 +1348,6 @@ fn proxychains_falls_back_to_http_for_http_proxy() {
 
 #[test]
 fn prefix_defaults_to_http_scheme_without_types() {
-    // A bare proxy carries no validated type; the URI must not claim SOCKS.
     let out = run_prefix(&[sample_proxy(3)], 0);
     assert_eq!(out, "http://192.168.0.3:8083\n");
 }
@@ -1607,9 +1586,7 @@ fn append_csv_skips_duplicate_header() {
     );
 }
 
-// Yields its items, fires the graceful-cancel permit once they are done,
-// and never completes afterwards — the shape of an upstream run that keeps
-// going after Ctrl+C was pressed.
+// Stream items then hold cancel permits like a live upstream.
 struct CancelAfterStream {
     items: std::vec::IntoIter<Proxy>,
     cancel: Arc<tokio::sync::Notify>,
@@ -1638,7 +1615,6 @@ impl futures_util::Stream for CancelAfterStream {
         }
         if !self.fired {
             self.fired = true;
-            // Like the SIGINT task: a stored permit survives until polled.
             self.cancel.notify_one();
             cx.waker().wake_by_ref();
         }
@@ -1719,15 +1695,12 @@ fn process_result_cancel_during_shuffle_collect_preserves_the_set() {
 
 #[test]
 fn second_ctrl_c_press_forces_the_exit() {
-    // One press stays on the graceful path; another press must quit.
     assert!(!should_force_exit(1));
     assert!(should_force_exit(2));
     assert!(should_force_exit(3));
 }
 
-// Yields its items in order and records whether any item past `allowed`
-// ever left the stream — the marker of an upstream that kept running after
-// the output limit had already been satisfied.
+// Record items leaking past the output limit.
 struct EarlyStopProbe {
     items: std::vec::IntoIter<Proxy>,
     allowed: usize,
@@ -1806,8 +1779,6 @@ fn process_result_sort_stops_collecting_once_the_limit_is_reached() {
         "the upstream must be dropped once enough results exist"
     );
 
-    // First-arrival semantics: the first three matches are kept and sorted
-    // among themselves — a global best-of-three would be [0.1, 0.2, 0.7].
     let content = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     let rows = parse_json_lines(&content);
@@ -2001,7 +1972,6 @@ fn run_stats_caps_top_countries_and_collapses_the_remainder() {
         .collect();
 
     let summary = run_with_stats(&proxies).expect("non-empty summary");
-    // Equal counts tie-break alphabetically.
     assert_eq!(summary, "top: CO 1, DE 1, HK 1, +2 more");
 }
 

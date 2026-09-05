@@ -1,4 +1,4 @@
-//! Proxy handshake negotiators.
+//! Negotiate proxy handshakes per protocol.
 
 mod http;
 mod https;
@@ -15,7 +15,7 @@ pub use socks4::Socks4Negotiator;
 pub use socks5::Socks5Negotiator;
 use tokio::net::TcpStream;
 
-/// Handshake behaviour for a proxy protocol.
+/// Negotiate handshake for a proxy protocol.
 #[async_trait]
 pub trait NegotiatorTrait {
     async fn negotiate(
@@ -27,12 +27,12 @@ pub trait NegotiatorTrait {
         Ok(())
     }
 
-    /// Whether the connection must be upgraded to TLS after negotiation.
+    /// Report whether negotiation requires TLS upgrade.
     fn with_tls(&self) -> bool {
         false
     }
 
-    /// Emits a `trace`-level log line prefixed with `proxy_host`.
+    /// Log trace line prefixed with proxy_host.
     fn log_trace<S>(&self, _proxy_host: &str, _msg: S)
     where
         S: Display,
@@ -41,10 +41,7 @@ pub trait NegotiatorTrait {
         log::trace!("{}: {}", _proxy_host, _msg);
     }
 
-    /// Emits an `error`-level log line prefixed with `proxy_host`.
-    ///
-    /// Only forwarded when the configured level is `Trace`, so a noisy error
-    /// cannot drown out genuinely higher-priority messages.
+    /// Log error line prefixed with proxy_host.
     fn log_error<S>(&self, _proxy_host: &str, _msg: S)
     where
         S: Display,

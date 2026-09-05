@@ -9,7 +9,7 @@ use hyper::Uri;
 
 use crate::proxy::models::{Anonymity, Protocol};
 
-/// Bundles the default protocols and scrape mode for a provider body.
+/// Bundle default protocols with the scrape mode for a provider body.
 pub struct ScrapeContext {
     pub default_types: Arc<[Protocol]>,
     pub mode: ScrapeMode,
@@ -27,7 +27,6 @@ pub enum ScrapeMode {
     GatherProxyJs,
 }
 
-/// Priority tier of a proxy provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProviderTier {
     Primary,
@@ -42,7 +41,7 @@ pub struct Source {
     pub mode: ScrapeMode,
 }
 
-/// Default protocol set assigned to sources that advertise none.
+/// Supply fallback protocols for sources advertising none.
 static COMMON_SOURCE_PROTOCOLS: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| {
     Arc::from([
         Protocol::Http(Anonymity::Unknown),
@@ -71,29 +70,24 @@ impl Source {
         })
     }
 
-    /// Overrides how this source's response body is parsed.
     pub fn with_mode(mut self, mode: ScrapeMode) -> Self {
         self.mode = mode;
         self
     }
 
-    /// Overrides the per-request timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Creates a `Source` for a single well-known protocol.
     pub fn typed(url: &str, protocol: Protocol) -> anyhow::Result<Self> {
         Self::new(url, vec![protocol])
     }
 
-    /// Creates a `Source` with default common protocols.
     pub fn all(url: &str) -> anyhow::Result<Self> {
         Self::new(url, vec![])
     }
 
-    /// Creates a `Source` with default types for HTTP protocols.
     pub fn http(url: &str) -> anyhow::Result<Self> {
         Self::new(
             url,
@@ -107,13 +101,12 @@ impl Source {
         )
     }
 
-    /// Creates a `Source` with default types for SOCKS protocols.
     pub fn socks(url: &str) -> anyhow::Result<Self> {
         Self::new(url, vec![Protocol::Socks4, Protocol::Socks5])
     }
 }
 
-/// Keeps only the sources whose URL parsed successfully.
+/// Filter sources to those whose URL parsed successfully.
 pub fn valid_sources(sources: Vec<anyhow::Result<Source>>) -> Vec<Source> {
     sources
         .into_iter()

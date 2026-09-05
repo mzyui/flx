@@ -86,15 +86,13 @@ impl NegotiatorTrait for Socks5Negotiator {
             })
             .context("SOCKS5 target URI has no port")?;
 
-        // CONNECT request: VER=5, CMD=1, RSV=0, ATYP, DST.ADDR, DST.PORT (BE).
-        // Built into a stack buffer; RFC 1928 bounds the domain to 255 bytes.
+        // Build SOCKS5 CONNECT request; domain names stay within 255 bytes.
         let mut packet_buf = [0u8; 512];
         let connection_packet = Self::build_connect_request(&mut packet_buf, host, port)?;
 
         stream.write_all(&connection_packet).await?;
 
-        // Parse the reply header [VER, REP, RSV, ATYP], then discard the
-        // variable-length bound address and trailing port.
+        // Parse reply header, then discard bound address and port.
         let mut response_buf = [0; 4];
         stream.read_exact(&mut response_buf).await?;
 
@@ -114,8 +112,7 @@ impl NegotiatorTrait for Socks5Negotiator {
             }
             address_type => anyhow::bail!("InvalidData: invalid response ATYP: {address_type}"),
         };
-        // Discard the variable-length bound address and trailing port (the
-        // domain ATYP caps the length at 255, so 257 bytes always fit).
+        // Discard bound address tail and trailing port.
         let mut tail_buf = [0u8; 258];
         let tail_len = address_length + 2;
         stream.read_exact(&mut tail_buf[..tail_len]).await?;

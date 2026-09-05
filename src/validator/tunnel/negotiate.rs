@@ -125,8 +125,7 @@ pub(super) async fn negotiate_socks5(
 }
 
 async fn read_discard(stream: &mut BufReader<TcpStream>, length: usize) -> anyhow::Result<()> {
-    // ATYP-bound addresses are at most 255 bytes, so a stack buffer avoids a
-    // heap allocation per SOCKS handshake.
+    // Use stack buffer; ATYP bounds addresses to 255 bytes.
     let mut bytes = [0u8; 256];
     if length > bytes.len() {
         anyhow::bail!("SOCKS reply address exceeds 256 bytes");

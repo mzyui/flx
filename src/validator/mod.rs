@@ -65,7 +65,10 @@ fn report_dropped(url: &str, reason: &str) {
     let _ = (url, reason);
 }
 
-/// Validates proxy candidates against online judges.
+/// Validate proxy candidates against online judges.
+///
+/// The validator itself is a [`Stream`] of passing proxies; use
+/// [`ProxyValidator::validate`] to build it.
 pub struct ProxyValidator {
     receiver: mpsc::Receiver<Proxy>,
     progress: ValidationProgress,
@@ -83,10 +86,7 @@ struct JudgeTargets {
     tunnel: Arc<checker::JudgePool>,
 }
 
-// Reuses a verified judge pool across passes of one run (a `find` fallback
-// pass repeats `validate`, which would otherwise re-run the online preflight).
-// A strong ref with a short TTL lets pass-2 reuse pass-1's pool without
-// unbounded growth in long-lived processes.
+// Reuse verified judge pool across passes within short TTL.
 const JUDGE_POOL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -136,9 +136,7 @@ fn cache_judge_pool(urls: &[String], insecure: bool, pool: &Arc<checker::JudgePo
         );
 }
 
-// Builds a judge pool, retrying the whole preflight once after a short delay
-// so a transient network blip cannot abort the run. Returns the pool plus a
-// snapshot of which candidate judges passed or failed preflight.
+// Retry preflight once so transient blips cannot abort the run.
 async fn preflight_pool(
     urls: &[String],
     timeout: Duration,
@@ -147,8 +145,7 @@ async fn preflight_pool(
     const PREFLIGHT_RETRIES: usize = 1;
     const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
     if let Some(pool) = cached_judge_pool(urls, insecure) {
-        // Report real numbers so pass-2 does not print a misleading empty
-        // health report; no candidate failed again since none re-ran.
+        // Report real counts for cached pools without rerunning preflight.
         let report = JudgeHealthReport {
             candidates: unique_count(urls),
             healthy: pool.len(),
@@ -174,12 +171,7 @@ async fn preflight_pool(
         {
             Ok(pool) => {
                 let candidates = unique_count(urls);
-                // `build` returns as soon as the first judge passes, so the
-                // remaining preflights settle in the background; snapshot the
-                // report once every candidate has resolved or a short grace
-                // elapses. The cap keeps one slow straggler judge from holding
-                // up validation startup for the whole preflight timeout; the
-                // pool (not the report) stays authoritative either way.
+                // Snapshot report once candidates resolve or short grace elapses.
                 let deadline = tokio::time::Instant::now() + timeout + Duration::from_secs(1);
                 let grace = tokio::time::Instant::now() + Duration::from_millis(250);
                 loop {
@@ -211,7 +203,16 @@ fn unique_count(urls: &[String]) -> usize {
 }
 
 impl ProxyValidator {
-    /// Validates every proxy yielded by the source stream.
+    /// Validates every proxy from the source stream against online judges.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy_source` - Candidate stream, usually from [`Flx`](crate::Flx).
+    /// * `config` - Protocols, timeouts, and concurrency limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config is empty/invalid or judge preflight fails.
     pub async fn validate<S>(proxy_source: S, config: Config) -> anyhow::Result<Self>
     where
         S: Stream<Item = Proxy> + Send + 'static,
@@ -250,8 +251,7 @@ impl ProxyValidator {
         let manager_done = Arc::clone(&progress.done);
         let manager_passed = Arc::clone(&progress.passed);
         let expected: Arc<[Protocol]> = Arc::from(config.types.into_boxed_slice());
-        // Deduplicate protocols inside each AND group so a duplicated member
-        // can never double-probe the same slot or emit a duplicate record.
+        // Deduplicate group members to avoid double probes and records.
         let groups: Arc<Vec<Vec<Protocol>>> = Arc::new(
             config
                 .groups
@@ -270,8 +270,7 @@ impl ProxyValidator {
                 })
                 .collect(),
         );
-        // Flatten all groups once, so job expansion only clones the shared
-        // spec (no per-proxy allocation).
+        // Flatten groups once to avoid per-proxy allocation.
         let group_spec: Arc<Vec<(usize, usize, Protocol)>> = Arc::from(
             groups
                 .iter()
@@ -301,9 +300,7 @@ impl ProxyValidator {
             .chain(groups.iter().flatten())
             .any(|protocol| !matches!(protocol, Protocol::Http(_)));
 
-        // Buffer the proxy source while judge preflights run so the fetcher
-        // never stalls on a full channel. The buffer drains into the manager
-        // stream as soon as preflights complete, preserving backpressure after.
+        // Buffer source during preflight to avoid stalling the fetcher.
         let (buf_tx, buf_rx) = mpsc::channel(validator_channel_capacity(concurrency_limit));
         let proxy_source: Pin<Box<dyn Stream<Item = Proxy> + Send>> = {
             let mut src: Pin<Box<dyn Stream<Item = Proxy> + Send>> = Box::pin(proxy_source);
@@ -342,8 +339,7 @@ impl ProxyValidator {
                     .context("HTTPS online judge pool is empty after preflight")?;
             Ok::<_, anyhow::Error>(Some((pool, report)))
         };
-        // Warm the public-IP cache in parallel with judge preflights so the
-        // first probe does not pay a cold lookup inline on its deadline.
+        // Warm public-IP cache in parallel with judge preflights.
         let my_ip_warmup = async {
             let _ = crate::resolver::my_ip().await;
         };
@@ -380,15 +376,10 @@ impl ProxyValidator {
             mpsc::Receiver<GroupWorkResult>,
         ) = mpsc::channel(validator_channel_capacity(concurrency_limit));
 
-        // AND-group aggregator: correlates the per-protocol probes of each
-        // proxy+group and only forwards to the public channel once every slot
-        // reported. Any missing/failed slot drops the whole group. Runs
-        // concurrently so multi-type results stream out as they complete.
+        // Forward proxies only after every group slot reports.
         let aggregate_sender = sender.clone();
         let aggregate_progress = progress.clone();
-        // Shared by group workers so a failed member short-circuits its
-        // siblings; entries are evicted by the aggregator once a group
-        // completes.
+        // Share dead flags so failed members short-circuit siblings.
         let worker_group_dead: work::GroupDeadMap =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let group_aggregator = tokio::spawn(aggregate_groups(
@@ -415,24 +406,16 @@ impl ProxyValidator {
                 },
             }
 
-            // Shared by the worker tasks (`for_each_concurrent`). The `total`
-            // increment happens inside the `flat_map` closure below, which moves
-            // `manager_total`, so give the workers their own clone up front.
+            // Clone counters for workers; total moves into job closure.
             let worker_counters = ValidationProgress {
                 total: Arc::clone(&manager_total),
                 done: Arc::clone(&manager_done),
                 passed: Arc::clone(&manager_passed),
             };
 
-            // Expand each proxy into its singleton jobs (advertised-gated, OR
-            // semantics) plus its AND-group jobs (every member always probed).
-            // Monotonic per-run proxy identity for AND-group bookkeeping; an
-            // address would be unsafe because the allocator can hand a freed
-            // slot to a different proxy mid-run.
+            // Expand proxies into singleton plus group jobs with monotonic ids.
             let next_proxy_id = AtomicU64::new(0);
-            // `total` must use the same unit as `done`/`passed`: one per
-            // singleton job and one per (proxy, group), counted as jobs are
-            // emitted below.
+            // Count total in job units matching done/passed increments.
             let stream_total = Arc::clone(&manager_total);
             let jobs = proxy_source.flat_map(move |proxy: Proxy| {
                 let proxy = Arc::new(proxy);
@@ -456,10 +439,7 @@ impl ProxyValidator {
                 };
                 let has_group = !group_spec.is_empty();
 
-                // Singleton path, allocation-free: no `Vec` is built per proxy,
-                // `Protocol` is `Copy`, and both the advertised and requested
-                // lists are deduplicated so a duplicated entry can never yield
-                // a duplicate probe job.
+                // Build singleton jobs allocation-free; inputs stay deduplicated.
                 let singleton: futures_util::stream::BoxStream<'static, Job> = if has_singleton {
                     if probe_missed {
                         Box::pin(futures_util::stream::unfold(
@@ -581,8 +561,7 @@ impl ProxyValidator {
                         Job::Singleton { .. } => {
                             stream_total.fetch_add(1, Ordering::Relaxed);
                         }
-                        // A group is one unit of work regardless of member
-                        // count; slot 0 is emitted exactly once per group.
+                        // Count each group once via its slot-0 member.
                         Job::GroupMember { slot, .. } if *slot == 0 => {
                             stream_total.fetch_add(1, Ordering::Relaxed);
                         }
@@ -683,7 +662,7 @@ impl ProxyValidator {
         })
     }
 
-    /// Judge preflight results collected while the validator started.
+    /// Report judge preflight results collected at startup.
     pub fn judge_health(&self) -> &JudgeHealthReport {
         &self.judge_health
     }
@@ -692,7 +671,7 @@ impl ProxyValidator {
         self.progress.clone()
     }
 
-    /// Takes the receiver for machine-readable probe failures, when enabled.
+    /// Take failure receiver for machine-readable probe reports.
     pub fn take_failures(&mut self) -> Option<mpsc::Receiver<work::ProxyFailure>> {
         self.failures.take()
     }
@@ -844,8 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn validator_drop_closes_channel_without_panic() {
-        // Regression test: dropping a `ProxyValidator` closes the receiver and
-        // aborts the manager task synchronously without panicking.
+        // Guard synchronous panic-free drop closing receiver and manager.
         let config = Config {
             types: vec![Protocol::Socks5],
             ..Config::default()
@@ -854,8 +832,6 @@ mod tests {
             .await
             .unwrap();
         drop(validator);
-        // If the channel were still open, poll_next would just pending; the
-        // key property is that Drop runs synchronously and never panics.
     }
 
     #[test]
@@ -870,9 +846,7 @@ mod tests {
 
     #[tokio::test]
     async fn failure_report_emits_one_reason_per_failed_probe() {
-        // Offline-safe: the judge echoes the token during preflight, while
-        // every candidate points at a closed local port, so each probe fails
-        // fast with a classified reason.
+        // Probe closed ports via echo judge so failures stay fast and offline.
         let judge = spawn_echo_judge().await;
         let config = Config {
             types: vec![Protocol::Http(Anonymity::Unknown)],
@@ -920,10 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_advances_as_candidates_are_probed() {
-        // Offline-safe: a local judge echoes the request token for the
-        // preflight, while every candidate points at a closed local port, so
-        // each probe fails fast. Done and total must still advance even when
-        // nothing passes.
+        // Probe closed ports via echo judge to advance counters without passes.
         let judge = spawn_echo_judge().await;
         let config = Config {
             types: vec![Protocol::Http(Anonymity::Unknown)],
@@ -977,8 +948,7 @@ mod tests {
 
     #[tokio::test]
     async fn judge_preflight_retries_after_transient_failure() {
-        // Offline-safe: the judge drops the first connection and echoes the
-        // token on the second, so preflight must retry once to pass.
+        // Guard preflight retry passing after one transient drop.
         let judge = spawn_flaky_echo_judge().await;
         let config = Config {
             types: vec![Protocol::Http(Anonymity::Unknown)],
@@ -995,9 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_missed_types_probes_only_unmatched_types() {
-        // Offline-safe: candidates advertise `Socks5` while `Http(Unknown)`
-        // is requested, so the missed HTTP probe runs on each candidate
-        // (closed local ports make every probe fail fast).
+        // Probe unmatched types on closed ports for fast failures.
         let judge = spawn_echo_judge().await;
         let candidates = (1u16..=5)
             .map(|port| {
@@ -1028,8 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_missed_types_skips_already_covered_types() {
-        // Offline-safe: an advertised `Http` proxy is not probed again for a
-        // requested `Http` type when `probe_missed_types` is on.
+        // Skip reprobe when advertisement already covers the request.
         let judge = spawn_echo_judge().await;
         let candidate = Proxy::with_expected_types(
             std::net::Ipv4Addr::LOCALHOST,
@@ -1055,10 +1022,7 @@ mod tests {
 
     #[tokio::test]
     async fn total_counts_each_singleton_job_not_each_proxy() {
-        // Offline-safe: two advertised HTTP variants each satisfy the single
-        // requested type, so every candidate emits two singleton jobs. `total`
-        // must count jobs (two per proxy) exactly like `done` does — counting
-        // per proxy would let done/pass outrun total on multi-type runs.
+        // Guard job-based total matching done on multi-type runs.
         let judge = spawn_echo_judge().await;
         let candidates = (1u16..=2).map(|port| {
             Proxy::with_expected_types(
@@ -1089,11 +1053,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_failure_does_not_leak_to_the_next_candidate() {
-        // Offline-safe: the first AND-group candidate fails fast against a
-        // closed port; the second is backed by a mock HTTP proxy and must
-        // still be probed. Address-derived group keys could inherit the dead
-        // flag of the first candidate when the allocator reuses its slot;
-        // monotonic ids keep every candidate independently probeable.
+        // Guard monotonic ids keeping candidates independently probeable.
         let judge = spawn_echo_judge().await;
         let proxy_port = spawn_mock_http_proxy().await;
         let candidates = [
@@ -1125,9 +1085,7 @@ mod tests {
             .any(|pt| matches!(pt.protocol, Protocol::Http(_))));
     }
 
-    /// Spawns a minimal HTTP forward proxy: it answers every request with a
-    /// 200 whose body echoes the incoming `X-Fluxy-Token` header, which is
-    /// exactly the marker the judge check requires.
+    /// Spawn mock HTTP proxy echoing the judge token.
     async fn spawn_mock_http_proxy() -> u16 {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio::net::TcpListener;
@@ -1174,6 +1132,5 @@ mod tests {
         port
     }
 
-    // Judge fixtures live in the shared `crate::test_support` module.
     use crate::test_support::{spawn_echo_judge, spawn_flaky_echo_judge, spawn_no_echo_judge};
 }

@@ -1,6 +1,4 @@
-//! Platform base directories: only the two paths the crate needs, resolved
-//! with the same fallbacks as before (XDG variables are honored only when
-//! absolute, per the XDG spec).
+//! Resolves platform data and config directories.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -23,8 +21,7 @@ fn resolve_xdg(
         .or_else(|| home.map(|home| home.join(fallback)))
 }
 
-/// `BaseDirs::data_dir()`: XDG data home on Linux, `~/Library/Application
-/// Support` on macOS, `%APPDATA%\data` on Windows.
+/// Resolves the platform data directory.
 pub fn data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -34,8 +31,7 @@ pub fn data_dir() -> Option<PathBuf> {
     {
         #[cfg(windows)]
         {
-            // The known-folder lookup resolves RoamingAppData via FFI; the
-            // env var covers the practical cases without that dependency.
+            // Reads RoamingAppData without extra dependencies.
             std::env::var_os("APPDATA")
                 .map(PathBuf::from)
                 .filter(|base| base.is_absolute())
@@ -52,8 +48,7 @@ pub fn data_dir() -> Option<PathBuf> {
     }
 }
 
-/// `BaseDirs::config_dir()`: XDG config home on Linux, `~/Library/Application
-/// Support` on macOS, `%APPDATA%\config` on Windows.
+/// Resolves the platform config directory.
 pub fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {

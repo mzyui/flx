@@ -14,8 +14,7 @@ use models::{ScrapeContext, ScrapeMode, Source};
 use tokio::time;
 
 const MAX_SOURCE_BODY_BYTES: usize = 8 * 1024 * 1024;
-// Typical sources are small; pre-sizing avoids quadratic reallocation during
-// frame accumulation.
+// Pre-size buffer; sources are small and frames accumulate incrementally.
 const SOURCE_BODY_INITIAL_CAPACITY: usize = 8192;
 const MAX_REDIRECTS: usize = 10;
 
@@ -55,7 +54,6 @@ pub use models::ProviderTier;
 
 pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
     vec![
-        // Primary: live websites / APIs.
         std::sync::Arc::new(ProxyscrapeProvider),
         std::sync::Arc::new(OpenProxyListProvider),
         std::sync::Arc::new(GeonodeProvider),
@@ -68,13 +66,11 @@ pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
         std::sync::Arc::new(ProxyDbProvider),
         std::sync::Arc::new(HideMyNameProvider),
         std::sync::Arc::new(SpysOneProvider),
-        // Fallback: aggregated GitHub mirrors.
         std::sync::Arc::new(GithubRepoProvider),
     ]
 }
 
-/// Keeps only the providers whose name is included by `include` (when
-/// non-empty) and absent from `exclude`.
+/// Filter providers by include/exclude name lists.
 pub fn select_providers(
     providers: Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>>,
     include: &[String],
@@ -90,11 +86,10 @@ pub fn select_providers(
         .collect()
 }
 
-/// Provider that scrapes a single user-supplied plaintext URL.
+/// Scrape a single user-supplied plaintext URL.
 pub struct CustomUrlProvider(pub Source);
 
 impl CustomUrlProvider {
-    /// Creates a provider from a plaintext proxy-list URL.
     pub fn new(url: &str) -> anyhow::Result<Self> {
         Ok(Self(Source::all(url)?))
     }
@@ -152,7 +147,6 @@ pub trait ProxyProvider {
                 req = req.header(hyper::header::REFERER, previous_url.as_str());
             }
 
-            // Send the request and await the response with a timeout
             let request = req
                 .body(Empty::<Bytes>::new())
                 .with_context(|| format!("failed to build request for {}", url))?;
@@ -164,7 +158,6 @@ pub trait ProxyProvider {
                 .with_context(|| format!("request to {} timed out after {:?}", url, timeout))?
                 .with_context(|| format!("request to {} failed", url))?;
 
-            // Handle possible redirects
             if response.status().is_redirection() {
                 if let Some(redirect) = response.headers().get(hyper::header::LOCATION) {
                     let redirect = redirect
@@ -187,8 +180,7 @@ pub trait ProxyProvider {
                 anyhow::bail!("{} returned HTTP {}", url, status);
             }
 
-            // Read the response frames, bounded by the same deadline as the
-            // request so a stalled body cannot hold a semaphore permit forever.
+            // Bound body reads by the same deadline to release permits on stalls.
             while let Some(next) = time::timeout_at(deadline, response.frame())
                 .await
                 .with_context(|| format!("body stream from {} timed out", url))?

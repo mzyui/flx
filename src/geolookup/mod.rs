@@ -1,4 +1,4 @@
-//! GeoIP lookup via cached GeoLite2-City database.
+//! Resolve GeoIP via cached GeoLite2 databases.
 
 mod ip_type;
 pub mod models;
@@ -39,7 +39,7 @@ fn download_lock() -> &'static tokio::sync::Mutex<()> {
     DOWNLOAD_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Snapshot of an in-flight GeoLite2 database download.
+/// Track in-flight GeoLite2 download progress.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadProgress {
     pub name: &'static str,
@@ -49,7 +49,7 @@ pub struct DownloadProgress {
 
 static DOWNLOAD_EVENTS: OnceLock<watch::Sender<Option<DownloadProgress>>> = OnceLock::new();
 
-/// Installs the download observer and returns a receiver for its events.
+/// Install a download observer and return its receiver.
 pub fn install_download_observer() -> Option<watch::Receiver<Option<DownloadProgress>>> {
     let (tx, rx) = watch::channel(None);
     match DOWNLOAD_EVENTS.set(tx) {
@@ -67,7 +67,7 @@ fn report_download(event: Option<DownloadProgress>) {
     }
 }
 
-// Ends the active download event on every exit path of the install function.
+// Clear the download event on every install exit path.
 struct DownloadNotifier;
 
 impl Drop for DownloadNotifier {
@@ -76,9 +76,7 @@ impl Drop for DownloadNotifier {
     }
 }
 
-// Announces a download before the network request starts so observers see
-// progress (even just 0.0 MB) during the connect/request phase, not only once
-// body chunks arrive.
+// Announce downloads early so observers see connect-phase progress.
 fn begin_download(name: &'static str) -> DownloadNotifier {
     report_download(Some(DownloadProgress {
         name,
@@ -113,8 +111,7 @@ fn lock_path(path: &Path) -> PathBuf {
 fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
-    // `flock` releases when the descriptor closes, matching the
-    // `lock_exclusive` semantics the download guard relied on.
+    // Rely on flock releasing when the descriptor closes.
     loop {
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc == 0 {
@@ -129,14 +126,13 @@ fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn lock_file(_file: &std::fs::File) -> std::io::Result<()> {
-    // flock is unix-only; the in-process tokio mutex still serializes runs.
+    // Serialize non-unix runs via the in-process tokio mutex.
     Ok(())
 }
 
 async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     let lock = lock_path(path);
-    // A stopped or wedged process holding the exclusive file lock would
-    // otherwise block this forever; give up after a short wait instead.
+    // Bound lock waits so a wedged holder cannot block forever.
     let acquire = tokio::task::spawn_blocking({
         let lock = lock.clone();
         move || {
@@ -280,10 +276,7 @@ fn database_in(mut dir: PathBuf, file_name: &str) -> PathBuf {
     dir
 }
 
-/// Older releases built the database path with `set_file_name` on the data
-/// directory itself, storing `<data>/geolite2-*.mmdb` beside (not inside) the
-/// `flx/` folder. Move such a leftover into the real location so an existing
-/// install does not re-download, carrying the ETag marker along.
+/// Relocate legacy databases so existing installs skip re-download.
 fn migrate_legacy_database(new_path: &Path) {
     let Some(file_name) = new_path.file_name() else {
         return;
@@ -308,8 +301,7 @@ fn migrate_legacy_database(new_path: &Path) {
         let _ = error;
         return;
     }
-    // The ETag sidecar moves too, otherwise the next sync would treat the
-    // migrated copy as unverified and download the full body again.
+    // Move the ETag sidecar so the copy stays verifiable.
     let marker = sync_marker_path(new_path);
     if let Some(legacy_marker) = marker
         .parent()
@@ -374,9 +366,7 @@ async fn fetch_database(
         .body(Empty::<Bytes>::new())
         .context("failed to build GeoLite2 download request")?;
 
-    // Reaching the mirror (TCP/TLS connect + response headers) is bounded
-    // separately from the body download so an unreachable mirror fails fast
-    // instead of sitting silent for the whole 120s download deadline.
+    // Bound connects separately so unreachable mirrors fail fast.
     let request_deadline = deadline.min(tokio::time::Instant::now() + GEOLITE_CONNECT_TIMEOUT);
     let response = tokio::time::timeout_at(request_deadline, client.request(req))
         .await
@@ -458,16 +448,19 @@ fn database_name(url: &str) -> &'static str {
     }
 }
 
-/// Result of a GeoLite2 database sync against the mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncOutcome {
-    /// The local database is up to date.
     UpToDate,
-    /// A newer database was downloaded.
     Synced,
 }
 
-/// Ensures the local GeoLite2 databases match the latest mirror revision.
+/// Syncs local GeoLite2 databases with the mirror revision.
+///
+/// Skips download when the ETag matches; migrates legacy layouts first.
+///
+/// # Errors
+///
+/// Returns an error when the data dir is unavailable or download fails.
 pub async fn sync_database() -> anyhow::Result<SyncOutcome> {
     let city = sync_one(GEOLITE_ENDPOINT_URL, &database_path()?).await?;
     let asn = sync_one(GEOLITE_ASN_ENDPOINT_URL, &asn_database_path()?).await?;
@@ -482,8 +475,7 @@ async fn sync_one(url: &str, mmdb_path: &Path) -> anyhow::Result<SyncOutcome> {
     let stored_etag = read_synced_etag(mmdb_path);
     let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
 
-    // A valid local copy with a recorded ETag can be checked with `If-None-
-    // Match`; a missing or corrupt copy always needs the full body.
+    // Skip conditional requests without a valid copy and ETag.
     let conditional = db_valid && stored_etag.is_some();
     let (response, remote_etag) = if conditional {
         fetch_database(url, stored_etag.as_deref(), deadline).await?
@@ -503,7 +495,7 @@ async fn sync_one(url: &str, mmdb_path: &Path) -> anyhow::Result<SyncOutcome> {
     Ok(SyncOutcome::Synced)
 }
 
-/// Downloads a GeoLite2 database from the mirror into `mmdb_path`.
+/// Download a GeoLite2 database from the mirror into `mmdb_path`.
 pub async fn download_database(mmdb_path: &Path, url: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
     let _notifier = begin_download(database_name(url));
@@ -527,7 +519,7 @@ async fn ensure_database(
     match Reader::open_readfile(mmdb_path) {
         Ok(reader) => Ok(reader),
         Err(e) => {
-            // The file is corrupt or truncated; drop it so the next run re-downloads.
+            // Drop corrupt files so the next run re-downloads.
             if let Err(_remove_err) = remove_file(mmdb_path) {
                 #[cfg(feature = "log")]
                 log::warn!(
@@ -544,7 +536,6 @@ async fn ensure_database(
     }
 }
 
-/// GeoLite2-based IP geolocation resolver.
 pub struct GeoLookup {
     reader: Reader<Vec<u8>>,
     asn_reader: Option<Reader<Vec<u8>>>,
@@ -577,7 +568,11 @@ impl GeoLookup {
         Ok(Self { reader, asn_reader })
     }
 
-    /// Looks up geographical data for an IP address.
+    /// Looks up country/city/ASN data for an IPv4 address.
+    ///
+    /// # Arguments
+    ///
+    /// * `ip` - Address to resolve; unknown IPs yield [`GeoData::default`].
     pub fn lookup(&self, ip: &Ipv4Addr) -> GeoData {
         let mut geodata = GeoData::default();
         let Ok(result) = self.reader.lookup(std::net::IpAddr::V4(*ip)) else {
@@ -645,7 +640,7 @@ mod tests {
     #[test]
     fn download_start_event_is_announced_then_cleared() {
         let Some(rx) = install_download_observer() else {
-            return; // another test already owns the process-wide observer
+            return;
         };
         let mut rx = rx;
         {
@@ -671,7 +666,6 @@ mod tests {
             read_synced_etag(&path).as_deref(),
             Some("\"1c87b8b3c4670be9\"")
         );
-        // the scratch file must not linger next to the marker
         assert!(!temporary_path(&marker).exists());
 
         let _ = std::fs::remove_file(&marker);
@@ -752,8 +746,6 @@ mod tests {
         assert!(!partial.exists());
     }
 
-    // Builds a `<root>/data/flx/…` tree mirroring the data-dir layout so the
-    // legacy sibling location is `<root>/data/<file>`.
     fn migration_dir(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "flx_geoip_migrate_{tag}_{}_{}",
@@ -779,7 +771,6 @@ mod tests {
         assert!(new_path.exists());
         assert!(!legacy.exists());
         assert_eq!(std::fs::read(&new_path).unwrap(), b"mmdb");
-        // the ETag sidecar moves along so the copy stays verifiable
         assert_eq!(std::fs::read(sync_marker_path(&new_path)).unwrap(), b"etag");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -788,11 +779,9 @@ mod tests {
     fn migration_never_touches_fresh_installs() {
         let (new_path, legacy, root) = migration_dir("fresh");
 
-        // nothing anywhere: no panic, no files created
         super::migrate_legacy_database(&new_path);
         assert!(!new_path.exists());
 
-        // an existing up-to-date database is left alone
         std::fs::write(&new_path, b"current").unwrap();
         std::fs::write(&legacy, b"stale").unwrap();
         super::migrate_legacy_database(&new_path);

@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-/// Snapshot of judge preflight results at validator startup.
+/// Report judge preflight results at validator startup.
 #[derive(Debug, Clone, Default)]
 pub struct JudgeHealthReport {
     pub candidates: usize,
@@ -19,7 +19,7 @@ impl JudgeHealthReport {
     }
 }
 
-/// Validation progress counters.
+/// Track validation progress counters.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationProgress {
     pub(crate) total: Arc<AtomicUsize>,

@@ -1,4 +1,4 @@
-//! Validation progress status line.
+//! Render validation progress on stderr.
 
 use std::{
     fmt::{Display, Formatter},
@@ -16,15 +16,13 @@ use tokio::sync::watch;
 
 use crate::OutputGuard;
 
-// Single-glyph accents: color lives only here, never on a whole line.
 const VALIDATING_ICON: &str = "▸";
 const PHASE_ICON: &str = "⟳";
 const DOWNLOAD_ICON: &str = "⇣";
 const GATHER_ICON: &str = "✦";
 const ELLIPSIS_TAIL: &str = " …";
 
-/// Compose `<icon> <phase>` with the trailing ellipsis de-emphasized so a
-/// repaint never paints the whole line in one hue.
+/// Compose icon-phase lines without whole-line hues.
 fn phase_line(phase: &str, color: bool) -> String {
     let body = phase.trim_end();
     let (text, tail) = match body.strip_suffix('…') {
@@ -42,7 +40,6 @@ const SHOW_CURSOR: &str = "\x1b[?25h";
 
 static LIVE_CURSOR_HIDERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Escape to emit for a live-handle count transition, if any.
 fn cursor_escape(prev: usize, next: usize) -> Option<&'static str> {
     match (prev, next) {
         (0, 1) => Some(HIDE_CURSOR),
@@ -54,16 +51,14 @@ fn cursor_escape(prev: usize, next: usize) -> Option<&'static str> {
 fn apply_cursor_escape(escape: Option<&'static str>) {
     use std::io::{IsTerminal as _, Write as _};
     if let Some(escape) = escape {
-        // Bars only exist on a TTY stderr; the check keeps tests and
-        // redirected runs free of stray control sequences.
+        // Emit escapes only on TTY stderr.
         if std::io::stderr().is_terminal() {
             let _ = std::io::stderr().lock().write_all(escape.as_bytes());
         }
     }
 }
 
-/// A forced exit skips the `CursorHider` destructors, so the cursor must be
-/// un-hidden manually before the process leaves.
+/// Restore the cursor after forced exits skip destructors.
 pub(crate) fn force_show_cursor() {
     use std::io::{IsTerminal as _, Write as _};
     if LIVE_CURSOR_HIDERS.load(Ordering::Acquire) > 0 && std::io::stderr().is_terminal() {
@@ -71,8 +66,7 @@ pub(crate) fn force_show_cursor() {
     }
 }
 
-/// Refcounted RAII hiding the terminal cursor while any status bar lives.
-/// Escapes are idempotent, so racing drops may repeat them harmlessly.
+/// Hide the cursor while any status bar lives.
 struct CursorHider;
 
 impl CursorHider {
@@ -90,12 +84,10 @@ impl Drop for CursorHider {
     }
 }
 
-/// Current terminal width in columns, or `None` when it cannot be determined.
 fn terminal_width() -> Option<usize> {
     #[cfg(unix)]
     {
-        // SAFETY: `ws` is a zeroed struct and TIOCGWINSZ only writes the window
-        // size into it; stderr (fd 2) is always a valid file descriptor.
+        // SAFETY: TIOCGWINSZ only writes the window size into ws.
         let ws_col = unsafe {
             let mut ws: libc::winsize = std::mem::zeroed();
             if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
@@ -114,14 +106,12 @@ fn terminal_width() -> Option<usize> {
         .filter(|&w| w > 0)
 }
 
-/// Visible column length of `s`, ignoring ANSI escape sequences (which occupy
-/// no terminal columns). Each non-escape char counts as one column.
+/// Measure visible columns ignoring ANSI escapes.
 fn visible_len(s: &str) -> usize {
     let mut len = 0;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            // Skip the rest of the escape sequence (ends on its final letter).
             for e in chars.by_ref() {
                 if e.is_ascii_alphabetic() {
                     break;
@@ -134,8 +124,7 @@ fn visible_len(s: &str) -> usize {
     len
 }
 
-/// Copy `s` up to `width` visible columns, preserving whole escape sequences
-/// intact so a truncation never lands inside an escape code.
+/// Truncate to visible columns without splitting escapes.
 fn truncate_to_visible(s: &str, width: usize) -> String {
     let mut out = String::with_capacity(s.len());
     let mut vis = 0;
@@ -161,10 +150,7 @@ fn truncate_to_visible(s: &str, width: usize) -> String {
     out
 }
 
-/// Fit a rendered line to the terminal width: truncate overflow to exactly
-/// `width` visible columns (closing any open color) and pad shorter lines with
-/// spaces so the bar always spans the full terminal width. `None` width leaves
-/// the line untouched. ANSI escapes are counted as zero width.
+/// Fit lines to terminal width with padding or truncation.
 fn fit_terminal(line: String, color: bool, width: Option<usize>) -> String {
     let width = match width {
         Some(w) if w > 0 => w,
@@ -236,9 +222,7 @@ fn show_progress(quiet: bool, stderr_is_terminal: bool, stdout_is_pipe: bool) ->
     !quiet && stderr_is_terminal && !stdout_is_pipe
 }
 
-// Warmup bars clash with streamed stdout data, so for commands that print their
-// payload to stdout (e.g. `grab`) the bar is hidden on a TTY and shown only when
-// output is redirected (a file via `-o` or a piped stdout) where stderr stays clean.
+// Hide warmup bars on TTY stdout to avoid clashing with payloads.
 fn show_warmup(
     quiet: bool,
     stderr_is_terminal: bool,
@@ -269,8 +253,6 @@ impl ValidationBar {
         if !show_progress(quiet, std::io::stderr().is_terminal(), stdout_is_pipe) {
             return None;
         }
-        // The global style override is set once in `run_application`, so the
-        // bar respects `--no-color` like the end-of-run summary.
         let _cursor = CursorHider::acquire();
         let status = StatusLine::new(Frame::new(progress, use_color(no_color)));
         Some(Self {
@@ -290,8 +272,7 @@ impl ValidationBar {
 
 impl OutputGuard for ValidationBar {
     fn before_write(&self) {
-        // The bar only exists when stdout reaches the same terminal, so every
-        // stdout write needs the line hidden until it is flushed.
+        // Hide the bar while stdout writes to the same terminal.
         self.hide();
     }
 
@@ -300,7 +281,7 @@ impl OutputGuard for ValidationBar {
     }
 }
 
-/// Repaintable warmup phase line shown before the validation bar takes over.
+/// Render warmup phases before validation starts.
 pub struct WarmupBar {
     status: StatusLine<WarmupFrame>,
     phase: Arc<Mutex<&'static str>>,
@@ -423,14 +404,10 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::watch;
 
-    // The style override is process-global, so the tests that render colored
-    // output must not interleave with each other; share the style module's
-    // lock so both test modules exclude one another.
     fn lock_color() -> MutexGuard<'static, ()> {
         crate::style::color_lock()
     }
 
-    // The live-cursor-hider count is process-global like the style override.
     static CURSOR_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -523,7 +500,6 @@ mod tests {
         assert!(rendered.starts_with("\x1b[36m⇣\x1b[0m GeoLite2-City.mmdb"));
         assert!(rendered.contains("\x1b[2m … 40.00%\x1b[0m"));
         assert!(rendered.ends_with("\x1b[0m"));
-        // No whole-line hue: the old full-line cyan-bold must stay gone.
         assert!(!rendered.contains("\x1b[1;36m"));
     }
 
@@ -570,8 +546,6 @@ mod tests {
         assert!(show_progress(false, true, false));
         assert!(!show_progress(true, true, false));
         assert!(!show_progress(false, false, false));
-        // A piped stdout means a downstream process owns the terminal; the bar
-        // must stay quiet there. Redirecting to a regular file keeps the bar.
         assert!(!show_progress(false, true, true));
     }
 
@@ -601,7 +575,6 @@ mod tests {
         assert!(colored.starts_with("\x1b[36m▸\x1b[0m "));
         assert!(colored.contains("\x1b[1mValidating\x1b[0m"));
         assert!(colored.contains("\x1b[2m (0/s)\x1b[0m"));
-        // The label must not carry the icon's cyan on top of bold.
         assert!(!colored.contains("\x1b[1;36mValidating"));
     }
 
@@ -620,7 +593,6 @@ mod tests {
 
     #[test]
     fn fit_terminal_pads_short_lines_to_width() {
-        // Shorter-than-terminal lines are padded to exactly the terminal width.
         let colored = fit_terminal("Validating 0/0".to_string(), true, Some(200));
         assert!(colored.starts_with("Validating 0/0\x1b[0m"));
         assert_eq!(visible_len(&colored), 200);
@@ -641,20 +613,17 @@ mod tests {
     #[test]
     fn fit_terminal_appends_reset_when_colored() {
         let line = "abcdefghijkl".to_string();
-        // 12 visible at width 10: truncate to 10 visible, then close color.
         assert_eq!(fit_terminal(line, true, Some(10)), "abcdefghij\x1b[0m");
     }
 
     #[test]
     fn fit_terminal_truncates_visible_columns_only() {
-        // 10 visible at width 5: truncate to 5 visible columns.
         let line = "abcdefghij".to_string();
         assert_eq!(fit_terminal(line, true, Some(5)), "abcde\x1b[0m");
     }
 
     #[test]
     fn fit_terminal_ignores_ansi_in_length() {
-        // Escape codes carry zero visible width; "Validatingx" is 11 visible.
         let line = "\x1b[1;36mValidatingx\x1b[0m".to_string();
         assert_eq!(visible_len(&line), 11);
         assert_eq!(fit_terminal(line, true, Some(5)), "\x1b[1;36mValid\x1b[0m");
