@@ -4,7 +4,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use aho_corasick::AhoCorasick;
 use anyhow::Context;
 use http_body_util::Empty;
 use hyper::{
@@ -43,8 +42,12 @@ static ANON_INTEREST: &[&str] = &[
     "X_FORWARDED FORWARDED",
 ];
 
-static ANON_MATCHER: LazyLock<AhoCorasick> =
-    LazyLock::new(|| AhoCorasick::new(ANON_INTEREST).expect("static anonymity tokens are valid"));
+static ANON_FINDERS: LazyLock<Vec<memchr::memmem::Finder>> = LazyLock::new(|| {
+    ANON_INTEREST
+        .iter()
+        .map(memchr::memmem::Finder::new)
+        .collect()
+});
 
 const MAX_JUDGE_BODY_BYTES: usize = 512 * 1024;
 
@@ -76,7 +79,10 @@ pub(crate) async fn read_bounded_body(
 pub fn classify_anonymity(body: &str, my_ip: &str) -> Anonymity {
     if body.contains(my_ip) {
         Anonymity::Transparent
-    } else if ANON_MATCHER.find(body.as_bytes()).is_some() {
+    } else if ANON_FINDERS
+        .iter()
+        .any(|finder| finder.find(body.as_bytes()).is_some())
+    {
         Anonymity::Anonymous
     } else {
         Anonymity::Elite

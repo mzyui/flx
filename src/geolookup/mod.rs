@@ -109,6 +109,30 @@ fn lock_path(path: &Path) -> PathBuf {
     lock
 }
 
+#[cfg(unix)]
+fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // `flock` releases when the descriptor closes, matching the
+    // `lock_exclusive` semantics the download guard relied on.
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file(_file: &std::fs::File) -> std::io::Result<()> {
+    // flock is unix-only; the in-process tokio mutex still serializes runs.
+    Ok(())
+}
+
 async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     let lock = lock_path(path);
     // A stopped or wedged process holding the exclusive file lock would
@@ -116,16 +140,13 @@ async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     let acquire = tokio::task::spawn_blocking({
         let lock = lock.clone();
         move || {
-            use fs2::FileExt;
-
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .write(true)
                 .open(&lock)
                 .with_context(|| format!("failed to create {}", lock.display()))?;
-            file.lock_exclusive()
-                .with_context(|| format!("failed to lock {}", lock.display()))?;
+            lock_file(&file).with_context(|| format!("failed to lock {}", lock.display()))?;
             Ok(file)
         }
     });
@@ -219,8 +240,8 @@ where
 }
 
 pub fn data_dir() -> anyhow::Result<PathBuf> {
-    if let Some(base_dirs) = directories::BaseDirs::new() {
-        let mut dir = base_dirs.data_dir().to_path_buf();
+    if let Some(base) = crate::base_dirs::data_dir() {
+        let mut dir = base;
         dir.push(env!("CARGO_PKG_NAME"));
 
         if !dir.is_dir() {

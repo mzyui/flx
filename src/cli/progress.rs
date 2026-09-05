@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::status_line::{Options as StatusLineOptions, StatusLine};
-use colored::Colorize;
+use crate::style::Colorize;
 use flx::{DownloadProgress, ValidationProgress};
 use tokio::sync::watch;
 
@@ -269,8 +269,8 @@ impl ValidationBar {
         if !show_progress(quiet, std::io::stderr().is_terminal(), stdout_is_pipe) {
             return None;
         }
-        // The global `colored` override is set once in `run_application`, so
-        // the bar respects `--no-color` like the end-of-run summary.
+        // The global style override is set once in `run_application`, so the
+        // bar respects `--no-color` like the end-of-run summary.
         let _cursor = CursorHider::acquire();
         let status = StatusLine::new(Frame::new(progress, use_color(no_color)));
         Some(Self {
@@ -423,15 +423,14 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::sync::watch;
 
-    // `colored`'s color decision is a process-global override, so the tests
-    // that render colored output must not interleave with each other.
-    static COLOR_LOCK: Mutex<()> = Mutex::new(());
-
+    // The style override is process-global, so the tests that render colored
+    // output must not interleave with each other; share the style module's
+    // lock so both test modules exclude one another.
     fn lock_color() -> MutexGuard<'static, ()> {
-        COLOR_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::style::color_lock()
     }
 
-    // The live-cursor-hider count is process-global like `colored`'s override.
+    // The live-cursor-hider count is process-global like the style override.
     static CURSOR_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -469,9 +468,9 @@ mod tests {
 
     fn with_color<T>(f: impl FnOnce() -> T) -> T {
         let _guard = lock_color();
-        colored::control::set_override(true);
+        crate::style::set_override(true);
         let result = f();
-        colored::control::set_override(false);
+        crate::style::set_override(false);
         result
     }
 
@@ -609,11 +608,11 @@ mod tests {
     #[test]
     fn frame_uses_ansi_codes_only_when_colored() {
         let _guard = lock_color();
-        colored::control::set_override(false);
+        crate::style::set_override(false);
         let plain = Frame::new(ValidationProgress::default(), false).to_string();
-        colored::control::set_override(true);
+        crate::style::set_override(true);
         let colored = Frame::new(ValidationProgress::default(), true).to_string();
-        colored::control::set_override(false);
+        crate::style::set_override(false);
 
         assert!(!plain.contains('\x1b'));
         assert!(colored.contains('\x1b'));

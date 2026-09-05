@@ -4,8 +4,6 @@ use argument::{
     Command, ConfigAction, ConfigCmd, FetchArgs, FetcherArgs, FindArgs, ServeArgs, ValidatorArgs,
 };
 use clap::{CommandFactory, FromArgMatches};
-#[cfg(feature = "progress_bar")]
-use colored::Colorize;
 #[cfg(feature = "log")]
 use flx::initialize_logging;
 use flx::{
@@ -17,6 +15,8 @@ use std::io::Write as _;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "progress_bar")]
+use style::Colorize;
 use tokio::runtime;
 
 mod argument;
@@ -28,6 +28,8 @@ mod output;
 mod progress;
 #[cfg(feature = "progress_bar")]
 mod status_line;
+#[cfg(feature = "progress_bar")]
+mod style;
 mod version;
 mod wizard;
 
@@ -184,6 +186,8 @@ enum RunOutcome {
 
 // Conventional shell status for a process killed by SIGINT (128 + 2).
 const SIGINT_EXIT_CODE: u8 = 130;
+/// Feedback cadence while the serve pool fills; mirrors the rotator gate poll.
+const SERVE_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 // The first Ctrl+C shuts down gracefully (finalizing output documents); a
 // second press force-quits so flx can always be stopped, even from a phase
 // that never reaches a cancellation checkpoint.
@@ -393,10 +397,11 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         return Ok(RunOutcome::NoCommand);
     };
 
-    // `colored` decides by the stdout TTY, but the bar and summary paint on
-    // stderr; force the color choice from `--no-color` for the whole run.
+    // The style module auto-detects by the stdout TTY, but the bar and
+    // summary paint on stderr; force the color choice from `--no-color` for
+    // the whole run.
     #[cfg(feature = "progress_bar")]
-    colored::control::set_override(!cli.no_color);
+    style::set_override(!cli.no_color);
 
     let runtime = runtime::Builder::new_multi_thread()
         .enable_all()
@@ -465,9 +470,7 @@ fn run_application() -> anyhow::Result<RunOutcome> {
 }
 
 fn config_home() -> std::path::PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.config_dir().to_path_buf())
-        .unwrap_or_else(std::env::temp_dir)
+    flx::base_dirs::config_dir().unwrap_or_else(std::env::temp_dir)
 }
 
 fn run_config(
@@ -746,10 +749,7 @@ async fn run_serve(
         bind: serve.bind,
         port: serve.port,
         strategy: flx::Strategy::parse(&serve.strategy).context("unknown rotation strategy")?,
-        pool_size: serve
-            .pool_size
-            .unwrap_or(flx::rotator::DEFAULT_POOL_SIZE)
-            .clamp(1, flx::rotator::MAX_POOL_SIZE),
+        pool_size: serve.pool_size.clamp(1, flx::rotator::MAX_POOL_SIZE),
         min_ready: serve.min_ready.clamp(1, flx::rotator::MAX_POOL_SIZE),
         refresh_secs: serve
             .refresh_secs
@@ -767,6 +767,13 @@ async fn run_serve(
     };
     let rotator = Arc::new(flx::Rotator::new(options));
     let pool = rotator.pool();
+
+    // The endpoint goes live on the first ready proxy (`--min-ready`, default
+    // 1); say so up front because the refill passes below stay silent.
+    eprintln!(
+        "flx serve filling the pool on {}:{} — goes live on the first validated proxy",
+        serve.bind, serve.port
+    );
 
     // One Ctrl+C press must stop the feeder, the refill sleep, and the accept
     // loop together, so the process cancel token feeds a watch that every
@@ -788,7 +795,29 @@ async fn run_serve(
     // The endpoint binds as soon as `--min-ready` validated proxies are up;
     // this loop only keeps the pool stocked, so a refill pass never interrupts
     // active client connections. A file pool is static: fill once, then wait.
+    // The listener line fires the moment the gate opens — the first ready
+    // proxy — not when a sweep ends, so a long fill is never mistaken for a
+    // dead process.
     let static_pool = !serve.validator.files.is_empty();
+    let live = {
+        let pool = Arc::clone(&pool);
+        let mut shutdown_rx = shutdown_rx.clone();
+        let bind = serve.bind;
+        let port = serve.port;
+        let strategy = serve.strategy.clone();
+        tokio::spawn(async move {
+            while pool.ready() == 0 {
+                tokio::select! {
+                    _ = tokio::time::sleep(SERVE_READY_POLL_INTERVAL) => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+            }
+            eprintln!(
+                "flx serve listening on {bind}:{port} (pool: {} proxies, strategy: {strategy})",
+                pool.ready()
+            );
+        })
+    };
     loop {
         let mut stream = validated_stream(&serve, protocols.clone(), groups.clone()).await?;
         while let Some(proxy) = tokio::select! {
@@ -798,13 +827,6 @@ async fn run_serve(
             pool.add(proxy);
         }
         rotator.force_ready();
-        eprintln!(
-            "flx serve listening on {}:{} (pool: {} proxies, strategy: {})",
-            serve.bind,
-            serve.port,
-            pool.len(),
-            serve.strategy
-        );
         if static_pool {
             break;
         }
@@ -819,6 +841,7 @@ async fn run_serve(
         }
     }
     let _ = server.await;
+    let _ = live.await;
     Ok(RunOutcome::Cancelled)
 }
 

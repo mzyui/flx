@@ -741,7 +741,7 @@ fn apply_serve(serve: &mut ServeArgs, cfg: Option<&ServeSection>, sub: Option<&A
         provided(sub, "pool_size"),
         &cfg.pool_size,
         serve.pool_size,
-        Some
+        |v| v
     );
     apply_field!(
         provided(sub, "min_ready"),
@@ -827,7 +827,7 @@ pub fn template() -> &'static str {
 # bind = "127.0.0.1"
 # port = 8080
 # strategy = "round-robin"              # round-robin|random
-# pool_size = 100
+# pool_size = 25
 # min_ready = 1                         # validated proxies required before serving
 # refresh_secs = 300                    # seconds between provider refills
 # request_timeout = 30                  # seconds per client connection
@@ -1204,7 +1204,7 @@ http_judges = ["http://azenv.net/"]
             _ => panic!("expected serve"),
         };
         assert_eq!(serve.min_ready, 5);
-        assert_eq!(serve.pool_size, Some(50));
+        assert_eq!(serve.pool_size, 50);
 
         let (cli, _) = parse_cli(&["serve"]);
         let serve = match cli.command {

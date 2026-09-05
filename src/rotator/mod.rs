@@ -24,8 +24,9 @@ pub use pool::RotatorPool;
 /// Bind and port defaults for the serve endpoint.
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 pub const DEFAULT_PORT: u16 = 8080;
-pub const DEFAULT_POOL_SIZE: usize = 100;
-pub const MAX_POOL_SIZE: usize = 1_000;
+/// Pool cap for the rotating endpoint; the feeder keeps refilling up to it.
+pub const MAX_POOL_SIZE: usize = 25;
+pub const DEFAULT_POOL_SIZE: usize = MAX_POOL_SIZE;
 /// The endpoint goes live once this many validated proxies are ready.
 pub const DEFAULT_MIN_READY: usize = 1;
 pub const DEFAULT_REFRESH_SECS: u64 = 300;
@@ -189,5 +190,16 @@ mod tests {
                 panic!("bypass flag did not open the gate");
             }
         }
+    }
+
+    #[test]
+    fn pool_is_capped_at_twenty_five_by_default() {
+        assert_eq!(MAX_POOL_SIZE, 25);
+        assert_eq!(DEFAULT_POOL_SIZE, MAX_POOL_SIZE);
+        assert_eq!(
+            ServeOptions::default().pool_size,
+            DEFAULT_POOL_SIZE,
+            "the serve facade must default to the capped pool"
+        );
     }
 }

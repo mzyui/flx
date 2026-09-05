@@ -23,5 +23,6 @@ graphify-out/
 # Editor & agent working directories
 .claude/
 .opencode
-
+.agents/
+skills-lock.json
 .flx.toml

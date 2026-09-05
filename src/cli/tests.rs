@@ -1932,6 +1932,11 @@ fn clap_defaults_match_facade_defaults_field_by_field() {
         flx::rotator::DEFAULT_MIN_READY.to_string(),
         "--min-ready must track DEFAULT_MIN_READY"
     );
+    assert_eq!(
+        clap_default(&command, "pool_size"),
+        flx::rotator::DEFAULT_POOL_SIZE.to_string(),
+        "--pool-size must track DEFAULT_POOL_SIZE"
+    );
 }
 
 fn run_with_stats(proxies: &[Proxy]) -> Option<String> {

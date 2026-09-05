@@ -434,8 +434,12 @@ pub struct ServeArgs {
     pub strategy: String,
 
     /// Maximum number of validated proxies kept in the rotation pool.
-    #[arg(long, help_heading = "Serve")]
-    pub pool_size: Option<usize>,
+    #[arg(
+        long,
+        default_value_t = flx::rotator::DEFAULT_POOL_SIZE,
+        help_heading = "Serve"
+    )]
+    pub pool_size: usize,
 
     /// Validated proxies required before the endpoint starts serving.
     #[arg(

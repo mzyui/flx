@@ -53,12 +53,12 @@ cat list.txt | flx find -f -
 
 ## Serve (beta)
 
-Expose the validated pool as a local rotating proxy: point any client at the endpoint and every connection is forwarded through a different working proxy. Start it like `find` — every validation flag (`-a`, `-c`, `-m`, `--timeout`, protocol types, ...) applies — and the endpoint keeps revalidating in the background, rotating round-robin (default) or randomly and dropping proxies that die.
+Expose the validated pool as a local rotating proxy: point any client at the endpoint and every connection is forwarded through a different working proxy. Start it like `find` — every validation flag (`-a`, `-c`, `-m`, `--timeout`, protocol types, ...) applies — and the endpoint keeps revalidating in the background, rotating round-robin (default) or randomly and dropping proxies that die. The endpoint goes live on the first validated proxy (tune with `--min-ready`) and the pool — capped at 25 — keeps refilling as proxies die or the providers yield more.
 
 ```bash
 flx serve                                    # 127.0.0.1:8080, round-robin
 flx serve --port 9000 --strategy random      # random rotation
-flx serve --pool-size 200 --refresh-secs 120 # larger pool, faster revalidation
+flx serve --refresh-secs 120                 # faster pool refill
 flx serve --min-ready 10                     # wait for 10 proxies before serving
 flx serve --auth user:pass                   # require basic proxy authentication
 ```
@@ -166,7 +166,6 @@ cargo build                              # build library + binary
 cargo test                               # run the test suite (~283 tests)
 cargo clippy --all-targets --all-features
 cargo fmt
-cargo bench                              # criterion benchmarks (parsers, proxy)
 ```
 
 ## Contributing

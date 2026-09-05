@@ -20,6 +20,7 @@
 //! }
 //! ```
 
+pub mod base_dirs;
 pub mod error;
 pub mod fetcher;
 pub mod filters;
@@ -83,13 +84,90 @@ pub mod prelude {
 /// Initializes the logging system.
 #[cfg(feature = "log")]
 pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
-    #[cfg(feature = "log")]
-    stderrlog::new()
-        .module(module_path!())
-        .show_module_names(true)
-        .verbosity(log_level)
-        .init()?;
+    log::set_boxed_logger(Box::new(FlxLogger))?;
+    log::set_max_level(log_level);
     Ok(())
+}
+
+/// Standard-error logger: writes `flx`-crate records to stderr as
+/// `{target}: {LEVEL} {message}` with per-level prefix colors gated by
+/// `TERM`/`NO_COLOR` and a tty stderr.
+#[cfg(feature = "log")]
+struct FlxLogger;
+
+#[cfg(feature = "log")]
+const LOG_MODULE_ROOT: &str = "flx";
+
+#[cfg(feature = "log")]
+fn log_module_allowed(target: &str) -> bool {
+    match target.strip_prefix(LOG_MODULE_ROOT) {
+        // Rust module paths separate segments with `::`, not `.`.
+        Some(rest) => rest.is_empty() || rest.starts_with("::"),
+        None => false,
+    }
+}
+
+#[cfg(feature = "log")]
+fn log_prefix_color(level: log::Level) -> &'static str {
+    match level {
+        log::Level::Error => "\x1b[31m",
+        log::Level::Warn => "\x1b[33m",
+        log::Level::Info => "\x1b[34m",
+        log::Level::Debug => "\x1b[36m",
+        log::Level::Trace => "\x1b[35m",
+    }
+}
+
+#[cfg(feature = "log")]
+impl FlxLogger {
+    fn color_enabled() -> bool {
+        use std::io::IsTerminal as _;
+        match std::env::var_os("TERM") {
+            None => return false,
+            Some(term) => {
+                if term == "dumb" {
+                    return false;
+                }
+            }
+        }
+        if std::env::var_os("NO_COLOR").is_some() {
+            return false;
+        }
+        std::io::stderr().is_terminal()
+    }
+}
+
+#[cfg(feature = "log")]
+impl log::Log for FlxLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level() && log_module_allowed(metadata.target())
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        if Self::color_enabled() {
+            // The previous logger reset the spec first, so its colored
+            // prefix carried a leading reset; keep the bytes identical.
+            let _ = write!(
+                stderr,
+                "\x1b[0m{}{}: {} ",
+                log_prefix_color(record.level()),
+                record.target(),
+                record.level()
+            );
+            let _ = write!(stderr, "\x1b[0m");
+        } else {
+            let _ = write!(stderr, "{}: {} ", record.target(), record.level());
+        }
+        let _ = writeln!(stderr, "{}", record.args());
+    }
+
+    fn flush(&self) {
+        let _ = std::io::stderr().flush();
+    }
 }
 
 /// File-backed proxy source. Scheme-prefixed lines pin their own protocol;
@@ -274,5 +352,30 @@ mod tests {
         assert_eq!(proxies.len(), 2);
         assert_eq!(proxies[0].expected_types.as_ref(), &[Protocol::Socks4]);
         assert_eq!(proxies[1].expected_types, *FILE_DEFAULT_PROTOCOLS);
+    }
+
+    #[cfg(feature = "log")]
+    #[test]
+    fn log_module_gate_accepts_only_crate_targets() {
+        use super::log_module_allowed;
+
+        assert!(log_module_allowed("flx"));
+        assert!(log_module_allowed("flx::validator::work"));
+        assert!(!log_module_allowed("other_crate"));
+        assert!(!log_module_allowed("flx2"));
+        assert!(!log_module_allowed("fl"));
+    }
+
+    #[cfg(feature = "log")]
+    #[test]
+    fn log_prefix_colors_match_the_documented_palette() {
+        use super::log_prefix_color;
+        use log::Level;
+
+        assert_eq!(log_prefix_color(Level::Error), "\x1b[31m");
+        assert_eq!(log_prefix_color(Level::Warn), "\x1b[33m");
+        assert_eq!(log_prefix_color(Level::Info), "\x1b[34m");
+        assert_eq!(log_prefix_color(Level::Debug), "\x1b[36m");
+        assert_eq!(log_prefix_color(Level::Trace), "\x1b[35m");
     }
 }
