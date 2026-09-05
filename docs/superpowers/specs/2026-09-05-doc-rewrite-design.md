@@ -7,13 +7,15 @@ Scope: `src/**/*.rs` (~66 files, incl. `src/rotator/`, `src/base_dirs.rs`, `src/
 ## Goal
 Rewrite all code documentation to short English, delete unnecessary comments. Zero behavior change.
 
-## Decisions (approved)
+## Decisions (approved + rev 2026-09-05: two-tier)
 - Language: English.
 - Coverage: all `src/` rustdoc (`//!`, `///`) + inline (`//`).
 - Out of scope: `README.md`, `examples/`, `tests/`, `benches/`, CLI help strings (user-facing behavior).
-- Style: max 1 line, <100 cols, `/// <Verb> ...`.
-- No `Examples`/`Errors`/`Panics` sections; `src/error.rs` variants get 1 line each.
-- `src/lib.rs` crate docs trimmed to 1 line (existing example removed for consistency).
+- Tier 2 (default, internal/trivial): max 1 line, <100 cols, `/// <Verb> ...`; delete if restates name/obvious.
+- Tier 1 (important public functions/types): full rustdoc per Rust conventions — summary line + extended description + sections as applicable (`# Arguments`, `# Returns`, `# Errors`, `# Panics`, `# Examples` with compilable snippet, `no_run` for network). Keep tight, no fluff.
+- Tier 1 set: `Flx::fetch/collect`, `load_proxy_files`, `ProxyValidator` public API, `ProxyFetcher` public API, `rotator::{server,pool}` public fns, `resolver::resolve`, `geolookup::{sync_database, GeoLookup::lookup}`, `ValidatorConfig/FetcherConfig` constructors with invariants, `error.rs` user-facing variants (1-3 lines + when-returned).
+- No `Examples`/`Errors`/`Panics` for Tier 2; Tier 1 includes them only when applicable.
+- `src/lib.rs` crate docs: 1-line summary + minimal example (kept, as Tier 1 entry).
 
 ## Delete criteria ("gak perlu")
 Delete entirely when:
