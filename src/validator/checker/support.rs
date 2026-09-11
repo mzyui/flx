@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{atomic::AtomicU64, Arc, LazyLock},
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
@@ -293,11 +294,18 @@ pub(crate) async fn support_http(
     let budget_started = time::Instant::now();
     let budget = timeout.saturating_mul(max_attempts as u32);
 
+    // Snapshot judges once per probe instead of per attempt; track cooldowns
+    // locally so retries skip judges that failed earlier in this probe.
+    let candidates = pool.candidates();
+    let mut cooling_down = HashSet::with_capacity(candidates.len());
     for attempt in 0..max_attempts {
         if attempt > 0 && !params.retry_delay.is_zero() {
             time::sleep(params.retry_delay).await;
         }
-        for target in pool.candidates() {
+        for target in &candidates {
+            if cooling_down.contains(target.url.as_str()) {
+                continue;
+            }
             let remaining = budget
                 .checked_sub(budget_started.elapsed())
                 .unwrap_or_default();
@@ -336,7 +344,8 @@ pub(crate) async fn support_http(
                     #[cfg(feature = "log")]
                     log::trace!("{}: local judge unreachable: {:#}", proxy, _e);
                     // Cool failing judge to steer round-robin away from it.
-                    pool.report_failure(&target);
+                    pool.report_failure(target);
+                    cooling_down.insert(target.url.clone());
                     continue;
                 }
             };
@@ -350,7 +359,8 @@ pub(crate) async fn support_http(
             if !inner.status().is_success() {
                 #[cfg(feature = "log")]
                 log::trace!("{}: local judge returned status {}", proxy, inner.status());
-                pool.report_failure(&target);
+                pool.report_failure(target);
+                cooling_down.insert(target.url.clone());
                 continue;
             }
 
@@ -378,7 +388,8 @@ pub(crate) async fn support_http(
                 if memchr::memmem::find(&body, target.response_marker.as_bytes()).is_none() {
                     #[cfg(feature = "log")]
                     log::trace!("{}: response did not originate from the local judge", proxy);
-                    pool.report_failure(&target);
+                    pool.report_failure(target);
+                    cooling_down.insert(target.url.clone());
                     continue;
                 }
                 if support_cookies
@@ -408,7 +419,8 @@ pub(crate) async fn support_http(
                 if memchr::memmem::find(&body, target.response_marker.as_bytes()).is_none() {
                     #[cfg(feature = "log")]
                     log::trace!("{}: response did not originate from the local judge", proxy);
-                    pool.report_failure(&target);
+                    pool.report_failure(target);
+                    cooling_down.insert(target.url.clone());
                     continue;
                 }
                 if support_cookies
@@ -436,7 +448,7 @@ pub(crate) async fn support_http(
                             error
                         );
                         let _ = error;
-                        pool.report_success(&target, started.elapsed());
+                        pool.report_success(target, started.elapsed());
                         return Ok(Some(ProxyRuntimes {
                             inner: Protocol::Http(Anonymity::Unknown),
                             runtimes: end_to_end_runtime(started.elapsed()),
@@ -448,7 +460,7 @@ pub(crate) async fn support_http(
             };
             let body = String::from_utf8_lossy(&body);
             let anonymity = classify_anonymity(&body, &my_ip);
-            pool.report_success(&target, started.elapsed());
+            pool.report_success(target, started.elapsed());
 
             return Ok(Some(ProxyRuntimes {
                 inner: Protocol::Http(anonymity),
