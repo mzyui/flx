@@ -11,7 +11,7 @@ use crate::proxy::{
     client::{ConnectionDriver, ProxyClient, ProxyRuntimes},
     models::{Protocol, Proxy, RuntimeStats},
 };
-use crate::resolver::my_ip;
+use crate::resolver::{cached_my_ip, my_ip};
 use negotiate::{authority_for, negotiate_http_connect, negotiate_socks4, negotiate_socks5};
 use tls::{verify_judge, verify_tls_judge};
 
@@ -135,9 +135,32 @@ pub(super) async fn support_tunnel(
                 let mut runtimes = RuntimeStats::default();
                 // Run my-IP lookup on fixed budget; never reject live tunnels for it.
                 let protocol = if needs_anonymity {
-                    let my_ip = my_ip().await.context(
-                        "cannot determine anonymity level without knowing our own public IP",
-                    )?;
+                    let my_ip = if let Some(cached) = cached_my_ip() {
+                        cached
+                    } else {
+                        match my_ip().await {
+                            Ok(ip) => ip,
+                            Err(error) => {
+                                #[cfg(feature = "log")]
+                                log::trace!(
+                                    "{}: my_ip lookup failed, degrading to unknown: {:#}",
+                                    proxy.as_text(),
+                                    error
+                                );
+                                #[cfg(not(feature = "log"))]
+                                let _ = error;
+                                let mut runtimes = RuntimeStats::default();
+                                runtimes.record(started.elapsed().as_secs_f64());
+                                return Ok(Some(ProxyRuntimes {
+                                    inner: Protocol::Https(
+                                        crate::proxy::models::Anonymity::Unknown,
+                                    ),
+                                    runtimes,
+                                    driver,
+                                }));
+                            }
+                        }
+                    };
                     let anon = classify_anonymity(&body, &my_ip);
                     Protocol::Https(anon)
                 } else {
