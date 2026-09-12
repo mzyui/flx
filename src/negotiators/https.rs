@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use hyper::Uri;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -58,24 +59,22 @@ impl NegotiatorTrait for HttpsNegotiator {
             );
             stream.write_all(connect_request.as_bytes()).await?;
 
-            let mut reader = tokio::io::BufReader::new(&mut *stream);
-            let mut buf = Vec::with_capacity(16 * 1024);
-            let mut line = Vec::with_capacity(64);
+            // Read byte-by-byte: a buffered reader would swallow any bytes the
+            // upstream sends after the header, corrupting the established tunnel.
+            let mut buf = Vec::with_capacity(1024);
+            let mut byte = [0u8; 1];
             loop {
-                line.clear();
-                if reader.read_until(b'\n', &mut line).await? == 0 {
-                    break;
-                }
-                if buf.len().saturating_add(line.len()) > 16 * 1024 {
+                stream
+                    .read_exact(&mut byte)
+                    .await
+                    .context("HTTPS proxy closed before completing the CONNECT response")?;
+                if buf.len() >= 16 * 1024 {
                     anyhow::bail!("HTTPS proxy response headers exceed limit");
                 }
-                buf.extend_from_slice(&line);
+                buf.push(byte[0]);
                 if buf.ends_with(b"\r\n\r\n") {
                     break;
                 }
-            }
-            if !buf.ends_with(b"\r\n\r\n") {
-                anyhow::bail!("HTTPS proxy response headers exceed limit");
             }
 
             let mut header = [httparse::EMPTY_HEADER; 32];
@@ -99,5 +98,43 @@ impl NegotiatorTrait for HttpsNegotiator {
 
     fn with_tls(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn negotiate_keeps_bytes_after_the_connect_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 256];
+            let _ = socket.read(&mut head).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nGREETING")
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let uri = Uri::try_from("https://example.com:443/").unwrap();
+        HttpsNegotiator
+            .negotiate(&mut stream, &address.to_string(), &uri)
+            .await
+            .unwrap();
+
+        let mut greeting = [0u8; 8];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut greeting),
+        )
+        .await
+        .expect("bytes after the CONNECT head must survive")
+        .unwrap();
+        assert_eq!(&greeting, b"GREETING");
     }
 }

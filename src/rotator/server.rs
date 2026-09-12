@@ -524,19 +524,18 @@ async fn connect_http(
     );
     let handshake = async {
         stream.write_all(request.as_bytes()).await?;
-        let mut reader = tokio::io::BufReader::new(&mut *stream);
+        // Read byte-by-byte: a buffered reader would swallow bytes a
+        // speak-first upstream sends right after the header, corrupting relay.
         let mut response = Vec::with_capacity(128);
-        let mut line = Vec::with_capacity(64);
+        let mut byte = [0u8; 1];
         loop {
-            line.clear();
-            use tokio::io::AsyncBufReadExt as _;
-            if reader.read_until(b'\n', &mut line).await? == 0 {
+            if stream.read_exact(&mut byte).await.is_err() {
                 anyhow::bail!("upstream closed during the CONNECT handshake");
             }
-            if response.len().saturating_add(line.len()) > PROXY_RESPONSE_LIMIT {
+            if response.len() >= PROXY_RESPONSE_LIMIT {
                 anyhow::bail!("upstream CONNECT response exceeds the header limit");
             }
-            response.extend_from_slice(&line);
+            response.push(byte[0]);
             if response.ends_with(b"\r\n\r\n") {
                 break;
             }
@@ -687,6 +686,41 @@ mod tests {
             vec![0x05, 0x01, 0x00],
             "upstream must receive a SOCKS5 method-selection greeting"
         );
+    }
+
+    async fn spawn_speak_first_upstream() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 256];
+            let _ = socket.read(&mut head).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nGREETING")
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn connect_handshake_keeps_bytes_sent_after_the_head() {
+        let upstream = spawn_speak_first_upstream().await;
+        let mut stream = TcpStream::connect(upstream).await.unwrap();
+        connect_http(
+            &mut stream,
+            "127.0.0.1",
+            443,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let mut greeting = [0u8; 8];
+        time::timeout(EXCHANGE_BUDGET, stream.read_exact(&mut greeting))
+            .await
+            .expect("bytes after the CONNECT head must survive")
+            .unwrap();
+        assert_eq!(&greeting, b"GREETING");
     }
 
     #[tokio::test]
