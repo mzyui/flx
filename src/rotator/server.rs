@@ -414,7 +414,18 @@ async fn open_upstream(
     );
 
     let proxy_host = proxy.as_text();
-    match proxy.expected_types.first() {
+    let protocol = proxy
+        .proxy_types
+        .iter()
+        .map(|typed| typed.protocol)
+        .find(|protocol| {
+            matches!(
+                protocol,
+                Protocol::Socks4 | Protocol::Socks5 | Protocol::Https(_)
+            )
+        })
+        .or_else(|| proxy.expected_types.first().copied());
+    match protocol {
         Some(Protocol::Socks4) => {
             let uri = target_uri("http", &request.host, request.port)?;
             let handshake_start = Instant::now();
@@ -625,6 +636,57 @@ mod tests {
         let (never, shutdown) = tokio::sync::watch::channel(false);
         std::mem::forget(never);
         shutdown
+    }
+
+    /// Minimal SOCKS5 server that records the opening greeting.
+    async fn spawn_socks5_upstream() -> (SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            let _ = socket.read_exact(&mut greeting).await;
+            let _ = tx.send(greeting.to_vec());
+            let _ = socket.write_all(&[0x05, 0x00]).await;
+            let mut request = [0u8; 10];
+            let _ = socket.read_exact(&mut request).await;
+            let _ = socket
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+        });
+        (address, rx)
+    }
+
+    #[tokio::test]
+    async fn validated_socks5_proxy_negotiates_socks5() {
+        let (upstream, greeting_rx) = spawn_socks5_upstream().await;
+        let mut proxy = proxy_at(upstream);
+        proxy
+            .proxy_types
+            .push(crate::proxy::models::ProxyType::checked(Protocol::Socks5));
+        let request = ClientRequest {
+            tunnel: true,
+            method: "CONNECT".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 443,
+            authorized: true,
+            forward: Vec::new(),
+        };
+        let options = ServeOptions::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let _stream = open_upstream(&proxy, &request, deadline, 1, &options)
+            .await
+            .expect("a validated SOCKS5 proxy must negotiate SOCKS5");
+        let greeting = time::timeout(EXCHANGE_BUDGET, greeting_rx)
+            .await
+            .expect("upstream must observe the greeting")
+            .expect("greeting sender must live");
+        assert_eq!(
+            greeting,
+            vec![0x05, 0x01, 0x00],
+            "upstream must receive a SOCKS5 method-selection greeting"
+        );
     }
 
     #[tokio::test]
