@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
@@ -17,8 +17,49 @@ use tokio::{
 use super::cache::Cache;
 use crate::{
     providers::{models::Source, parse_all, parsers::ParsedProxy, ProxyProvider},
-    proxy::models::Proxy,
+    proxy::models::{Anonymity, Protocol, Proxy},
 };
+
+/// Cached single-protocol type sets, reusable across every typed row.
+static HTTP_ARCS: LazyLock<[Arc<[Protocol]>; 4]> = LazyLock::new(|| {
+    [
+        Arc::from([Protocol::Http(Anonymity::Transparent)]),
+        Arc::from([Protocol::Http(Anonymity::Anonymous)]),
+        Arc::from([Protocol::Http(Anonymity::Elite)]),
+        Arc::from([Protocol::Http(Anonymity::Unknown)]),
+    ]
+});
+static HTTPS_ARCS: LazyLock<[Arc<[Protocol]>; 4]> = LazyLock::new(|| {
+    [
+        Arc::from([Protocol::Https(Anonymity::Transparent)]),
+        Arc::from([Protocol::Https(Anonymity::Anonymous)]),
+        Arc::from([Protocol::Https(Anonymity::Elite)]),
+        Arc::from([Protocol::Https(Anonymity::Unknown)]),
+    ]
+});
+static SOCKS4_ARC: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| Arc::from([Protocol::Socks4]));
+static SOCKS5_ARC: LazyLock<Arc<[Protocol]>> = LazyLock::new(|| Arc::from([Protocol::Socks5]));
+
+fn anonymity_index(anonymity: Anonymity) -> usize {
+    match anonymity {
+        Anonymity::Transparent => 0,
+        Anonymity::Anonymous => 1,
+        Anonymity::Elite => 2,
+        Anonymity::Unknown => 3,
+    }
+}
+
+/// Returns a shared single-protocol type set, falling back to a fresh
+/// allocation only for the unbounded `Connect(port)` variant.
+pub(crate) fn protocol_arc(protocol: Protocol) -> Arc<[Protocol]> {
+    match protocol {
+        Protocol::Http(anonymity) => Arc::clone(&HTTP_ARCS[anonymity_index(anonymity)]),
+        Protocol::Https(anonymity) => Arc::clone(&HTTPS_ARCS[anonymity_index(anonymity)]),
+        Protocol::Socks4 => Arc::clone(&SOCKS4_ARC),
+        Protocol::Socks5 => Arc::clone(&SOCKS5_ARC),
+        Protocol::Connect(_) => Arc::from([protocol]),
+    }
+}
 
 /// Fetch-phase transitions reported to consumers.
 ///
@@ -74,11 +115,12 @@ pub(crate) fn spawn_phase(
         let job = FetchJob { provider, source };
         let ctx = ctx.clone();
         handles.spawn(async move {
-            let url = job.source.url.to_string();
+            // Keep the source Arc for the error path only; success never formats.
+            let source = Arc::clone(&job.source);
             if let Err(e) = do_work(job, ctx).await {
                 #[cfg(feature = "log")]
-                log::error!("{}: {:#}", url, e);
-                let _ = (url, e);
+                log::error!("{}: {:#}", source.url, e);
+                let _ = (source, e);
             }
         });
     }
@@ -166,16 +208,21 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
                 log::warn!("offline: no cached rows for {url}; skipping");
                 return Ok(());
             }
-            let _permit = ctx
-                .sem
-                .acquire()
-                .await
-                .context("fetcher semaphore closed during shutdown")?;
+            // Throttle before taking a permit so a sleeping host holds no slot.
             throttle_wait(&ctx.settings, &source).await;
-            let body = provider
-                .fetch(Arc::clone(&ctx.client), &url, source.timeout)
-                .await
-                .with_context(|| format!("failed to fetch proxy list from {}", source.url))?;
+            // Hold the network permit only for the fetch; parsing and cache
+            // writes must not occupy a fetch slot.
+            let body = {
+                let _permit = ctx
+                    .sem
+                    .acquire()
+                    .await
+                    .context("fetcher semaphore closed during shutdown")?;
+                provider
+                    .fetch(Arc::clone(&ctx.client), &url, source.timeout)
+                    .await
+                    .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
+            };
             let mode = source.mode.clone();
             let rows = tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
                 .await
@@ -193,7 +240,7 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
 
     for (ip, port, protocol) in rows {
         let proxy = match protocol {
-            Some(protocol) => Proxy::with_expected_types(ip, port, Arc::from([protocol])),
+            Some(protocol) => Proxy::with_expected_types(ip, port, protocol_arc(protocol)),
             None => Proxy::with_expected_types(ip, port, Arc::clone(&expected_types)),
         };
         if ctx.tx.send(proxy).await.is_err() {
@@ -201,4 +248,25 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::protocol_arc;
+    use crate::proxy::models::{Anonymity, Protocol};
+    use std::sync::Arc;
+
+    #[test]
+    fn protocol_arc_reuses_shared_sets_and_falls_back_for_connect() {
+        let first = protocol_arc(Protocol::Http(Anonymity::Elite));
+        let second = protocol_arc(Protocol::Http(Anonymity::Elite));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_ref(), &[Protocol::Http(Anonymity::Elite)]);
+
+        let socks = protocol_arc(Protocol::Socks5);
+        assert_eq!(socks.as_ref(), &[Protocol::Socks5]);
+
+        let connect = protocol_arc(Protocol::Connect(8080));
+        assert_eq!(connect.as_ref(), &[Protocol::Connect(8080)]);
+    }
 }
