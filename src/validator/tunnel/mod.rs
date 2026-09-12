@@ -103,7 +103,8 @@ pub(super) async fn support_tunnel(
     }
     let total_attempts = max_attempts.saturating_mul(candidates.len());
     // Skip judges already cooling down to avoid burning connects.
-    let mut cooling_down = HashSet::with_capacity(candidates.len());
+    // Borrow URLs from `candidates`; no per-failure String clone.
+    let mut cooling_down: HashSet<&str> = HashSet::with_capacity(candidates.len());
     // Share one budget across attempts so stalled tunnels stay bounded.
     let budget_started = time::Instant::now();
     let budget = timeout.saturating_mul(max_attempts as u32);
@@ -119,7 +120,7 @@ pub(super) async fn support_tunnel(
             break;
         }
         let (validation_target, target) = &candidates[offset % candidates.len()];
-        if cooling_down.contains(&validation_target.url) {
+        if cooling_down.contains(validation_target.url.as_str()) {
             continue;
         }
         let started = time::Instant::now();
@@ -183,7 +184,7 @@ pub(super) async fn support_tunnel(
                 );
                 // Cool failing judge to mirror HTTP path behaviour.
                 pool.report_failure(validation_target);
-                cooling_down.insert(validation_target.url.clone());
+                cooling_down.insert(validation_target.url.as_str());
             }
             Err(_elapsed) => {
                 #[cfg(feature = "log")]
@@ -194,7 +195,7 @@ pub(super) async fn support_tunnel(
                     timeout
                 );
                 pool.report_failure(validation_target);
-                cooling_down.insert(validation_target.url.clone());
+                cooling_down.insert(validation_target.url.as_str());
             }
         }
     }

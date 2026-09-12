@@ -40,6 +40,16 @@ static TLS_CONNECTORS: LazyLock<[TlsConnector; 2]> = LazyLock::new(|| {
     ]
 });
 
+/// Signature schemes advertised by the insecure verifier.
+///
+/// Built once: the crypto provider is expensive to construct and the handshake
+/// path queries this on every connection.
+static INSECURE_VERIFY_SCHEMES: LazyLock<Vec<rustls::SignatureScheme>> = LazyLock::new(|| {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .signature_verification_algorithms
+        .supported_schemes()
+});
+
 fn build_client_config(insecure: bool) -> Arc<rustls::ClientConfig> {
     let verifier: Arc<dyn ServerCertVerifier> = if insecure {
         Arc::new(AcceptAnyServerCert)
@@ -147,9 +157,7 @@ impl ServerCertVerifier for AcceptAnyServerCert {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        INSECURE_VERIFY_SCHEMES.clone()
     }
 }
 

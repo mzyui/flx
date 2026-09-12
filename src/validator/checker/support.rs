@@ -297,7 +297,8 @@ pub(crate) async fn support_http(
     // Snapshot judges once per probe instead of per attempt; track cooldowns
     // locally so retries skip judges that failed earlier in this probe.
     let candidates = pool.candidates();
-    let mut cooling_down = HashSet::with_capacity(candidates.len());
+    // Borrow judge URLs from `candidates`; no per-failure String clone.
+    let mut cooling_down: HashSet<&str> = HashSet::with_capacity(candidates.len());
     for attempt in 0..max_attempts {
         if attempt > 0 && !params.retry_delay.is_zero() {
             time::sleep(params.retry_delay).await;
@@ -345,7 +346,7 @@ pub(crate) async fn support_http(
                     log::trace!("{}: local judge unreachable: {:#}", proxy, _e);
                     // Cool failing judge to steer round-robin away from it.
                     pool.report_failure(target);
-                    cooling_down.insert(target.url.clone());
+                    cooling_down.insert(target.url.as_str());
                     continue;
                 }
             };
@@ -360,7 +361,7 @@ pub(crate) async fn support_http(
                 #[cfg(feature = "log")]
                 log::trace!("{}: local judge returned status {}", proxy, inner.status());
                 pool.report_failure(target);
-                cooling_down.insert(target.url.clone());
+                cooling_down.insert(target.url.as_str());
                 continue;
             }
 
@@ -389,7 +390,7 @@ pub(crate) async fn support_http(
                     #[cfg(feature = "log")]
                     log::trace!("{}: response did not originate from the local judge", proxy);
                     pool.report_failure(target);
-                    cooling_down.insert(target.url.clone());
+                    cooling_down.insert(target.url.as_str());
                     continue;
                 }
                 if support_cookies
@@ -420,7 +421,7 @@ pub(crate) async fn support_http(
                     #[cfg(feature = "log")]
                     log::trace!("{}: response did not originate from the local judge", proxy);
                     pool.report_failure(target);
-                    cooling_down.insert(target.url.clone());
+                    cooling_down.insert(target.url.as_str());
                     continue;
                 }
                 if support_cookies
