@@ -230,7 +230,16 @@ pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
         .next()
         .unwrap_or(text)
         .trim();
-    let head = head.rsplit("//").next().unwrap_or(head);
+    // A `//` here is either the scheme separator (`socks5://host:port`, the
+    // scheme ends in `:`) or the start of a trailing comment (`host:port//US`).
+    let head = match head.split_once("//") {
+        Some((scheme, rest)) if scheme.ends_with(':') => {
+            rest.split(['/', '?']).next().unwrap_or(rest)
+        }
+        Some((before, _)) => before,
+        None => head,
+    }
+    .trim();
 
     // Discard trailing fields like country or latency after ip:port.
     let mut fields = head.split(':');
@@ -816,6 +825,29 @@ mod tests {
                 ("13.14.15.16".into(), 80),
             ]
         );
+    }
+
+    #[test]
+    fn parse_pair_handles_scheme_prefixes_and_slash_comments() {
+        assert_eq!(
+            parse_pair("socks5://1.2.3.4:1080"),
+            Some((Ipv4Addr::new(1, 2, 3, 4), 1080))
+        );
+        assert_eq!(
+            parse_pair("http://1.2.3.4:8080/path"),
+            Some((Ipv4Addr::new(1, 2, 3, 4), 8080))
+        );
+        assert_eq!(
+            parse_pair("1.2.3.4:8080//US"),
+            Some((Ipv4Addr::new(1, 2, 3, 4), 8080))
+        );
+    }
+
+    #[test]
+    fn plaintext_keeps_a_pair_followed_by_a_slash_comment() {
+        let parsed = parse_plaintext("5.6.7.8:1080//DE\n");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].1, 1080);
     }
 
     #[test]
