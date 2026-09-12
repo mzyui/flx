@@ -342,7 +342,11 @@ mod tests {
 
     #[test]
     fn ready_target_never_exceeds_the_pool_size() {
-        assert_eq!(ready_target(1, 5), 1, "min_ready above pool_size must clamp");
+        assert_eq!(
+            ready_target(1, 5),
+            1,
+            "min_ready above pool_size must clamp"
+        );
         assert_eq!(ready_target(25, 3), 3);
         assert_eq!(ready_target(0, 4), 1);
         assert_eq!(ready_target(1000, 1000), MAX_POOL_SIZE);
