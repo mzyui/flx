@@ -378,7 +378,11 @@ fn deobfuscate_proxynova_ip(raw: &str) -> Option<Ipv4Addr> {
                 let Ok(code) = token.trim().parse::<i64>() else {
                     continue;
                 };
-                let Some(ch) = u32::try_from(code - offset).ok().and_then(char::from_u32) else {
+                let Some(value) = code.checked_sub(offset).and_then(|v| u32::try_from(v).ok())
+                else {
+                    continue;
+                };
+                let Some(ch) = char::from_u32(value) else {
                     continue;
                 };
                 if buffer.len() - len < 4 {
@@ -825,6 +829,15 @@ mod tests {
                 ("13.14.15.16".into(), 80),
             ]
         );
+    }
+
+    #[test]
+    fn proxynova_ignores_char_codes_that_overflow_the_offset() {
+        // `code - offset` on i64::MIN panicked in overflow-checked builds.
+        assert!(deobfuscate_proxynova_ip(
+            "[-9223372036854775808].map(code => fromCharCode(code-1))"
+        )
+        .is_none());
     }
 
     #[test]
