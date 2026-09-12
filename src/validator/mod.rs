@@ -43,8 +43,8 @@ pub use tunnel::ValidationStatus;
 /// Machine-readable record of one failed probe.
 pub use work::ProxyFailure;
 use work::{
-    advertised_matches_request, aggregate_groups, do_group_work, do_work, GroupMemberJob,
-    GroupWorkResult, SingletonJob, WorkParams,
+    aggregate_groups, do_group_work, do_work, GroupMemberJob, GroupWorkResult, SingletonJob,
+    WorkParams,
 };
 #[cfg(test)]
 use work::{group_finish, result_satisfies_request, GroupState};
@@ -480,106 +480,21 @@ impl ProxyValidator {
                 let proxy = Arc::new(proxy);
                 let proxy_id = next_proxy_id.fetch_add(1, Ordering::Relaxed);
                 let advertised = Arc::clone(&proxy.expected_types);
-                let has_singleton = if probe_missed {
-                    // Requested types the advertised set does not cover (or
-                    // every requested type when nothing is advertised).
-                    expected.iter().any(|requested| {
-                        advertised.is_empty()
-                            || !advertised
-                                .iter()
-                                .any(|adv| advertised_matches_request(adv, requested))
-                    })
-                } else {
-                    advertised.iter().any(|advertised| {
-                        expected
-                            .iter()
-                            .any(|requested| advertised_matches_request(advertised, requested))
-                    })
-                };
                 let has_group = !group_spec.is_empty();
 
-                // Build singleton jobs allocation-free; inputs stay deduplicated.
-                let singleton: futures_util::stream::BoxStream<'static, Job> = if has_singleton {
-                    if probe_missed {
-                        Box::pin(futures_util::stream::unfold(
-                            (
-                                proxy.clone(),
-                                Arc::clone(&expected),
-                                Arc::clone(&advertised),
-                                0usize,
-                            ),
-                            |(proxy, requested, advertised, mut req_idx)| async move {
-                                loop {
-                                    if req_idx >= requested.len() {
-                                        return None;
-                                    }
-                                    let req = &requested[req_idx];
-                                    let is_new =
-                                        !requested[..req_idx].iter().any(|seen| seen == req);
-                                    req_idx += 1;
-                                    let covered = advertised
-                                        .iter()
-                                        .any(|adv| advertised_matches_request(adv, req));
-                                    if is_new && !covered {
-                                        return Some((
-                                            Job::Singleton {
-                                                proxy: Arc::clone(&proxy),
-                                                protocol: *req,
-                                                requested: *req,
-                                            },
-                                            (proxy, requested, advertised, req_idx),
-                                        ));
-                                    }
-                                }
-                            },
-                        ))
-                    } else {
-                        let state = (
-                            proxy.clone(),
-                            advertised,
-                            Arc::clone(&expected),
-                            0usize,
-                            0usize,
-                        );
-                        Box::pin(futures_util::stream::unfold(
-                            state,
-                            |(proxy, advertised, requested, mut adv_idx, mut req_idx)| async move {
-                                loop {
-                                    if adv_idx >= advertised.len() {
-                                        return None;
-                                    }
-                                    let adv = &advertised[adv_idx];
-                                    if advertised[..adv_idx].iter().any(|seen| seen == adv) {
-                                        adv_idx += 1;
-                                        req_idx = 0;
-                                        continue;
-                                    }
-                                    while req_idx < requested.len() {
-                                        let req = &requested[req_idx];
-                                        let requested_is_new =
-                                            !requested[..req_idx].iter().any(|seen| seen == req);
-                                        req_idx += 1;
-                                        if requested_is_new && advertised_matches_request(adv, req)
-                                        {
-                                            return Some((
-                                                Job::Singleton {
-                                                    proxy: Arc::clone(&proxy),
-                                                    protocol: *adv,
-                                                    requested: *req,
-                                                },
-                                                (proxy, advertised, requested, adv_idx, req_idx),
-                                            ));
-                                        }
-                                    }
-                                    adv_idx += 1;
-                                    req_idx = 0;
-                                }
-                            },
-                        ))
-                    }
-                } else {
-                    Box::pin(futures_util::stream::empty())
-                };
+                // Collapse to unique probes; see `work::singleton_jobs`.
+                let singleton_jobs =
+                    work::singleton_jobs(advertised.as_ref(), expected.as_ref(), probe_missed);
+
+                let singleton_proxy = Arc::clone(&proxy);
+                let singleton: futures_util::stream::BoxStream<'static, Job> =
+                    Box::pin(futures_util::stream::iter(singleton_jobs.into_iter().map(
+                        move |(protocol, requested)| Job::Singleton {
+                            proxy: Arc::clone(&singleton_proxy),
+                            protocol,
+                            requested,
+                        },
+                    )));
 
                 let group: futures_util::stream::BoxStream<'static, Job> = if has_group {
                     Box::pin(futures_util::stream::unfold(
@@ -804,10 +719,10 @@ impl Drop for ProxyValidator {
 
 #[cfg(test)]
 mod tests {
+    use super::work::advertised_matches_request;
     use super::{
-        advertised_matches_request, group_finish, result_satisfies_request,
-        validator_channel_capacity, Config, GroupState, ProbeGate, ProxyValidator,
-        VALIDATOR_CHANNEL_MAX, VALIDATOR_CHANNEL_MIN,
+        group_finish, result_satisfies_request, validator_channel_capacity, Config, GroupState,
+        ProbeGate, ProxyValidator, VALIDATOR_CHANNEL_MAX, VALIDATOR_CHANNEL_MIN,
     };
     use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType};
 
@@ -1160,18 +1075,50 @@ mod tests {
 
     #[tokio::test]
     async fn total_counts_each_singleton_job_not_each_proxy() {
-        // Guard job-based total matching done on multi-type runs.
-        let judge = spawn_echo_judge().await;
+        // Guard job-based total matching done on multi-type runs; the two
+        // advertised families are distinct, so each yields one probe.
+        let http_judge = spawn_echo_judge().await;
+        let tunnel_judge = spawn_echo_judge().await;
         let candidates = (1u16..=2).map(|port| {
             Proxy::with_expected_types(
                 std::net::Ipv4Addr::LOCALHOST,
                 port,
-                std::sync::Arc::from([
-                    Protocol::Http(Anonymity::Anonymous),
-                    Protocol::Http(Anonymity::Unknown),
-                ]),
+                std::sync::Arc::from([Protocol::Http(Anonymity::Unknown), Protocol::Socks5]),
             )
         });
+        let config = Config {
+            types: vec![Protocol::Http(Anonymity::Unknown), Protocol::Socks5],
+            http_judge_urls: vec![http_judge],
+            https_judge_urls: vec![tunnel_judge],
+            ..Config::default()
+        };
+        let mut validator =
+            ProxyValidator::validate(futures_util::stream::iter(candidates), config)
+                .await
+                .unwrap();
+        let progress = validator.progress();
+        while validator.get_one().await.is_some() {}
+        assert_eq!(progress.total(), 4);
+        assert_eq!(progress.done(), 4);
+        assert!(progress.fraction() <= 1.0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_http_families_collapse_to_one_probe() {
+        // Guard collapsing advertised HTTP levels that probe identically.
+        let judge = spawn_echo_judge().await;
+        let candidates: Vec<Proxy> = (1u16..=3)
+            .map(|port| {
+                Proxy::with_expected_types(
+                    std::net::Ipv4Addr::LOCALHOST,
+                    port,
+                    std::sync::Arc::from([
+                        Protocol::Http(Anonymity::Anonymous),
+                        Protocol::Http(Anonymity::Unknown),
+                    ]),
+                )
+            })
+            .collect();
         let config = Config {
             types: vec![Protocol::Http(Anonymity::Unknown)],
             http_judge_urls: vec![judge],
@@ -1184,9 +1131,9 @@ mod tests {
                 .unwrap();
         let progress = validator.progress();
         while validator.get_one().await.is_some() {}
-        assert_eq!(progress.total(), 4);
-        assert_eq!(progress.done(), 4);
-        assert!(progress.fraction() <= 1.0);
+        // One probe per candidate, not two.
+        assert_eq!(progress.total(), 3);
+        assert_eq!(progress.done(), 3);
     }
 
     #[tokio::test]

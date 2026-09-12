@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -81,6 +81,84 @@ pub(crate) fn advertised_matches_request(advertised: &Protocol, requested: &Prot
     protocol_matches(advertised, requested, |left, right| {
         matches!(left, Anonymity::Unknown) || matches!(right, Anonymity::Unknown) || left == right
     })
+}
+
+/// Identity of an actual probe.
+///
+/// HTTP(S) anonymity is *measured* by the probe, never used to perform it, so
+/// it is erased here; Socks/Connect variants keep their exact shape. Two jobs
+/// with the same probe family and requested level probe identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ProbeFamily {
+    Http,
+    Https,
+    Socks4,
+    Socks5,
+    Connect(u16),
+}
+
+pub(crate) fn probe_family(protocol: &Protocol) -> ProbeFamily {
+    match protocol {
+        Protocol::Http(_) => ProbeFamily::Http,
+        Protocol::Https(_) => ProbeFamily::Https,
+        Protocol::Socks4 => ProbeFamily::Socks4,
+        Protocol::Socks5 => ProbeFamily::Socks5,
+        Protocol::Connect(port) => ProbeFamily::Connect(*port),
+    }
+}
+
+/// Builds the unique `(probe protocol, requested protocol)` pairs for one proxy.
+///
+/// HTTP(S) anonymity is measured by the probe, so advertised levels of the same
+/// family collapse into a single probe; the requested level stays exact. With
+/// `probe_missed`, only requested types the advertisement does not cover are
+/// probed (every request when nothing is advertised).
+pub(crate) fn singleton_jobs(
+    advertised: &[Protocol],
+    requested: &[Protocol],
+    probe_missed: bool,
+) -> Vec<(Protocol, Protocol)> {
+    if probe_missed {
+        let mut seen: Vec<Protocol> = Vec::with_capacity(requested.len());
+        let mut jobs = Vec::new();
+        for requested in requested {
+            if seen.contains(requested) {
+                continue;
+            }
+            seen.push(*requested);
+            let covered = advertised
+                .iter()
+                .any(|adv| advertised_matches_request(adv, requested));
+            if !covered {
+                jobs.push((*requested, *requested));
+            }
+        }
+        jobs
+    } else {
+        let mut seen_keys: HashSet<(ProbeFamily, Protocol)> = HashSet::new();
+        let mut seen_adv: Vec<Protocol> = Vec::with_capacity(advertised.len());
+        let mut jobs = Vec::new();
+        for adv in advertised {
+            if seen_adv.contains(adv) {
+                continue;
+            }
+            seen_adv.push(*adv);
+            let mut seen_req: Vec<Protocol> = Vec::with_capacity(requested.len());
+            for req in requested {
+                if seen_req.contains(req) {
+                    continue;
+                }
+                seen_req.push(*req);
+                if !advertised_matches_request(adv, req) {
+                    continue;
+                }
+                if seen_keys.insert((probe_family(adv), *req)) {
+                    jobs.push((*adv, *req));
+                }
+            }
+        }
+        jobs
+    }
 }
 
 pub(crate) fn result_satisfies_request(result: &Protocol, requested: &Protocol) -> bool {
@@ -440,6 +518,53 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty(),
             "a completed group's dead flag must be evicted"
+        );
+    }
+
+    #[test]
+    fn duplicate_http_families_collapse_to_one_probe() {
+        let advertised = [
+            Protocol::Http(Anonymity::Anonymous),
+            Protocol::Http(Anonymity::Unknown),
+        ];
+        let requested = [Protocol::Http(Anonymity::Unknown)];
+
+        let jobs = singleton_jobs(&advertised, &requested, false);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1, Protocol::Http(Anonymity::Unknown));
+        assert_eq!(probe_family(&jobs[0].0), ProbeFamily::Http);
+    }
+
+    #[test]
+    fn distinct_families_produce_one_job_each() {
+        let advertised = [Protocol::Http(Anonymity::Unknown), Protocol::Socks5];
+        let requested = [Protocol::Http(Anonymity::Unknown), Protocol::Socks5];
+
+        let jobs = singleton_jobs(&advertised, &requested, false);
+
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[test]
+    fn probe_missed_skips_covered_requests() {
+        let advertised = [Protocol::Http(Anonymity::Unknown)];
+        let requested = [Protocol::Http(Anonymity::Unknown), Protocol::Socks5];
+
+        let jobs = singleton_jobs(&advertised, &requested, true);
+
+        assert_eq!(jobs, vec![(Protocol::Socks5, Protocol::Socks5)]);
+    }
+
+    #[test]
+    fn probe_family_ignores_http_anonymity_but_keeps_connect_port() {
+        assert_eq!(
+            probe_family(&Protocol::Http(Anonymity::Elite)),
+            probe_family(&Protocol::Http(Anonymity::Unknown))
+        );
+        assert_ne!(
+            probe_family(&Protocol::Connect(80)),
+            probe_family(&Protocol::Connect(443))
         );
     }
 }
