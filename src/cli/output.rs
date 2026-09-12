@@ -258,12 +258,17 @@ where
     if options.append && matches!(format, "json" | "pretty-json") {
         anyhow::bail!("--append cannot be combined with the {format} format");
     }
-    let chained = finalize.continue_json.is_some();
+    // Only a pass that continues an earlier one appends; the first pass of a
+    // command truncates so stale output from a previous run cannot survive.
+    let continuing = finalize
+        .continue_json
+        .as_ref()
+        .is_some_and(|chain| !chain.leave_open);
     let mut output_file = match options.output_file.as_ref() {
         Some(file_path) => {
             let mut open = tokio::fs::OpenOptions::new();
             open.write(true).create(true);
-            if options.append || chained {
+            if options.append || continuing {
                 open.append(true);
             } else {
                 open.truncate(true);

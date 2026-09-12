@@ -974,6 +974,36 @@ fn fallback_pass_extends_the_json_array_instead_of_truncating() {
 }
 
 #[test]
+fn first_chained_pass_truncates_stale_output() {
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let (options, path) = output_options("text", 0);
+    std::fs::write(&path, "stale bytes\n").unwrap();
+    rt.block_on(async {
+        process_result(
+            stream::iter(vec![sample_proxy(1)]),
+            options,
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts {
+                continue_json: Some(JsonContinuation {
+                    doc: Arc::new(JsonDoc::default()),
+                    leave_open: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !content.contains("stale bytes"),
+        "the first pass must truncate the file: {content:?}"
+    );
+}
+
+#[test]
 fn skipped_fallback_after_partial_pass_closes_the_open_array() {
     let rt = runtime::Builder::new_current_thread().build().unwrap();
     let (options, path) = output_options("json", 0);
