@@ -157,11 +157,11 @@ impl Throttle {
             match next_slot.get_mut(host) {
                 Some(previous) => {
                     let avail_at = (*previous).max(now);
-                    *previous = avail_at + delay;
+                    *previous = avail_at.checked_add(delay).unwrap_or(avail_at);
                     avail_at
                 }
                 None => {
-                    next_slot.insert(host.to_owned(), now + delay);
+                    next_slot.insert(host.to_owned(), now.checked_add(delay).unwrap_or(now));
                     now
                 }
             }
@@ -268,5 +268,17 @@ mod tests {
 
         let connect = protocol_arc(Protocol::Connect(8080));
         assert_eq!(connect.as_ref(), &[Protocol::Connect(8080)]);
+    }
+
+    #[tokio::test]
+    async fn throttle_saturates_an_oversized_delay() {
+        let throttle = super::Throttle::new();
+        let huge = std::time::Duration::from_secs(u64::MAX);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            throttle.wait("example.com", huge),
+        )
+        .await
+        .expect("an out-of-range delay must not be slept off");
     }
 }

@@ -182,7 +182,9 @@ pub trait ProxyProvider {
         let mut pending_len = 0usize;
         let mut visited: HashSet<url::Url> = HashSet::new();
         let mut redirect_count = 0usize;
-        let deadline = time::Instant::now() + timeout;
+        let deadline = time::Instant::now()
+            .checked_add(timeout)
+            .with_context(|| format!("provider fetch timeout {timeout:?} is out of range"))?;
 
         while let Some((url, previous_url)) = urls.pop_front() {
             if !visited.insert(url.clone()) {
