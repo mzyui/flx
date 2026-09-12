@@ -22,6 +22,7 @@ graphify-out/
 
 # Editor & agent working directories
 .claude/
+.commandcode/
 .opencode
 .agents/
 skills-lock.json
