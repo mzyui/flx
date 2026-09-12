@@ -165,7 +165,10 @@ fn decode_rows(body: &[u8]) -> Option<Vec<ParsedProxy>> {
         return None;
     }
     let n = u32::from_le_bytes(body[8..12].try_into().ok()?) as usize;
-    let mut rows = Vec::with_capacity(n);
+    // Bound the reservation by what the body can actually hold: a corrupted
+    // header must not trigger a multi-gigabyte allocation.
+    let max_rows = (body.len() - 12) / 7;
+    let mut rows = Vec::with_capacity(n.min(max_rows));
     let mut cursor = 12;
     for _ in 0..n {
         if cursor + 7 > body.len() {
@@ -233,6 +236,14 @@ mod tests {
 
     fn cleanup(dir: &PathBuf) {
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decode_rows_rejects_an_impossible_row_count() {
+        // Magic + a row count the body cannot possibly back.
+        let mut body = Vec::from(&CACHE_MAGIC[..]);
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_rows(&body).is_none());
     }
 
     #[tokio::test]
