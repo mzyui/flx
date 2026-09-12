@@ -621,6 +621,43 @@ fn process_result_caps_single_quota_below_global_limit() {
 }
 
 #[test]
+fn process_result_applies_quota_once_on_the_buffered_path() {
+    let proxies: Vec<Proxy> = (1u8..=4)
+        .map(|ip| quota_proxy(ip, Protocol::Http(Anonymity::Elite)))
+        .collect();
+    let rt = runtime::Builder::new_current_thread().build().unwrap();
+    let (mut options, path) = output_options("json-lines", 10);
+    options.sort = Some("response-time".to_owned());
+    let enforcer = Arc::new(std::sync::Mutex::new(super::quotas::QuotaEnforcer::new(
+        vec![super::quotas::TypeQuota {
+            protocol: Protocol::Http(Anonymity::Unknown),
+            quota: Some(2),
+        }],
+    )));
+    rt.block_on(async {
+        process_result(
+            stream::iter(proxies),
+            options,
+            Arc::new(tokio::sync::Notify::new()),
+            &NoopGuard,
+            FinalizeOpts {
+                quotas: Some(enforcer),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let content = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        parse_json_lines(&content).len(),
+        2,
+        "sorting must not consume the quota twice"
+    );
+}
+
+#[test]
 fn process_result_mixed_quota_and_uncapped_fills_global_limit() {
     let mut proxies: Vec<Proxy> = (1u8..=3)
         .map(|ip| quota_proxy(ip, Protocol::Http(Anonymity::Elite)))

@@ -295,6 +295,9 @@ where
     let filter = Arc::new(ProxyFilter::from_options(&options));
     let quotas = finalize.quotas.clone();
     let buffered_path = options.sort.is_some() || options.shuffle;
+    // The buffering loop already runs `should_emit`, so the emit/PAC loops
+    // must not run it again (it is stateful and would consume caps twice).
+    let quotas_applied = buffered_path;
     let source: std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>> = if buffered_path {
         // Buffer sorted output interruptibly so cancel keeps arrivals.
         let mut buffered: Vec<Proxy> = Vec::new();
@@ -363,14 +366,16 @@ where
                 }
                 item = source.next() => {
                     let Some(proxy) = item else { break };
-                    if let Some(enforcer) = &quotas {
-                        let mut enforcer =
-                            enforcer.lock().unwrap_or_else(|e| e.into_inner());
-                        if !enforcer.should_emit(&proxy) {
-                            if enforcer.is_satisfied() {
-                                break;
+                    if !quotas_applied {
+                        if let Some(enforcer) = &quotas {
+                            let mut enforcer =
+                                enforcer.lock().unwrap_or_else(|e| e.into_inner());
+                            if !enforcer.should_emit(&proxy) {
+                                if enforcer.is_satisfied() {
+                                    break;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                     proxies.push(proxy);
@@ -378,7 +383,7 @@ where
                     if options.limit > 0 && rows >= options.limit {
                         break;
                     }
-                    if quotas_satisfied(&quotas) {
+                    if !quotas_applied && quotas_satisfied(&quotas) {
                         break;
                     }
                 }
@@ -456,14 +461,16 @@ where
             item = source.next() => {
                 let Some(proxy) = item else { break };
                 // Enforce quotas before serializing; filled caps stop early.
-                if let Some(enforcer) = &quotas {
-                    let mut enforcer =
-                        enforcer.lock().unwrap_or_else(|e| e.into_inner());
-                    if !enforcer.should_emit(&proxy) {
-                        if enforcer.is_satisfied() {
-                            break;
+                if !quotas_applied {
+                    if let Some(enforcer) = &quotas {
+                        let mut enforcer =
+                            enforcer.lock().unwrap_or_else(|e| e.into_inner());
+                        if !enforcer.should_emit(&proxy) {
+                            if enforcer.is_satisfied() {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
                     }
                 }
                 buf.clear();
@@ -560,7 +567,10 @@ where
                     }
                     rows += 1;
                 }
-                if (options.limit > 0 && rows >= options.limit) || quotas_satisfied(&quotas) {
+                if options.limit > 0 && rows >= options.limit {
+                    break;
+                }
+                if !quotas_applied && quotas_satisfied(&quotas) {
                     break;
                 }
             }
