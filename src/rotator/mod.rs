@@ -302,12 +302,8 @@ impl Rotator {
             .await
             .with_context(|| format!("failed to bind the rotating endpoint on {address}"))?;
 
-        wait_for_ready(
-            &self.pool,
-            &self.ready_bypass,
-            self.options.min_ready.min(MAX_POOL_SIZE),
-        )
-        .await;
+        let ready_target = ready_target(self.options.pool_size, self.options.min_ready);
+        wait_for_ready(&self.pool, &self.ready_bypass, ready_target).await;
 
         server::accept_loop(
             listener,
@@ -318,6 +314,11 @@ impl Rotator {
         .await;
         Ok(())
     }
+}
+
+/// Readiness target, never above what the feeder will actually pool.
+fn ready_target(pool_size: usize, min_ready: usize) -> usize {
+    min_ready.min(pool_size.max(1)).min(MAX_POOL_SIZE)
 }
 
 /// Poll pool readiness until bypass or timeout.
@@ -338,6 +339,14 @@ use anyhow::Context as _;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_target_never_exceeds_the_pool_size() {
+        assert_eq!(ready_target(1, 5), 1, "min_ready above pool_size must clamp");
+        assert_eq!(ready_target(25, 3), 3);
+        assert_eq!(ready_target(0, 4), 1);
+        assert_eq!(ready_target(1000, 1000), MAX_POOL_SIZE);
+    }
 
     #[tokio::test]
     async fn single_ready_proxy_goes_live_immediately() {

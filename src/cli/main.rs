@@ -703,13 +703,14 @@ async fn run_serve(
         protocols.push(Protocol::Http(Anonymity::Unknown));
     }
 
+    let pool_size = serve.pool_size.clamp(1, flx::rotator::MAX_POOL_SIZE);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(flx::rotator::EVENT_CHANNEL_CAPACITY);
     let options = flx::ServeOptions {
         bind: serve.bind,
         port: serve.port,
         strategy: flx::Strategy::parse(&serve.strategy).context("unknown rotation strategy")?,
-        pool_size: serve.pool_size.clamp(1, flx::rotator::MAX_POOL_SIZE),
-        min_ready: serve.min_ready.clamp(1, flx::rotator::MAX_POOL_SIZE),
+        pool_size,
+        min_ready: serve.min_ready.clamp(1, pool_size),
         refresh_secs: serve
             .refresh_secs
             .unwrap_or(flx::rotator::DEFAULT_REFRESH_SECS),
@@ -737,8 +738,7 @@ async fn run_serve(
         })?;
     let rotator = Arc::new(flx::Rotator::new(options));
     let pool = rotator.pool();
-    let pool_size = serve.pool_size.clamp(1, flx::rotator::MAX_POOL_SIZE);
-    let min_ready = serve.min_ready.clamp(1, flx::rotator::MAX_POOL_SIZE);
+    let min_ready = serve.min_ready.clamp(1, pool_size);
     let endpoint = format!("{}:{}", serve.bind, serve.port);
     let serve_bar = make_serve_bar(
         Arc::clone(&pool),
