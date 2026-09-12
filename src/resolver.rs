@@ -193,7 +193,8 @@ fn build_a_query(
             anyhow::bail!("DNS label exceeds {DNS_MAX_LABEL_LEN} bytes in `{domain}`");
         }
         let end = len + 1 + label.len();
-        if end > out.len() - DNS_QUESTION_TAIL_LEN {
+        // Reserve the trailing root label plus TYPE/CLASS, not just the tail.
+        if end + 1 + DNS_QUESTION_TAIL_LEN > out.len() {
             anyhow::bail!("DNS name `{domain}` exceeds the {DNS_MAX_NAME_LEN}-byte wire limit");
         }
         out[len] = label.len() as u8;
@@ -507,6 +508,21 @@ mod tests {
             "d".repeat(63)
         );
         assert!(build_a_query(&long_name, 1, &mut buffer).is_err());
+    }
+
+    #[test]
+    fn a_query_rejects_a_name_exactly_filling_the_buffer() {
+        let mut buffer = [0u8; DNS_QUERY_BUFFER_LEN];
+        // 63+63+63+62 payload bytes land the last label end at 267, the old
+        // guard's off-by-one boundary that then wrote past the buffer.
+        let name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        assert!(build_a_query(&name, 1, &mut buffer).is_err());
     }
 
     #[test]
