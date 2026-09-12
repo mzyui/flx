@@ -95,8 +95,16 @@ impl PauseGate {
 
     /// Waits while paused; returns immediately when running.
     pub async fn wait_if_paused(&self) {
-        while self.is_paused() {
-            self.notify.notified().await;
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before re-checking: `resume` uses `notify_waiters`, which
+            // is a no-op when no waiter is registered yet.
+            notified.as_mut().enable();
+            if !self.is_paused() {
+                break;
+            }
+            notified.await;
         }
     }
 }
@@ -722,7 +730,7 @@ mod tests {
     use super::work::advertised_matches_request;
     use super::{
         group_finish, result_satisfies_request, validator_channel_capacity, Config, GroupState,
-        ProbeGate, ProxyValidator, VALIDATOR_CHANNEL_MAX, VALIDATOR_CHANNEL_MIN,
+        PauseGate, ProbeGate, ProxyValidator, VALIDATOR_CHANNEL_MAX, VALIDATOR_CHANNEL_MIN,
     };
     use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType};
 
@@ -935,6 +943,24 @@ mod tests {
         assert_eq!(progress.passed(), 0);
         assert_eq!(progress.remaining(), 0);
         assert!((progress.fraction() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pause_resume_never_loses_a_wakeup() {
+        for _ in 0..500 {
+            let gate = std::sync::Arc::new(PauseGate::new());
+            gate.pause();
+            let waiter = {
+                let gate = std::sync::Arc::clone(&gate);
+                tokio::spawn(async move { gate.wait_if_paused().await })
+            };
+            tokio::task::yield_now().await;
+            gate.resume();
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+                .await
+                .expect("waiter must wake after resume")
+                .unwrap();
+        }
     }
 
     #[tokio::test]
