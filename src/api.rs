@@ -345,6 +345,16 @@ impl Flx {
                     .to_owned(),
             ));
         }
+        if validation_choice == ValidationChoice::Explicit
+            && validator_config.types.is_empty()
+            && validator_config.groups.is_empty()
+        {
+            return Err(FlxError::Config(
+                "validation target is empty; pass at least one type to .types(..) or \
+                 .groups(..), or call .no_validate()"
+                    .to_owned(),
+            ));
+        }
 
         let source = match source {
             SourceKind::Fetcher => Box::pin(
@@ -851,6 +861,27 @@ mod tests {
         assert_eq!(progress.done(), 0);
         assert_eq!(progress.passed(), 0);
         assert!(run.take_failures().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_explicit_validation_target_is_rejected() {
+        let result = Flx::fetch()
+            .types(Vec::<Protocol>::new())
+            .stream_with_progress()
+            .await;
+        assert!(
+            matches!(result, Err(FlxError::Config(_))),
+            "an explicitly empty target must not silently skip validation"
+        );
+
+        let result = Flx::fetch()
+            .groups(Vec::<Vec<Protocol>>::new())
+            .stream_with_progress()
+            .await;
+        assert!(
+            matches!(result, Err(FlxError::Config(_))),
+            "an explicitly empty group list must not silently skip validation"
+        );
     }
 
     #[tokio::test]
