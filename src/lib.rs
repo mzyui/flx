@@ -49,6 +49,8 @@ pub mod filters;
 pub mod geolookup;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod test_support;
 
 mod api;
