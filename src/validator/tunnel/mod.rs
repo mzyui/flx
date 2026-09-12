@@ -134,12 +134,18 @@ pub(super) async fn support_tunnel(
             Ok(Ok((body, driver))) => {
                 pool.report_success(validation_target, started.elapsed());
                 let mut runtimes = RuntimeStats::default();
-                // Run my-IP lookup on fixed budget; never reject live tunnels for it.
+                // Bound the my-IP lookup by the probe deadline; never reject live tunnels for it.
                 let protocol = if needs_anonymity {
                     let my_ip = if let Some(cached) = cached_my_ip() {
                         cached
                     } else {
-                        match my_ip().await {
+                        let lookup = match time::timeout_at(deadline, my_ip()).await {
+                            Ok(result) => result,
+                            Err(elapsed) => Err(anyhow::anyhow!(
+                                "my_ip lookup exceeded the probe deadline ({elapsed})"
+                            )),
+                        };
+                        match lookup {
                             Ok(ip) => ip,
                             Err(error) => {
                                 #[cfg(feature = "log")]

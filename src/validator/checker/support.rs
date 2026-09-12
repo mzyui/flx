@@ -439,7 +439,13 @@ pub(crate) async fn support_http(
                     continue;
                 }
                 // Degrade to Unknown when my-IP lookup fails; never fail live proxy.
-                let my_ip = match my_ip().await {
+                let lookup = match time::timeout_at(deadline, my_ip()).await {
+                    Ok(result) => result,
+                    Err(elapsed) => Err(anyhow::anyhow!(
+                        "my_ip lookup exceeded the probe deadline ({elapsed})"
+                    )),
+                };
+                let my_ip = match lookup {
                     Ok(ip) => ip,
                     Err(error) => {
                         #[cfg(feature = "log")]
