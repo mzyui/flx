@@ -6,6 +6,7 @@
 use std::{
     borrow::Cow,
     collections::{HashSet, VecDeque},
+    io::Write,
     sync::Arc,
     time::Duration,
 };
@@ -22,6 +23,7 @@ const MAX_SOURCE_BODY_BYTES: usize = 8 * 1024 * 1024;
 // Pre-size buffer; sources are small and frames accumulate incrementally.
 const SOURCE_BODY_INITIAL_CAPACITY: usize = 64 * 1024;
 const MAX_REDIRECTS: usize = 10;
+const ACCEPT_ENCODING: &str = "gzip";
 
 use crate::proxy::models::{Protocol, Proxy};
 
@@ -177,9 +179,6 @@ pub trait ProxyProvider {
         urls.push_back((initial_url, None));
 
         let user_agent = crate::user_agent::next_user_agent();
-        let mut content = String::with_capacity(SOURCE_BODY_INITIAL_CAPACITY);
-        let mut pending = [0u8; 3];
-        let mut pending_len = 0usize;
         let mut visited: HashSet<url::Url> = HashSet::new();
         let mut redirect_count = 0usize;
         let deadline = time::Instant::now()
@@ -192,7 +191,8 @@ pub trait ProxyProvider {
             }
             let mut req = Request::builder()
                 .uri(url.as_str())
-                .header(hyper::header::USER_AGENT, user_agent);
+                .header(hyper::header::USER_AGENT, user_agent)
+                .header(hyper::header::ACCEPT_ENCODING, ACCEPT_ENCODING);
 
             if let Some(previous_url) = previous_url {
                 req = req.header(hyper::header::REFERER, previous_url.as_str());
@@ -244,8 +244,15 @@ pub trait ProxyProvider {
                         MAX_SOURCE_BODY_BYTES
                     );
                 }
-                content.reserve(length.saturating_sub(content.len()));
             }
+            let capacity = declared.unwrap_or(SOURCE_BODY_INITIAL_CAPACITY);
+            let encoding = response
+                .headers()
+                .get(hyper::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_ascii_lowercase());
+            let mut decoder = BodyDecoder::new(encoding.as_deref(), capacity)
+                .with_context(|| format!("unsupported encoding from {}", url))?;
 
             // Bound body reads by the same deadline to release permits on stalls.
             while let Some(next) = time::timeout_at(deadline, response.frame())
@@ -255,21 +262,24 @@ pub trait ProxyProvider {
                 let frame =
                     next.with_context(|| format!("body stream from {} was interrupted", url))?;
                 if let Some(chunk) = frame.data_ref() {
-                    if content.len().saturating_add(chunk.len()) > MAX_SOURCE_BODY_BYTES {
+                    decoder
+                        .write_all(chunk)
+                        .with_context(|| format!("failed to decode body from {}", url))?;
+                    if decoder.len() > MAX_SOURCE_BODY_BYTES {
                         anyhow::bail!(
                             "response body from {} exceeds {} bytes",
                             url,
                             MAX_SOURCE_BODY_BYTES
                         );
                     }
-                    append_utf8(&mut content, &mut pending, &mut pending_len, chunk)?;
                 }
             }
+            return decoder
+                .finish()
+                .map(Cow::Owned)
+                .with_context(|| format!("failed to decode body from {}", url));
         }
-        if pending_len > 0 {
-            anyhow::bail!("provider response body is not valid UTF-8");
-        }
-        Ok(Cow::Owned(content))
+        anyhow::bail!("provider returned no body for {url}")
     }
 
     /// Parses `html` as plaintext and forwards proxies to `tx`.
@@ -403,12 +413,97 @@ fn append_utf8(
     Ok(())
 }
 
+struct Utf8Collector {
+    content: String,
+    pending: [u8; 3],
+    pending_len: usize,
+}
+
+impl Utf8Collector {
+    fn new(capacity: usize) -> Self {
+        Self {
+            content: String::with_capacity(capacity),
+            pending: [0u8; 3],
+            pending_len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.content.len() + self.pending_len
+    }
+
+    fn finish(self) -> anyhow::Result<String> {
+        if self.pending_len > 0 {
+            anyhow::bail!("provider response body is not valid UTF-8");
+        }
+        Ok(self.content)
+    }
+}
+
+impl Write for Utf8Collector {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        append_utf8(
+            &mut self.content,
+            &mut self.pending,
+            &mut self.pending_len,
+            buf,
+        )
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+enum BodyDecoder {
+    Identity(Utf8Collector),
+    Gzip(Box<flate2::write::GzDecoder<Utf8Collector>>),
+}
+
+impl BodyDecoder {
+    fn new(encoding: Option<&str>, capacity: usize) -> anyhow::Result<Self> {
+        let collector = Utf8Collector::new(capacity);
+        match encoding {
+            None | Some("") | Some("identity") => Ok(Self::Identity(collector)),
+            Some("gzip") | Some("x-gzip") => Ok(Self::Gzip(Box::new(
+                flate2::write::GzDecoder::new(collector),
+            ))),
+            Some(other) => anyhow::bail!("unsupported Content-Encoding `{other}`"),
+        }
+    }
+
+    fn write_all(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        match self {
+            Self::Identity(collector) => collector.write_all(chunk)?,
+            Self::Gzip(decoder) => decoder.write_all(chunk)?,
+        }
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Identity(collector) => collector.len(),
+            Self::Gzip(decoder) => decoder.get_ref().len(),
+        }
+    }
+
+    fn finish(self) -> anyhow::Result<String> {
+        match self {
+            Self::Identity(collector) => collector.finish(),
+            Self::Gzip(decoder) => decoder.finish()?.finish(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{select_providers, ProxyProvider, ScrapeContext, MAX_REDIRECTS};
     use http_body_util::Empty;
     use hyper::body::Bytes;
     use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+    use std::io::Write;
     use std::sync::Arc;
     use std::{borrow::Cow, time::Duration};
     use tokio::{
@@ -527,6 +622,61 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{error:#}").contains("exceeds"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_decodes_a_gzip_body_into_utf8() {
+        let payload = "1.2.3.4:8080\n5.6.7.8:3128\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/gzip");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_headers(&mut stream).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                compressed.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(&compressed).await.unwrap();
+        });
+
+        let body = TestProvider
+            .fetch(test_client(), &url, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(body, payload);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_an_unsupported_content_encoding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/brotli");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody",
+                )
+                .await
+                .unwrap();
+        });
+
+        let error = TestProvider
+            .fetch(test_client(), &url, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unsupported encoding"));
         server.abort();
     }
 
