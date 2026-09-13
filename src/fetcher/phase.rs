@@ -16,7 +16,7 @@ use tokio::{
 
 use super::cache::Cache;
 use crate::{
-    providers::{models::Source, parse_all, parsers::ParsedProxy, ProxyProvider},
+    providers::{models::Source, parsers::ParsedProxy, visit, ProxyProvider},
     proxy::models::{Anonymity, Protocol, Proxy},
 };
 
@@ -242,8 +242,8 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
         None => None,
     };
 
-    let rows: Vec<ParsedProxy> = match cached {
-        Some(rows) => rows,
+    let cached_rows: Option<Vec<ParsedProxy>> = match cached {
+        Some(rows) => Some(rows),
         None => {
             if ctx.settings.offline {
                 #[cfg(feature = "log")]
@@ -294,21 +294,43 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
             #[cfg(feature = "log")]
             let body_len = body.len();
             let mode = source.mode.clone();
+            let tx = ctx.tx.clone();
+            let forward_types = Arc::clone(&expected_types);
             #[cfg(feature = "log")]
             let parse_started = time::Instant::now();
-            let rows = tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
-                .await
-                .context("provider parser task failed")??;
+            let (rows, complete) = tokio::task::spawn_blocking(move || {
+                let mut rows = Vec::new();
+                let mut closed = false;
+                let mut forward = |(ip, port, protocol): ParsedProxy| {
+                    rows.push((ip, port, protocol));
+                    if closed {
+                        return false;
+                    }
+                    let expected_types = match protocol {
+                        Some(protocol) => protocol_arc(protocol),
+                        None => Arc::clone(&forward_types),
+                    };
+                    let proxy = Proxy::with_expected_types(ip, port, expected_types);
+                    closed = tx.blocking_send(proxy).is_err();
+                    !closed
+                };
+                visit(&mode, body.as_ref(), &mut forward)?;
+                Ok::<_, anyhow::Error>((rows, !closed))
+            })
+            .await
+            .context("provider parser task failed")??;
             #[cfg(feature = "log")]
             log::debug!(
                 "{url}: fetched {body_len} bytes in {fetch_elapsed:?}, parsed {} rows in {:?}",
                 rows.len(),
                 parse_started.elapsed(),
             );
-            if let Some(fetch_cache) = ctx.settings.fetch_cache.as_ref() {
-                fetch_cache.store_rows(&url, &rows).await;
+            if complete {
+                if let Some(fetch_cache) = ctx.settings.fetch_cache.as_ref() {
+                    fetch_cache.store_rows(&url, &rows).await;
+                }
             }
-            rows
+            None
         }
     };
 
@@ -316,13 +338,15 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
         return Ok(());
     }
 
-    for (ip, port, protocol) in rows {
-        let proxy = match protocol {
-            Some(protocol) => Proxy::with_expected_types(ip, port, protocol_arc(protocol)),
-            None => Proxy::with_expected_types(ip, port, Arc::clone(&expected_types)),
-        };
-        if ctx.tx.send(proxy).await.is_err() {
-            break;
+    if let Some(rows) = cached_rows {
+        for (ip, port, protocol) in rows {
+            let proxy = match protocol {
+                Some(protocol) => Proxy::with_expected_types(ip, port, protocol_arc(protocol)),
+                None => Proxy::with_expected_types(ip, port, Arc::clone(&expected_types)),
+            };
+            if ctx.tx.send(proxy).await.is_err() {
+                break;
+            }
         }
     }
     Ok(())

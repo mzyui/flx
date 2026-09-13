@@ -357,26 +357,22 @@ pub trait ProxyProvider {
     }
 }
 
-pub(crate) fn parse_all(
+pub(crate) fn visit(
     mode: &ScrapeMode,
     body: &str,
-) -> anyhow::Result<Vec<parsers::ParsedProxy>> {
-    let mut rows = Vec::new();
-    let mut collect = |row: parsers::ParsedProxy| {
-        rows.push(row);
-        true
-    };
+    on_row: &mut dyn FnMut(parsers::ParsedProxy) -> bool,
+) -> anyhow::Result<()> {
     match mode {
-        ScrapeMode::Plaintext => parsers::visit_plaintext(body, &mut collect),
-        ScrapeMode::GeonodeJson => parsers::visit_geonode(body, &mut collect)?,
-        ScrapeMode::ProxyNovaJson => parsers::visit_proxynova(body, &mut collect)?,
-        ScrapeMode::HtmlTable => parsers::visit_html_table(body, &mut collect),
-        ScrapeMode::RegexPairs => parsers::visit_regex_pairs(body, &mut collect),
-        ScrapeMode::Base64Rows => parsers::visit_base64_rows(body, &mut collect),
-        ScrapeMode::JsonStringArray => parsers::visit_json_strings(body, &mut collect)?,
-        ScrapeMode::GatherProxyJs => parsers::visit_gatherproxy(body, &mut collect),
+        ScrapeMode::Plaintext => parsers::visit_plaintext(body, on_row),
+        ScrapeMode::GeonodeJson => parsers::visit_geonode(body, on_row)?,
+        ScrapeMode::ProxyNovaJson => parsers::visit_proxynova(body, on_row)?,
+        ScrapeMode::HtmlTable => parsers::visit_html_table(body, on_row),
+        ScrapeMode::RegexPairs => parsers::visit_regex_pairs(body, on_row),
+        ScrapeMode::Base64Rows => parsers::visit_base64_rows(body, on_row),
+        ScrapeMode::JsonStringArray => parsers::visit_json_strings(body, on_row)?,
+        ScrapeMode::GatherProxyJs => parsers::visit_gatherproxy(body, on_row),
     }
-    Ok(rows)
+    Ok(())
 }
 
 fn append_utf8(
@@ -905,6 +901,37 @@ mod tests {
 
     fn provider_names(providers: &[Arc<dyn ProxyProvider + Send + Sync>]) -> Vec<&'static str> {
         providers.iter().map(|provider| provider.name()).collect()
+    }
+
+    #[test]
+    fn visit_forwards_every_row_to_the_callback() {
+        let mut seen = Vec::new();
+        super::visit(
+            &super::ScrapeMode::Plaintext,
+            "1.2.3.4:8080\n5.6.7.8:3128\n",
+            &mut |row| {
+                seen.push(row);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1], (std::net::Ipv4Addr::new(5, 6, 7, 8), 3128, None));
+    }
+
+    #[test]
+    fn visit_stops_as_soon_as_the_callback_returns_false() {
+        let mut seen = 0usize;
+        super::visit(
+            &super::ScrapeMode::Plaintext,
+            "1.2.3.4:8080\n5.6.7.8:3128\n",
+            &mut |_| {
+                seen += 1;
+                false
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, 1);
     }
 
     #[test]
