@@ -1,8 +1,13 @@
 //! Cache parsed proxy rows on disk.
 
 use std::{
+    collections::HashMap,
     net::Ipv4Addr,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -16,6 +21,48 @@ use crate::{
 const ORPHANED_TMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 // Bump on encoding or parser changes to reject stale rows.
 const CACHE_MAGIC: &[u8; 8] = b"FLXPCW02";
+const MEMO_MAX_ENTRIES: usize = 256;
+
+type MemoEntry = (SystemTime, Vec<ParsedProxy>);
+
+static MEMO: OnceLock<Mutex<HashMap<PathBuf, MemoEntry>>> = OnceLock::new();
+static MEMO_HITS: AtomicUsize = AtomicUsize::new(0);
+
+fn memo() -> &'static Mutex<HashMap<PathBuf, MemoEntry>> {
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn recall(path: &Path, modified: SystemTime) -> Option<Vec<ParsedProxy>> {
+    let memo = memo().lock().ok()?;
+    let (cached_mtime, rows) = memo.get(path)?;
+    if *cached_mtime != modified {
+        return None;
+    }
+    MEMO_HITS.fetch_add(1, Ordering::Relaxed);
+    Some(rows.clone())
+}
+
+fn remember(path: PathBuf, modified: SystemTime, rows: &[ParsedProxy]) {
+    let Ok(mut memo) = memo().lock() else {
+        return;
+    };
+    if memo.len() >= MEMO_MAX_ENTRIES {
+        memo.clear();
+    }
+    memo.insert(path, (modified, rows.to_vec()));
+}
+
+fn forget(path: &Path) {
+    let Ok(mut memo) = memo().lock() else {
+        return;
+    };
+    memo.remove(path);
+}
+
+#[cfg(test)]
+pub(crate) fn memo_hits() -> usize {
+    MEMO_HITS.load(Ordering::Relaxed)
+}
 
 pub struct Cache {
     dir: PathBuf,
@@ -72,13 +119,18 @@ impl Cache {
             .duration_since(modified)
             .unwrap_or(Duration::ZERO);
         if age > self.ttl {
+            forget(&path);
             return None;
         }
-        let body = tokio::fs::read(path).await.ok()?;
+        if let Some(rows) = recall(&path, modified) {
+            return Some(rows);
+        }
+        let body = tokio::fs::read(&path).await.ok()?;
         let rows = decode_rows(&body)?;
         if rows.is_empty() {
             return None;
         }
+        remember(path, modified, &rows);
         Some(rows)
     }
 
@@ -279,6 +331,29 @@ mod tests {
                 3128,
                 Some(Protocol::Http(crate::proxy::models::Anonymity::Elite))
             )
+        );
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn repeated_loads_reuse_the_in_memory_memo() {
+        let (cache, dir) = temp_cache(Duration::from_secs(60), false);
+        cache
+            .store_rows(
+                "http://example.com/list",
+                &[(Ipv4Addr::new(1, 2, 3, 4), 8080, None)],
+            )
+            .await;
+
+        let first = cache.load_rows("http://example.com/list").await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        let before = super::memo_hits();
+        let second = cache.load_rows("http://example.com/list").await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(
+            super::memo_hits() > before,
+            "second load must be served from the memo"
         );
         cleanup(&dir);
     }
