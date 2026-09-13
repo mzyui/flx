@@ -137,6 +137,7 @@ pub(crate) struct FetchSettings {
     pub(crate) offline: bool,
     pub(crate) throttle: Arc<Throttle>,
     pub(crate) fetch_delay: Option<Duration>,
+    pub(crate) hosts: Arc<HostLimiter>,
 }
 
 /// Serializes network requests to the same host.
@@ -173,6 +174,31 @@ impl Throttle {
         if !remaining.is_zero() {
             time::sleep(remaining).await;
         }
+    }
+}
+
+/// Caps concurrent requests per host so bursts stay polite.
+pub(crate) struct HostLimiter {
+    limit: usize,
+    hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl HostLimiter {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            hosts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn for_host(&self, host: &str) -> Arc<Semaphore> {
+        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sem) = hosts.get(host) {
+            return Arc::clone(sem);
+        }
+        let sem = Arc::new(Semaphore::new(self.limit));
+        hosts.insert(host.to_owned(), Arc::clone(&sem));
+        sem
     }
 }
 
@@ -234,6 +260,11 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
                 let mut attempt = 1usize;
                 loop {
                     let result = {
+                        let host_sem = ctx.settings.hosts.for_host(&source_host(&source));
+                        let _host_permit = host_sem
+                            .acquire_owned()
+                            .await
+                            .context("fetcher host limiter closed during shutdown")?;
                         let _permit = ctx
                             .sem
                             .acquire()
@@ -337,6 +368,23 @@ mod tests {
         assert!(!super::is_transient(&anyhow::anyhow!(
             "invalid provider URL `nope`"
         )));
+    }
+
+    #[tokio::test]
+    async fn host_limiter_shares_one_semaphore_per_host() {
+        let limiter = super::HostLimiter::new(1);
+        let first = limiter.for_host("example.com");
+        let second = limiter.for_host("example.com");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let other = limiter.for_host("other.com");
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let held = first.acquire_owned().await.unwrap();
+        assert_eq!(second.available_permits(), 0);
+        assert_eq!(other.available_permits(), 1);
+        drop(held);
+        assert_eq!(second.available_permits(), 1);
     }
 
     #[tokio::test]

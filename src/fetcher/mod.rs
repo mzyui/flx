@@ -20,7 +20,9 @@ use std::{
 };
 
 use anyhow::Context;
-pub use config::{Config, DEFAULT_CACHE_TTL_MINUTES, DEFAULT_CONCURRENCY_LIMIT};
+pub use config::{
+    Config, DEFAULT_CACHE_TTL_MINUTES, DEFAULT_CONCURRENCY_LIMIT, DEFAULT_HOST_CONCURRENCY_LIMIT,
+};
 use dedup::{protocol_hash, DedupTable};
 use futures_util::Stream;
 use hashbrown::HashSet;
@@ -33,7 +35,7 @@ use hyper_util::{
 pub use phase::FetchStage;
 #[cfg(test)]
 use phase::{do_work, source_host, FetchJob};
-use phase::{spawn_phase, FetchSettings, PhaseContext, StageReporter, Throttle};
+use phase::{spawn_phase, FetchSettings, HostLimiter, PhaseContext, StageReporter, Throttle};
 use tokio::{
     sync::{mpsc, watch, Notify, Semaphore},
     task::JoinHandle,
@@ -193,6 +195,7 @@ impl ProxyFetcher {
         };
 
         let throttle = Arc::new(Throttle::new());
+        let hosts = Arc::new(HostLimiter::new(DEFAULT_HOST_CONCURRENCY_LIMIT));
 
         // Size primary phase from accepted count without extra channel hop.
         let produced = Arc::clone(&accepted);
@@ -217,6 +220,7 @@ impl ProxyFetcher {
                     offline,
                     throttle,
                     fetch_delay,
+                    hosts,
                 };
                 let mut stop_rx_coordinator = stop_rx_coordinator;
                 let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -993,6 +997,9 @@ mod tests {
                 offline: true,
                 throttle: Arc::new(super::Throttle::new()),
                 fetch_delay: None,
+                hosts: Arc::new(super::HostLimiter::new(
+                    super::DEFAULT_HOST_CONCURRENCY_LIMIT,
+                )),
             },
         };
         do_work(job, ctx).await.unwrap();
@@ -1042,6 +1049,9 @@ mod tests {
                 offline: true,
                 throttle: Arc::new(super::Throttle::new()),
                 fetch_delay: None,
+                hosts: Arc::new(super::HostLimiter::new(
+                    super::DEFAULT_HOST_CONCURRENCY_LIMIT,
+                )),
             },
         };
         do_work(job, ctx).await.unwrap();
@@ -1107,6 +1117,9 @@ mod tests {
                 offline: false,
                 throttle: Arc::new(super::Throttle::new()),
                 fetch_delay: None,
+                hosts: Arc::new(super::HostLimiter::new(
+                    super::DEFAULT_HOST_CONCURRENCY_LIMIT,
+                )),
             },
         };
 
