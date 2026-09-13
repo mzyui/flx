@@ -212,6 +212,8 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
             throttle_wait(&ctx.settings, &source).await;
             // Hold the network permit only for the fetch; parsing and cache
             // writes must not occupy a fetch slot.
+            #[cfg(feature = "log")]
+            let fetch_started = time::Instant::now();
             let body = {
                 let _permit = ctx
                     .sem
@@ -223,10 +225,22 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
                     .await
                     .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
             };
+            #[cfg(feature = "log")]
+            let fetch_elapsed = fetch_started.elapsed();
+            #[cfg(feature = "log")]
+            let body_len = body.len();
             let mode = source.mode.clone();
+            #[cfg(feature = "log")]
+            let parse_started = time::Instant::now();
             let rows = tokio::task::spawn_blocking(move || parse_all(&mode, body.as_ref()))
                 .await
                 .context("provider parser task failed")??;
+            #[cfg(feature = "log")]
+            log::debug!(
+                "{url}: fetched {body_len} bytes in {fetch_elapsed:?}, parsed {} rows in {:?}",
+                rows.len(),
+                parse_started.elapsed(),
+            );
             if let Some(fetch_cache) = ctx.settings.fetch_cache.as_ref() {
                 fetch_cache.store_rows(&url, &rows).await;
             }
