@@ -20,7 +20,7 @@ use tokio::time;
 
 const MAX_SOURCE_BODY_BYTES: usize = 8 * 1024 * 1024;
 // Pre-size buffer; sources are small and frames accumulate incrementally.
-const SOURCE_BODY_INITIAL_CAPACITY: usize = 8192;
+const SOURCE_BODY_INITIAL_CAPACITY: usize = 64 * 1024;
 const MAX_REDIRECTS: usize = 10;
 
 use crate::proxy::models::{Protocol, Proxy};
@@ -229,6 +229,22 @@ pub trait ProxyProvider {
             let status = response.status();
             if !status.is_success() {
                 anyhow::bail!("{} returned HTTP {}", url, status);
+            }
+
+            let declared = response
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok());
+            if let Some(length) = declared {
+                if length > MAX_SOURCE_BODY_BYTES {
+                    anyhow::bail!(
+                        "response body from {} exceeds {} bytes",
+                        url,
+                        MAX_SOURCE_BODY_BYTES
+                    );
+                }
+                content.reserve(length.saturating_sub(content.len()));
             }
 
             // Bound body reads by the same deadline to release permits on stalls.
@@ -488,6 +504,30 @@ mod tests {
             "unexpected error: {error:#}"
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_declared_oversized_body_before_reading() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/huge");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_headers(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                super::MAX_SOURCE_BODY_BYTES + 1
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let error = TestProvider
+            .fetch(test_client(), &url, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("exceeds"));
+        server.abort();
     }
 
     #[tokio::test]
