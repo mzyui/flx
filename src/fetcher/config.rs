@@ -55,7 +55,7 @@ impl Config {
 }
 
 /// Default concurrent provider fetches.
-pub const DEFAULT_CONCURRENCY_LIMIT: usize = 25;
+pub const DEFAULT_CONCURRENCY_LIMIT: usize = 64;
 
 /// Default concurrent provider fetches per host.
 pub const DEFAULT_HOST_CONCURRENCY_LIMIT: usize = 4;

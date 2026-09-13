@@ -615,7 +615,10 @@ mod tests {
     fn concurrency_touches_only_the_validator() {
         let flx = Flx::fetch().concurrency(99);
         assert_eq!(flx.validator_config.concurrency_limit, 99);
-        assert_eq!(flx.fetcher_config.concurrency_limit, 25);
+        assert_eq!(
+            flx.fetcher_config.concurrency_limit,
+            crate::fetcher::DEFAULT_CONCURRENCY_LIMIT
+        );
     }
 
     #[test]

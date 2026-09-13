@@ -747,7 +747,7 @@ pub fn template() -> &'static str {
 # with_geo = true
 # countries = ["US", "DE"]                 # --countries
 # exclude_countries = ["RU", "CN"]         # --exclude-country
-# concurrency = 25                         # --fetch-concurrency
+# concurrency = 64                         # --fetch-concurrency
 # cache_ttl = 15                           # minutes, --cache-ttl
 # refresh_cache = false
 # offline = false
