@@ -20,6 +20,9 @@ use crate::{
     proxy::models::{Anonymity, Protocol, Proxy},
 };
 
+const MAX_FETCH_ATTEMPTS: usize = 2;
+const FETCH_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Cached single-protocol type sets, reusable across every typed row.
 static HTTP_ARCS: LazyLock<[Arc<[Protocol]>; 4]> = LazyLock::new(|| {
     [
@@ -187,6 +190,19 @@ async fn throttle_wait(settings: &FetchSettings, source: &Source) {
     }
 }
 
+fn is_transient(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        cause.is::<std::io::Error>()
+            || cause.is::<hyper::Error>()
+            || cause.is::<hyper_util::client::legacy::Error>()
+            || cause.is::<time::error::Elapsed>()
+    }) {
+        return true;
+    }
+    let chain = format!("{error:#}");
+    chain.contains("returned HTTP 5") || chain.contains("returned HTTP 429")
+}
+
 pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<()> {
     let FetchJob { provider, source } = job;
     if *ctx.stop_rx.borrow() {
@@ -215,15 +231,32 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
             #[cfg(feature = "log")]
             let fetch_started = time::Instant::now();
             let body = {
-                let _permit = ctx
-                    .sem
-                    .acquire()
-                    .await
-                    .context("fetcher semaphore closed during shutdown")?;
-                provider
-                    .fetch(Arc::clone(&ctx.client), &url, source.timeout)
-                    .await
-                    .with_context(|| format!("failed to fetch proxy list from {}", source.url))?
+                let mut attempt = 1usize;
+                loop {
+                    let result = {
+                        let _permit = ctx
+                            .sem
+                            .acquire()
+                            .await
+                            .context("fetcher semaphore closed during shutdown")?;
+                        provider
+                            .fetch(Arc::clone(&ctx.client), &url, source.timeout)
+                            .await
+                    };
+                    match result {
+                        Ok(body) => break body,
+                        Err(error) if attempt < MAX_FETCH_ATTEMPTS && is_transient(&error) => {
+                            attempt += 1;
+                            time::sleep(FETCH_RETRY_BACKOFF).await;
+                        }
+                        Err(error) => {
+                            return Err(error.context(format!(
+                                "failed to fetch proxy list from {}",
+                                source.url
+                            )))
+                        }
+                    }
+                }
             };
             #[cfg(feature = "log")]
             let fetch_elapsed = fetch_started.elapsed();
@@ -282,6 +315,28 @@ mod tests {
 
         let connect = protocol_arc(Protocol::Connect(8080));
         assert_eq!(connect.as_ref(), &[Protocol::Connect(8080)]);
+    }
+
+    #[test]
+    fn transient_errors_are_retryable_and_permanent_ones_are_not() {
+        let reset = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(super::is_transient(&reset));
+
+        assert!(super::is_transient(&anyhow::anyhow!(
+            "http://example.com returned HTTP 503 Service Unavailable"
+        )));
+        assert!(super::is_transient(&anyhow::anyhow!(
+            "http://example.com returned HTTP 429 Too Many Requests"
+        )));
+        assert!(!super::is_transient(&anyhow::anyhow!(
+            "http://example.com returned HTTP 404 Not Found"
+        )));
+        assert!(!super::is_transient(&anyhow::anyhow!(
+            "invalid provider URL `nope`"
+        )));
     }
 
     #[tokio::test]

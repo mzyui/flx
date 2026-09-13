@@ -1063,6 +1063,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn do_work_retries_a_transient_failure_once() {
+        async fn serve_once(listener: &TcpListener, response: &'static [u8]) {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::with_capacity(512);
+            let mut byte = [0u8; 1];
+            while !headers.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                headers.push(byte[0]);
+            }
+            stream.write_all(response).await.unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/flaky");
+        let server = tokio::spawn(async move {
+            serve_once(
+                &listener,
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            serve_once(
+                &listener,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n1.2.3.4:8080",
+            )
+            .await;
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (_, stop_rx) = tokio::sync::watch::channel(false);
+        let job = FetchJob {
+            provider: Arc::new(OfflineTestProvider),
+            source: Arc::new(Source::all(&url).unwrap()),
+        };
+        let ctx = PhaseContext {
+            client: test_client(),
+            sem: Arc::new(Semaphore::new(1)),
+            tx: tx.clone(),
+            stop_rx,
+            settings: super::FetchSettings {
+                fetch_cache: None,
+                offline: false,
+                throttle: Arc::new(super::Throttle::new()),
+                fetch_delay: None,
+            },
+        };
+
+        do_work(job, ctx).await.unwrap();
+        drop(tx);
+
+        let mut proxies = Vec::new();
+        while let Some(proxy) = rx.recv().await {
+            proxies.push(proxy);
+        }
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].as_text(), "1.2.3.4:8080");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn finish_phase_returns_true_when_primary_completes() {
         // Guard fallback proceeding when primary finishes in time.
         let mut handles = JoinSet::new();
