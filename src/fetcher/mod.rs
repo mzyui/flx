@@ -53,6 +53,9 @@ pub(crate) const FETCH_CHANNEL_CAPACITY: usize = 2_048;
 /// Bound primary phase runtime before fallback decision.
 pub const PRIMARY_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Start fallback providers after this long even while primary keeps running.
+const PRIMARY_FALLBACK_GRACE: Duration = Duration::from_secs(8);
+
 /// Stream scraped proxy candidates to consumers.
 ///
 /// Build with [`ProxyFetcher::gather`]; the stream yields deduplicated
@@ -228,6 +231,7 @@ impl ProxyFetcher {
                     stop_rx: stop_rx_primary,
                     settings: settings.clone(),
                 };
+                let primary_started = time::Instant::now();
                 let mut primary_handles = spawn_phase(primary, &primary_ctx);
 
                 let mut primary_aborted = false;
@@ -239,25 +243,19 @@ impl ProxyFetcher {
                         while primary_handles.join_next().await.is_some() {}
                         primary_aborted = true;
                     }
-                    _ = time::sleep(PRIMARY_PHASE_TIMEOUT) => {
-                        primary_handles.abort_all();
-                        while primary_handles.join_next().await.is_some() {}
-                        primary_aborted = true;
-                    }
+                    _ = time::sleep(PRIMARY_FALLBACK_GRACE) => {}
                 }
 
                 #[cfg(feature = "log")]
                 if primary_aborted {
-                    log::warn!(
-                        "primary providers aborted (stop signal or timeout {:?})",
-                        PRIMARY_PHASE_TIMEOUT
-                    );
+                    log::warn!("primary providers aborted (stop signal)");
                 }
                 let _ = primary_aborted;
 
                 if *stop_rx_coordinator.borrow() {
                     #[cfg(feature = "log")]
                     log::debug!("stopping early: consumer collected enough proxies");
+                    primary_handles.abort_all();
                     return;
                 }
 
@@ -270,6 +268,7 @@ impl ProxyFetcher {
                             found,
                             threshold
                         );
+                        primary_handles.abort_all();
                         return;
                     }
                 }
@@ -290,6 +289,31 @@ impl ProxyFetcher {
                     settings: settings.clone(),
                 };
                 let mut fallback_handles = spawn_phase(fallback, &fallback_ctx);
+
+                let primary_remaining =
+                    PRIMARY_PHASE_TIMEOUT.saturating_sub(primary_started.elapsed());
+                if !primary_handles.is_empty() && !primary_remaining.is_zero() {
+                    tokio::select! {
+                        _ = async { while primary_handles.join_next().await.is_some() {} } => {}
+                        _ = time::sleep(primary_remaining) => {
+                            primary_handles.abort_all();
+                            while primary_handles.join_next().await.is_some() {}
+                            #[cfg(feature = "log")]
+                            log::warn!(
+                                "primary providers aborted after timeout {:?}",
+                                PRIMARY_PHASE_TIMEOUT
+                            );
+                        }
+                        _ = stop_rx_coordinator.changed() => {
+                            primary_handles.abort_all();
+                            fallback_handles.abort_all();
+                            while primary_handles.join_next().await.is_some() {}
+                            while fallback_handles.join_next().await.is_some() {}
+                            return;
+                        }
+                    }
+                }
+
                 match fallback_phase_timeout {
                     Some(timeout) => {
                         tokio::select! {
@@ -303,9 +327,21 @@ impl ProxyFetcher {
                                     timeout
                                 );
                             }
+                            _ = stop_rx_coordinator.changed() => {
+                                fallback_handles.abort_all();
+                                while fallback_handles.join_next().await.is_some() {}
+                            }
                         }
                     }
-                    None => while fallback_handles.join_next().await.is_some() {},
+                    None => {
+                        tokio::select! {
+                            _ = async { while fallback_handles.join_next().await.is_some() {} } => {}
+                            _ = stop_rx_coordinator.changed() => {
+                                fallback_handles.abort_all();
+                                while fallback_handles.join_next().await.is_some() {}
+                            }
+                        }
+                    }
                 }
             }
         });
