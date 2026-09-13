@@ -38,15 +38,14 @@ impl DedupTable {
     }
 
     pub(crate) fn insert(&mut self, endpoint: EndpointKey) -> bool {
-        if self.seen.contains(&endpoint) {
+        if !self.seen.insert(endpoint) {
             return false;
         }
-        if self.seen.len() >= self.capacity {
+        if self.seen.len() > self.capacity {
             if let Some(oldest) = self.order.pop_front() {
                 self.seen.remove(&oldest);
             }
         }
-        self.seen.insert(endpoint);
         self.order.push_back(endpoint);
         true
     }
