@@ -37,7 +37,7 @@ pub use phase::FetchStage;
 use phase::{do_work, source_host, FetchJob};
 use phase::{spawn_phase, FetchSettings, HostLimiter, PhaseContext, StageReporter, Throttle};
 use tokio::{
-    sync::{mpsc, watch, Notify, Semaphore},
+    sync::{mpsc, watch, Semaphore},
     task::JoinHandle,
     time,
 };
@@ -69,7 +69,6 @@ pub struct ProxyFetcher {
     coordinator: JoinHandle<()>,
     config: Config,
     accepted: Arc<AtomicUsize>,
-    drain_notify: Arc<Notify>,
     prefetched: Option<Proxy>,
     stop_tx: watch::Sender<bool>,
     stop_signaled: AtomicBool,
@@ -200,9 +199,6 @@ impl ProxyFetcher {
         // Size primary phase from accepted count without extra channel hop.
         let produced = Arc::clone(&accepted);
 
-        let drain_notify = Arc::new(Notify::new());
-        let drain_notify_coordinator = Arc::clone(&drain_notify);
-
         let (stop_tx, stop_rx) = watch::channel(false);
         let stop_rx_coordinator = stop_rx.clone();
         let stop_rx_primary = stop_rx.clone();
@@ -265,9 +261,6 @@ impl ProxyFetcher {
                     return;
                 }
 
-                // Drain channel before threshold check to stabilize counter.
-                wait_for_drain(&sender, &drain_notify_coordinator).await;
-
                 let found = produced.load(Ordering::Relaxed);
                 if let Some(threshold) = fallback_threshold {
                     if found >= threshold {
@@ -329,23 +322,11 @@ impl ProxyFetcher {
             excluded_countries,
             config,
             accepted,
-            drain_notify,
             prefetched: None,
             stop_tx,
             stop_signaled: AtomicBool::new(false),
             stages: Some(stages),
         })
-    }
-}
-
-// Reverify empty buffer on wakeup; stale permits must not end the wait.
-async fn wait_for_drain(tx: &mpsc::Sender<Proxy>, notify: &Notify) {
-    while tx.capacity() < tx.max_capacity() {
-        let drained = notify.notified();
-        if tx.capacity() == tx.max_capacity() {
-            break;
-        }
-        drained.await;
     }
 }
 
@@ -374,7 +355,6 @@ impl ProxyFetcher {
                     Some(proxy) => proxy,
                     None => {
                         self.elapsed = Some(self.timer.elapsed());
-                        self.drain_notify.notify_one();
                         return None;
                     }
                 }
@@ -397,13 +377,8 @@ impl ProxyFetcher {
     }
 
     fn check_drain(&mut self) {
-        match self.receiver.try_recv() {
-            Ok(proxy) => {
-                self.prefetched = Some(proxy);
-            }
-            Err(_) => {
-                self.drain_notify.notify_one();
-            }
+        if let Ok(proxy) = self.receiver.try_recv() {
+            self.prefetched = Some(proxy);
         }
     }
 
@@ -524,7 +499,6 @@ impl Stream for ProxyFetcher {
                     if this.elapsed.is_none() {
                         this.elapsed = Some(this.timer.elapsed());
                     }
-                    this.drain_notify.notify_one();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -552,8 +526,8 @@ impl Drop for ProxyFetcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_proxy, do_work, finish_phase, protocol_hash, source_host, wait_for_drain,
-        AcceptContext, DedupTable, FetchJob, FetchStage, PhaseContext, ProxyFetcher, Throttle,
+        accept_proxy, do_work, finish_phase, protocol_hash, source_host, AcceptContext, DedupTable,
+        FetchJob, FetchStage, PhaseContext, ProxyFetcher, Throttle,
     };
     use crate::fetcher::{cache::Cache, Config};
     use crate::geolookup::models::GeoData;
@@ -795,39 +769,6 @@ mod tests {
         assert!(rejected.is_none());
         assert!(kept.is_some());
         assert_eq!(counter, 1);
-    }
-
-    #[tokio::test]
-    async fn drain_wait_survives_stale_notify_permits() {
-        // Guard drain wait against stale notify permits.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Proxy>(4);
-        for port in 8000u16..8003 {
-            tx.send(Proxy::new(Ipv4Addr::new(192, 0, 2, 1), port))
-                .await
-                .unwrap();
-        }
-        let notify = Arc::new(tokio::sync::Notify::new());
-        notify.notify_one();
-
-        let wait = wait_for_drain(&tx, &notify);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), wait)
-                .await
-                .is_err(),
-            "a stale permit must not end the drain wait while items are buffered"
-        );
-
-        // Release the wait only on real drain plus fresh signal.
-        let consumer_notify = Arc::clone(&notify);
-        let consumer = tokio::spawn(async move {
-            // Drain with try_recv; recv would park forever on open channel.
-            while rx.try_recv().is_ok() {}
-            consumer_notify.notify_one();
-        });
-        tokio::time::timeout(Duration::from_secs(1), wait_for_drain(&tx, &notify))
-            .await
-            .expect("a real drain signal must release the wait");
-        consumer.await.unwrap();
     }
 
     #[tokio::test]
