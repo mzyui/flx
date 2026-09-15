@@ -88,6 +88,12 @@ pub struct Cli {
     #[arg(long, help_heading = "Global")]
     pub skip_version_check: bool,
 
+    /// Watch the run in an interactive terminal UI (`find` and `grab` only).
+    /// Requires the `tui` Cargo feature; build with `--features tui`.
+    #[cfg(feature = "tui")]
+    #[arg(long, global = true, help_heading = "Global")]
+    pub tui: bool,
+
     /// Path to a config file overriding the discovery defaults.
     #[arg(long, global = true, help_heading = "Global")]
     pub config: Option<PathBuf>,

@@ -2,7 +2,7 @@ use anyhow::Context;
 use argument::Cli;
 #[cfg(feature = "serve")]
 use argument::ServeArgs;
-use argument::{Command, ConfigAction, ConfigCmd, FetchArgs, FetcherArgs, FindArgs, ValidatorArgs};
+use argument::{Command, ConfigAction, ConfigCmd, FetchArgs, FindArgs};
 use clap::{CommandFactory, FromArgMatches};
 #[cfg(feature = "log")]
 use flx::initialize_logging;
@@ -10,7 +10,9 @@ use flx::{
     proxy::models::{Anonymity, Protocol, Proxy},
     FetchStage, PauseGate, ProxySource, ProxyValidator, ValidationProgress,
 };
-use futures_util::{Stream, StreamExt};
+// `flx serve` uses `.next()`; the CLI test module reaches this through `use super::*`.
+#[allow(unused_imports)]
+use futures_util::StreamExt;
 use quotas::{split_type_requests, QuotaEnforcer, TypeQuota};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,6 +26,7 @@ mod config;
 mod filters;
 mod guard;
 mod output;
+mod pipeline;
 #[cfg(feature = "progress_bar")]
 mod progress;
 mod quotas;
@@ -31,6 +34,8 @@ mod quotas;
 mod status_line;
 #[cfg(feature = "progress_bar")]
 mod style;
+#[cfg(feature = "tui")]
+mod tui;
 mod version;
 mod wizard;
 
@@ -39,6 +44,7 @@ mod tests;
 
 pub(crate) use guard::*;
 pub(crate) use output::*;
+pub(crate) use pipeline::*;
 pub(crate) use version::*;
 
 /// Format the end-of-run stats line for find.
@@ -197,6 +203,8 @@ fn restore_terminal_and_exit() -> ! {
     let _ = std::io::stdout().lock().flush();
     #[cfg(feature = "progress_bar")]
     progress::force_show_cursor();
+    #[cfg(feature = "tui")]
+    tui::force_restore();
     let _ = std::io::stderr().lock().flush();
     quiet_signal_echo::restore();
     std::process::exit(i32::from(SIGINT_EXIT_CODE))
@@ -234,52 +242,6 @@ fn convert_protocols(types: &[String]) -> Vec<Protocol> {
         .collect()
 }
 
-// Match advertised types tolerating Unknown anonymity sides.
-fn advertised_covers_request(advertised: &[Protocol], requested: Protocol) -> bool {
-    advertised.iter().any(|adv| match (*adv, requested) {
-        (Protocol::Http(a), Protocol::Http(b)) | (Protocol::Https(a), Protocol::Https(b)) => {
-            matches!(a, Anonymity::Unknown) || matches!(b, Anonymity::Unknown) || a == b
-        }
-        (Protocol::Connect(a), Protocol::Connect(b)) => a == b,
-        (adv, req) => adv == req,
-    })
-}
-
-// Probe missed types when advertisements leave gaps.
-fn needs_missed_probe(proxy: &Proxy, requested: &[Protocol]) -> bool {
-    let advertised = proxy.expected_types.as_ref();
-    advertised.is_empty()
-        || requested
-            .iter()
-            .any(|req| !advertised_covers_request(advertised, *req))
-}
-
-fn fetcher_config(options: &FetcherArgs) -> flx::fetcher::Config {
-    flx::fetcher::Config {
-        concurrency_limit: options.fetch_concurrency,
-        enable_geo_lookup: options.with_geo
-            || !options.countries.is_empty()
-            || !options.exclude_country.is_empty(),
-        countries: Arc::from(options.countries.as_slice()),
-        excluded_countries: Arc::from(options.exclude_country.as_slice()),
-        cache_ttl: (options.cache_ttl > 0)
-            .then(|| std::time::Duration::from_secs(options.cache_ttl.saturating_mul(60))),
-        refresh_cache: options.refresh_cache,
-        enforce_unique_ip: !options.no_dedup,
-        providers: Arc::from(options.provider.as_slice()),
-        excluded_providers: Arc::from(options.exclude_provider.as_slice()),
-        custom_sources: Arc::from(options.source_url.as_slice()),
-        offline: options.offline,
-        fetch_delay: (options.fetch_delay_ms > 0)
-            .then(|| std::time::Duration::from_millis(options.fetch_delay_ms)),
-        fallback_threshold: options.fallback_threshold,
-        fallback_phase_timeout: (options.fetch_phase_timeout > 0)
-            .then(|| std::time::Duration::from_secs(options.fetch_phase_timeout)),
-        provider_timeout: (options.provider_timeout > 0)
-            .then(|| std::time::Duration::from_secs(options.provider_timeout)),
-    }
-}
-
 fn list_sources() {
     for provider in flx::all_providers() {
         let tier = match provider.tier() {
@@ -291,13 +253,6 @@ fn list_sources() {
             eprintln!("  {}", source.url);
         }
     }
-}
-
-type BoxStream = std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>>;
-
-async fn file_source(paths: &[std::path::PathBuf]) -> anyhow::Result<BoxStream> {
-    let proxies = flx::load_proxy_files(paths.to_owned()).await?;
-    Ok(Box::pin(futures_util::stream::iter(proxies)))
 }
 
 fn run_application() -> anyhow::Result<RunOutcome> {
@@ -329,7 +284,26 @@ fn run_application() -> anyhow::Result<RunOutcome> {
             "trace" => log::LevelFilter::Trace,
             _ => log::LevelFilter::Off,
         };
-        initialize_logging(log_level)?;
+        // A run that owns the screen cannot log to it: stderr would paint over
+        // the alternate screen. Nothing is written at `off`, so no file is made.
+        #[cfg(feature = "tui")]
+        let owns_screen = cli.tui && log_level != log::LevelFilter::Off;
+        #[cfg(not(feature = "tui"))]
+        let owns_screen = false;
+        if owns_screen {
+            let path = flx::screen_log_path()?;
+            eprintln!("flx: logging to {}", path.display());
+            flx::initialize_file_logging(log_level, &path)?;
+        } else {
+            initialize_logging(log_level)?;
+        }
+    }
+
+    // `--tui` redirects a find/grab run into the terminal UI.
+    // Only available with the `tui` Cargo feature; the flag is hidden otherwise.
+    #[cfg(feature = "tui")]
+    if cli.tui {
+        return run_tui(&cli);
     }
 
     // Reject bare invocations with help and usage error.
@@ -401,6 +375,42 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     });
     runtime.shutdown_background();
     outcome
+}
+
+// Hand a find/grab run to the terminal UI instead of streaming to stdout.
+#[cfg(feature = "tui")]
+fn run_tui(cli: &Cli) -> anyhow::Result<RunOutcome> {
+    use tui::RunSpec;
+
+    if !tui::is_interactive() {
+        anyhow::bail!("--tui needs an interactive terminal (stdin and stdout must be a TTY)");
+    }
+    let spec = match &cli.command {
+        Some(Command::Find(find)) => RunSpec {
+            fetcher: find.fetcher.clone(),
+            validator: Some(find.validator.clone()),
+            output: find.output.clone(),
+        },
+        Some(Command::Grab(grab)) => RunSpec {
+            fetcher: grab.fetcher.clone(),
+            validator: None,
+            output: grab.output.clone(),
+        },
+        Some(_) => anyhow::bail!("--tui only applies to `find` and `grab`"),
+        None => anyhow::bail!("--tui needs a command: try `flx find --tui` or `flx grab --tui`"),
+    };
+
+    let runtime = runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    let ctx = tui::TuiCtx {
+        no_color: cli.no_color,
+        spec,
+    };
+    let outcome = runtime.block_on(tui::run(ctx))?;
+    runtime.shutdown_background();
+    Ok(outcome)
 }
 
 fn config_home() -> std::path::PathBuf {
@@ -928,15 +938,7 @@ async fn run_find(
         .has_any_quota();
     // Probes for filled families are pointless: strict output would reject
     // their results, so the validator skips them (groups always probe).
-    let probe_gate: Option<flx::ProbeGate> = has_quotas.then(|| {
-        let enforcer = Arc::clone(&quota_enforcer);
-        Arc::new(move |requested: Protocol| {
-            !enforcer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_protocol_closed(requested)
-        }) as flx::ProbeGate
-    });
+    let probe_gate: Option<flx::ProbeGate> = build_probe_gate(&quota_enforcer);
 
     // Record pass-1 candidates for fallback without re-fetching.
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
@@ -1123,14 +1125,15 @@ async fn run_find(
     let limit = find.output.limit;
     let p1_passed = progress1.passed();
     let emitted1 = json_doc.as_ref().map_or(p1_passed, |doc| doc.items());
-    let needs_fallback = if has_quotas {
-        let enforcer = quota_enforcer.lock().unwrap_or_else(|e| e.into_inner());
-        let room = limit == 0 || emitted1 < limit;
-        let other_capacity = enforcer.has_uncapped() || !groups.is_empty();
-        may_fallback && room && (emitted1 == 0 || enforcer.has_unfilled() || other_capacity)
-    } else {
-        may_fallback && (p1_passed == 0 || (limit > 0 && p1_passed < limit))
-    };
+    let needs_fallback = needs_fallback(
+        has_quotas,
+        &quota_enforcer,
+        !groups.is_empty(),
+        may_fallback,
+        limit,
+        emitted1,
+        p1_passed,
+    );
 
     if needs_fallback {
         let requested = protocols;
@@ -1358,35 +1361,6 @@ fn report_validation_summary(
     eprintln!("{report}");
 }
 
-// Forward candidates while recording fallbacks for replay.
-fn tee_recorder<S>(
-    inner: S,
-    recordings: Arc<std::sync::Mutex<Vec<Proxy>>>,
-    requested: Arc<[Protocol]>,
-) -> impl Stream<Item = Proxy>
-where
-    S: Stream<Item = Proxy> + Unpin,
-{
-    futures_util::stream::unfold(inner, move |mut inner| {
-        let recordings = Arc::clone(&recordings);
-        let requested = Arc::clone(&requested);
-        async move {
-            match inner.next().await {
-                // Record only fallback candidates worth a deep copy.
-                Some(proxy) if needs_missed_probe(&proxy, &requested) => {
-                    recordings
-                        .lock()
-                        .expect("candidate recorder mutex poisoned")
-                        .push(proxy.clone());
-                    Some((proxy, inner))
-                }
-                Some(proxy) => Some((proxy, inner)),
-                None => None,
-            }
-        }
-    })
-}
-
 async fn run_geo_update(
     download: &tokio::sync::watch::Receiver<Option<flx::DownloadProgress>>,
     quiet: bool,
@@ -1416,28 +1390,4 @@ async fn run_geo_update(
         }
     }
     Ok(RunOutcome::Finished)
-}
-
-fn validator_config(
-    options: &ValidatorArgs,
-    protocols: Vec<Protocol>,
-    groups: Vec<Vec<Protocol>>,
-    probe_missed_types: bool,
-) -> flx::validator::Config {
-    flx::validator::Config {
-        types: protocols,
-        groups,
-        concurrency_limit: options.max_connections,
-        max_attempts: options.max_attempts,
-        request_timeout: options.timeout,
-        http_judge_urls: options.http_judge_urls.clone(),
-        https_judge_urls: options.https_judge_urls.clone(),
-        insecure: options.no_verify_tls,
-        probe_missed_types,
-        support_cookies: options.support_cookies,
-        support_referer: options.support_referer,
-        retry_delay: std::time::Duration::from_millis(options.retry_delay_ms),
-        report_failures: options.report_failures.is_some(),
-        probe_gate: None,
-    }
 }

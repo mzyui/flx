@@ -1,0 +1,14 @@
+---
+source: src/cli/tui/ui.rs
+expression: "draw(&app, 42, 10)"
+---
+"                                          "
+"                                          "
+"                                          "
+"                                          "
+"      terminal too small — need 60×12     "
+"                                          "
+"                                          "
+"                                          "
+"                                          "
+"                                          "

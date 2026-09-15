@@ -1,29 +1,27 @@
-
 # flx
 
-is a fast proxy scraper & validator written in Rust. It collects free proxies from 13 sources, validates them against online judges (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT), filters by anonymity / country / IP type / response time, and exports in 9 formats. It ships as both a CLI (`flx`) and a Rust library.
-
-## Demo
+Fast proxy scraper and validator written in Rust. Collects free proxies from 12 primary providers + GitHub raw mirrors, validates them against online judges (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT), filters by anonymity, country, IP type, and response time, and exports in 9 formats. Ships as a CLI (`flx`) and a Rust library.
 
 ![demo](https://vhs.charm.sh/vhs-3tm46j5tEl6LYWePbsAuOw.gif)
 
 ## Features
 
-- **Scrape** from 12 primary providers + GitHub raw mirrors, or plug in your own plaintext source
-- **Validate** with end-to-end deadlines over hand-rolled hyper + rustls networking — anti-replay judge tokens keep fake judges out
-- **Filter & sort** by protocol, anonymity level, country, IP type (residential / datacenter / mobile), and response time
-- **GeoIP** via GeoLite2 City + ASN, with a one-command database sync
-- **9 output formats** including JSON, CSV, PAC, and proxychains config
-- **Streaming-first pipeline** with backpressure, atomic parse cache, and graceful Ctrl+C finalization
-- **Proxy rotating server** — expose validated proxies through a local rotating endpoint (`flx serve`, requires `--features serve`; experimental)
+- Scrape from 12 primary providers + GitHub raw mirrors, or plug in your own plaintext source
+- Validate with end-to-end deadlines over hyper + rustls, with anti-replay judge tokens
+- Filter and sort by protocol, anonymity level, country, IP type (residential / datacenter / mobile), and response time
+- GeoIP via GeoLite2 City + ASN, with a one-command database sync
+- 9 output formats including JSON, CSV, PAC, and proxychains config
+- Streaming-first pipeline with backpressure, atomic parse cache, and graceful Ctrl+C finalization
+- Interactive TUI to watch a `find` or `grab` run live with `--tui` (behind the `tui` feature, optional)
+- Optional rotating proxy server (`flx serve`, behind the `serve` feature, experimental)
 
-## Install
+## Installation
 
 ```bash
 cargo install --git https://github.com/mzyui/flx
 ```
 
-Or build from source (requires `pkg-config` and `libssl-dev`):
+Or build from source:
 
 ```bash
 git clone https://github.com/mzyui/flx
@@ -31,18 +29,20 @@ cd flx
 cargo install --path .
 ```
 
-## Scrape
+## Usage
 
-Scrape without validating, or render the results straight to a file. `-o` infers the format from the file extension.
+### Scrape
+
+Scrape without validating. `-o` infers the format from the file extension.
 
 ```bash
 flx grab -l 20
 flx grab -f json -o proxies.json
 ```
 
-## Validate
+### Validate
 
-Validate proxies scraped from the providers, read from a file, or piped in from stdin (`--files`, `-` reads stdin). Plain `flx find` defaults to HTTP checks.
+Validate proxies from the providers, a file, or stdin (`-` reads stdin). Plain `flx find` defaults to HTTP checks.
 
 ```bash
 flx find -l 5
@@ -50,47 +50,50 @@ flx find -f proxies.txt
 cat list.txt | flx find -f -
 ```
 
-## Serve (beta, optional)
+### Interactive TUI (optional)
 
-> Experimental and suboptimal for now: disabled by default. Build with
-> `cargo build --features serve` (library: `Flx::serve`, `ServeOptions`,
-> `Rotator*` only exist with the `serve` feature) to enable it. Release
-> binaries track the default build, so `serve` is hidden there until it
-> stabilizes. A `[serve]` config section is still parsed but ignored without
-> the feature.
+> [!NOTE]
+> Requires the `tui` Cargo feature: `cargo build --features tui` or `cargo install --path . --features tui`. The `--tui` flag is hidden without it.
 
-Expose the validated pool as a local rotating proxy: point any client at the endpoint and every connection is forwarded through a different working proxy. Start it like `find` — every validation flag (`-a`, `-c`, `-m`, `--timeout`, protocol types, ...) applies — and the endpoint keeps revalidating in the background, rotating round-robin (default) or randomly and dropping proxies that die. The endpoint goes live on the first validated proxy (tune with `--min-ready`) and the pool — capped at 25 — keeps refilling as proxies die or the providers yield more.
+Add `--tui` to a `find` or `grab` run to watch it live instead of streaming to stdout. All flags apply as usual.
+
+```bash
+flx find --tui -l 20
+flx grab --tui -c US,DE
+```
+
+> [!TIP]
+> Press `?` inside the TUI for the full keymap. Filter with `/`, sort with `s` / `S`, inspect a row with `Enter`, export with `e`.
+
+> [!NOTE]
+> `--tui` needs an interactive terminal and only works with `find` and `grab`.
+
+### Serve (beta)
+
+> [!WARNING]
+> Experimental and disabled by default. Build with `cargo build --features serve` to enable it. Release binaries hide `serve` until it stabilizes.
+
+Expose the validated pool as a local rotating endpoint. Every validation flag applies, the pool revalidates in the background and drops dead proxies.
 
 ```bash
 cargo build --features serve
-./target/debug/flx serve                  # 127.0.0.1:8080, round-robin
-flx serve --port 9000 --strategy random      # random rotation
-flx serve --refresh-secs 120                 # faster pool refill
-flx serve --min-ready 10                     # wait for 10 proxies before serving
-flx serve --auth user:pass                   # require basic proxy authentication
+./target/debug/flx serve --port 8080
+flx serve --port 9000 --strategy random --min-ready 10
 ```
 
-## Protocol types
+### Protocol types
 
-Pick the types to validate: HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT:80, CONNECT:25. Combine types with `+` and annotate anonymity with a colon (HTTP:Elite).
+Validate HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT:80, CONNECT:25. Combine with `+`, pin anonymity with `:`, cap per-type with `=n`.
 
 ```bash
 flx find -f proxies.txt HTTP SOCKS5 HTTPS
 flx find HTTP+HTTPS HTTP:Elite
+flx find HTTP=8 HTTPS=2
 ```
 
-Cap how many of each type to keep with `TYPE=n` (shell-safe, no quoting needed). Capped types stop at `n` — the run ends once every quota is filled — while uncapped types fill the rest of `--limit`:
+### Output formats
 
-```bash
-flx find HTTP=8 HTTPS=2          # at most 8 HTTP and 2 HTTPS
-flx find HTTP=2 HTTPS -l 10      # at most 2 HTTP, HTTPS fills up to 10 total
-```
-
-Matching is strict per family: `HTTPS:Elite=2` emits only Elite HTTPS and rejects other levels. Quotas are not allowed inside `+` groups or with `serve`.
-
-## Output formats
-
-Nine formats: `text`, `json`, `json-lines`, `pretty-json`, `csv`, `prefix`, `pac`, `proxychains`, and the human-readable default.
+`text`, `json`, `json-lines`, `pretty-json`, `csv`, `prefix`, `pac`, `proxychains`, and the human-readable default.
 
 ```bash
 flx find -l 5 -f json
@@ -99,9 +102,7 @@ flx find -l 5 -f proxychains > /etc/proxychains.conf
 flx find -l 5 -f pac -o proxy.pac
 ```
 
-## Filters and sorting
-
-Keep only the proxies that fit: minimum anonymity, response-time windows, excluded types, or a sort order.
+### Filters and sorting
 
 ```bash
 flx find -a elite --levels anonymous elite
@@ -109,18 +110,16 @@ flx find --max-response-time 2 --min-response-time 0.1 --exclude-type SOCKS4
 flx find -s response-time --order desc --shuffle
 ```
 
-## GeoIP
+### GeoIP
 
-`-c` filters by country and `-g` annotates without filtering; `geo-update` refreshes the GeoLite2 databases. Every geo lookup also carries ASN data and classifies endpoints as residential, datacenter, or mobile.
+`-c` filters by country, `-g` annotates without filtering. Every lookup also carries ASN data and an IP-type classification.
 
 ```bash
 flx geo-update
 flx find -c US,DE --exclude-country RU,CN -l 5
 ```
 
-## Providers and cache
-
-Choose or skip providers, add your own plaintext source, or run entirely from the local cache.
+### Providers and cache
 
 ```bash
 flx find --list-providers
@@ -129,9 +128,7 @@ flx find --source-url https://example.com/proxies.txt
 flx find --offline --cache-ttl 30 --refresh-cache
 ```
 
-## Tuning and strict checks
-
-Tune the validation throughput, require cookie/referer forwarding, disable TLS verification, and log every failure to a JSON-lines report.
+### Tuning
 
 ```bash
 flx find -m 1000 --timeout 5 --max-attempts 3
@@ -139,25 +136,21 @@ flx find --support-cookies --support-referer --no-verify-tls
 flx find --report-failures failures.jsonl
 ```
 
-## Config file
+### Config file
 
-Persist your defaults in TOML. CLI flags always win over the config, and a project `.flx.toml` overrides the user config key-by-key.
+Persist defaults in TOML. CLI flags always win; a project `.flx.toml` overrides the user config key-by-key.
 
 ```bash
-flx config init                 # write a commented template to ~/.config/flx/config.toml
-flx config wizard               # interactively set up a config file
-flx config wizard --yes         # write one with every default (no questions)
-flx config path                 # show which files are in effect
-flx config show                 # print the merged configuration
-flx --config ./custom.toml find # use one specific file (or $FLX_CONFIG)
-flx --no-config find            # ignore every config file
+flx config init     # write template to ~/.config/flx/config.toml
+flx config wizard   # interactive setup
+flx config show     # print merged configuration
+flx --config ./custom.toml find
+flx --no-config find
 ```
-
-The user config lives at `$XDG_CONFIG_HOME/flx/config.toml` (default `~/.config/flx/config.toml`); a `.flx.toml` in the current directory overrides it. Loaded even for `grab`; `--verbose` overrides a `quiet = true` set by the config.
 
 ## Library usage
 
-flx is also a library. The `Flx` builder mirrors the CLI defaults:
+The `Flx` builder mirrors the CLI defaults:
 
 ```rust
 use flx::{Anonymity, Flx, Protocol};
@@ -174,26 +167,11 @@ A guided walkthrough of every sample lives in [`examples/README.md`](examples/RE
 
 ## Development
 
-Requires a Rust toolchain (edition 2021); TLS is pure-Rust (rustls), no OpenSSL dependency.
+Requires a Rust toolchain (edition 2021). TLS is pure-Rust (rustls).
 
 ```bash
-cargo build                              # build library + binary
-cargo test                               # run the test suite (~283 tests)
+cargo build
+cargo test
 cargo clippy --all-targets --all-features
 cargo fmt
 ```
-
-## Contributing
-
-PRs and issue reports are welcome. Before submitting a PR, make sure:
-
-- `cargo test` passes (the suite needs `pkg-config` and `libssl-dev`)
-- `cargo clippy --all-targets --all-features` is warning-free
-- `cargo fmt --check` is clean
-
-A few conventions to keep in mind: name constants instead of magic numbers, keep per-source/per-proxy failures non-fatal (log and continue), compile regexes/selectors once in statics, and add offline tests (`TcpListener` on port 0, no external network) for any new or changed behavior.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-

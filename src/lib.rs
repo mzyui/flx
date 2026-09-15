@@ -108,14 +108,55 @@ pub mod prelude {
 /// Initializes logging.
 #[cfg(feature = "log")]
 pub fn initialize_logging(log_level: log::LevelFilter) -> anyhow::Result<()> {
-    log::set_boxed_logger(Box::new(FlxLogger))?;
+    log::set_boxed_logger(Box::new(FlxLogger::to_stderr()))?;
     log::set_max_level(log_level);
     Ok(())
 }
 
-/// Writes flx records to stderr with tty-gated colors.
+/// Sends log records to `path` instead of stderr, for runs that own the screen.
+///
+/// ANSI is always off: the destination is a file to be paged through later, and
+/// anything written to stderr while a full-screen UI is up would corrupt it.
 #[cfg(feature = "log")]
-struct FlxLogger;
+pub fn initialize_file_logging(
+    log_level: log::LevelFilter,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("cannot open the log file {}", path.display()))?;
+    log::set_boxed_logger(Box::new(FlxLogger::to_file(file)))?;
+    log::set_max_level(log_level);
+    Ok(())
+}
+
+/// Where a run that owns the screen writes its log.
+#[cfg(feature = "log")]
+pub fn screen_log_path() -> anyhow::Result<std::path::PathBuf> {
+    // Reuses the database directory: the one flx path already created on demand.
+    Ok(geolookup::data_dir()?.join(TUI_LOG_FILE))
+}
+
+/// File name a full-screen run logs to, inside the flx data directory.
+#[cfg(feature = "log")]
+pub const TUI_LOG_FILE: &str = "tui.log";
+
+/// Where flx records go: the terminal, or a file for a full-screen run.
+#[cfg(feature = "log")]
+enum LogSink {
+    Stderr,
+    /// Appended to, behind a lock: many tasks log from many threads.
+    File(std::sync::Mutex<std::fs::File>),
+}
+
+/// Writes flx records with tty-gated colors.
+#[cfg(feature = "log")]
+struct FlxLogger {
+    sink: LogSink,
+}
 
 #[cfg(feature = "log")]
 const LOG_MODULE_ROOT: &str = "flx";
@@ -142,6 +183,18 @@ fn log_prefix_color(level: log::Level) -> &'static str {
 
 #[cfg(feature = "log")]
 impl FlxLogger {
+    fn to_stderr() -> Self {
+        Self {
+            sink: LogSink::Stderr,
+        }
+    }
+
+    fn to_file(file: std::fs::File) -> Self {
+        Self {
+            sink: LogSink::File(std::sync::Mutex::new(file)),
+        }
+    }
+
     fn color_enabled() -> bool {
         use std::io::IsTerminal as _;
         match std::env::var_os("TERM") {
@@ -157,6 +210,42 @@ impl FlxLogger {
         }
         std::io::stderr().is_terminal()
     }
+
+    /// One record, as a single line: the color is only added for a terminal.
+    fn write_record(&self, record: &log::Record, color: bool) -> std::io::Result<()> {
+        match &self.sink {
+            LogSink::Stderr => {
+                let mut stderr = std::io::stderr().lock();
+                write_record_to(&mut stderr, record, color)
+            }
+            LogSink::File(file) => {
+                let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
+                write_record_to(&mut *file, record, color)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "log")]
+fn write_record_to(
+    target: &mut impl std::io::Write,
+    record: &log::Record,
+    color: bool,
+) -> std::io::Result<()> {
+    if color {
+        // Keeps prefix bytes identical to the previous logger.
+        write!(
+            target,
+            "\x1b[0m{}{}: {} ",
+            log_prefix_color(record.level()),
+            record.target(),
+            record.level()
+        )?;
+        write!(target, "\x1b[0m")?;
+    } else {
+        write!(target, "{}: {} ", record.target(), record.level())?;
+    }
+    writeln!(target, "{}", record.args())
 }
 
 #[cfg(feature = "log")]
@@ -169,25 +258,21 @@ impl log::Log for FlxLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let mut stderr = std::io::stderr().lock();
-        if Self::color_enabled() {
-            // Keeps prefix bytes identical to the previous logger.
-            let _ = write!(
-                stderr,
-                "\x1b[0m{}{}: {} ",
-                log_prefix_color(record.level()),
-                record.target(),
-                record.level()
-            );
-            let _ = write!(stderr, "\x1b[0m");
-        } else {
-            let _ = write!(stderr, "{}: {} ", record.target(), record.level());
-        }
-        let _ = writeln!(stderr, "{}", record.args());
+        let color = matches!(self.sink, LogSink::Stderr) && Self::color_enabled();
+        let _ = self.write_record(record, color);
     }
 
     fn flush(&self) {
-        let _ = std::io::stderr().flush();
+        match &self.sink {
+            LogSink::Stderr => {
+                let _ = std::io::stderr().flush();
+            }
+            LogSink::File(file) => {
+                if let Ok(mut file) = file.lock() {
+                    let _ = file.flush();
+                }
+            }
+        }
     }
 }
 
@@ -427,5 +512,57 @@ mod tests {
         assert_eq!(log_prefix_color(Level::Info), "\x1b[34m");
         assert_eq!(log_prefix_color(Level::Debug), "\x1b[36m");
         assert_eq!(log_prefix_color(Level::Trace), "\x1b[35m");
+    }
+
+    #[cfg(feature = "log")]
+    #[test]
+    fn a_file_sink_writes_uncolored_lines() {
+        use super::{FlxLogger, TUI_LOG_FILE};
+
+        let path = std::env::temp_dir().join(format!(
+            "flx_file_sink_{}_{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let logger = FlxLogger::to_file(std::fs::File::create(&path).unwrap());
+        logger
+            .write_record(
+                &log::Record::builder()
+                    .target("flx::test")
+                    .level(log::Level::Warn)
+                    .args(format_args!("noise"))
+                    .build(),
+                // Color is only ever requested for a terminal.
+                false,
+            )
+            .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written, "flx::test: WARN noise\n");
+        assert!(
+            !written.contains('\u{1b}'),
+            "a log file is paged through later, never painted"
+        );
+        assert!(TUI_LOG_FILE.ends_with(".log"));
+    }
+
+    #[cfg(feature = "log")]
+    #[test]
+    fn the_screen_log_lives_beside_the_database() {
+        use super::screen_log_path;
+        use std::ffi::OsStr;
+
+        let path = screen_log_path().expect("a data directory resolves");
+        assert_eq!(path.file_name(), Some(OsStr::new(super::TUI_LOG_FILE)));
+        assert_eq!(
+            path.parent().and_then(|dir| dir.file_name()),
+            Some(OsStr::new(env!("CARGO_PKG_NAME"))),
+            "the log belongs in flx's own data directory, got {}",
+            path.display()
+        );
     }
 }

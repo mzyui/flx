@@ -51,6 +51,17 @@ futures-util = "0.3"
 memchr = "2.8.3"
 hashbrown = "0.17.1"
 
+# interactive TUI (`flx` with no arguments). Ratatui 0.30 keeps crossterm
+# behind one per-version flag; enabling both majors would give the event
+# stream and raw-mode tracking two separate queues, so pick only 0.29.
+ratatui = { version = "0.30", optional = true, default-features = false, features = [
+  "crossterm_0_29",
+  "layout-cache",
+] }
+crossterm = { version = "0.29", optional = true, features = ["event-stream"] }
+# Table cells are measured in display cells, never in bytes.
+unicode-width = { version = "0.2", optional = true }
+
 # request client
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = [
@@ -94,6 +105,16 @@ default = ["log", "progress_bar", "clap"]
 log = ["dep:log"]
 progress_bar = []
 clap = ["dep:clap"]
+# Optional interactive TUI (`flx find --tui`, `flx grab --tui`).
+# Off by default; opt in with `--features tui`.
+tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width"]
 # Optional rotating proxy endpoint (`flx serve` + `Flx::serve`).
 # Off by default while serve stays suboptimal; opt in with `--features serve`.
 serve = []
+
+
+[dev-dependencies]
+# Golden frames for the TUI (`TestBackend` + `insta` snapshots).
+insta = "1"
+# A real terminal for the TUI's lifecycle smoke test.
+portable-pty = "0.9"
