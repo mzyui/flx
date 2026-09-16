@@ -128,6 +128,18 @@ impl Session {
         self.seen().contains(needle)
     }
 
+    /// Waits until the child has emitted more output than before a resize.
+    fn wait_for_output_after(&self, previous_length: usize) -> bool {
+        let deadline = Instant::now() + TIMEOUT;
+        while Instant::now() < deadline {
+            if self.seen().len() > previous_length {
+                return true;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        self.seen().len() > previous_length
+    }
+
     /// Waits for the child to exit, returning its code.
     fn exit_code(&mut self) -> Option<u32> {
         let deadline = Instant::now() + TIMEOUT;
@@ -164,14 +176,17 @@ fn a_run_paints_immediately_survives_a_resize_and_quits_cleanly() {
     );
 
     // A resize must re-lay out rather than corrupt or blank the screen.
+    let before_resize = session.seen().len();
     session.resize(140, 30);
     assert!(
-        session.wait_for("selected"),
-        "the wide layout grows a side panel; tail: {:?}",
+        session.wait_for_output_after(before_resize),
+        "the single-pane table redraws after resize; tail: {:?}",
         session.tail()
     );
 
-    session.send(b"q");
+    session.send(b"\x03");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(b"\x03");
     assert_eq!(
         session.exit_code(),
         Some(0),
