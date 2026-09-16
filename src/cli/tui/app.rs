@@ -23,6 +23,16 @@ const PAGE_ROWS: usize = 10;
 const RATE_SAMPLE_SECS: f64 = 0.5;
 /// How long an ephemeral status line stays before it fades.
 const MESSAGE_TTL: Duration = Duration::from_secs(6);
+const EXPORT_FORMATS: [&str; 8] = [
+    "default",
+    "text",
+    "json",
+    "pretty-json",
+    "json-lines",
+    "csv",
+    "prefix",
+    "proxychains",
+];
 
 /// How loud a status line is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +53,9 @@ pub(crate) struct Message {
 pub(crate) struct InputBox {
     pub(crate) purpose: InputPurpose,
     pub(crate) buffer: String,
+    pub(crate) original: String,
+    pub(crate) options: Vec<String>,
+    pub(crate) selected: usize,
 }
 
 /// What a `y/N` prompt will do once confirmed.
@@ -79,7 +92,6 @@ pub(crate) struct App {
     /// Rows the `?` panel is scrolled down; clamped to its content at render.
     pub(crate) help_scroll: u16,
     pub(crate) message: Option<Message>,
-    pub(crate) paused: bool,
     pub(crate) should_quit: bool,
     pub(crate) started: Option<Instant>,
     /// When the run ended, which freezes the header's elapsed. `None` while it
@@ -115,7 +127,6 @@ impl App {
             help: false,
             help_scroll: 0,
             message: None,
-            paused: false,
             should_quit: false,
             started: None,
             finished_at: None,
@@ -235,7 +246,6 @@ impl App {
 
         let rows = self.visible.len();
         match action {
-            Action::Quit => self.should_quit = true,
             Action::Interrupt => self.interrupt(),
             Action::ToggleHelp => {
                 // Opening always starts at the top, so the panel reads in order.
@@ -274,6 +284,9 @@ impl App {
                 self.input = Some(InputBox {
                     purpose: InputPurpose::Filter,
                     buffer: self.view.filter.clone(),
+                    original: self.view.filter.clone(),
+                    options: Vec::new(),
+                    selected: 0,
                 });
             }
             Action::ClearFilter => {
@@ -282,10 +295,19 @@ impl App {
                 self.refresh_visible();
             }
             Action::Export => {
-                let buffer = self.default_export_path();
+                let selected = EXPORT_FORMATS
+                    .iter()
+                    .position(|format| *format == self.spec.output.format)
+                    .unwrap_or(0);
                 self.input = Some(InputBox {
-                    purpose: InputPurpose::ExportPath,
-                    buffer,
+                    purpose: InputPurpose::ExportFormat,
+                    buffer: EXPORT_FORMATS[selected].to_owned(),
+                    original: String::new(),
+                    options: EXPORT_FORMATS
+                        .iter()
+                        .map(|format| (*format).to_owned())
+                        .collect(),
+                    selected,
                 });
             }
             Action::Rerun => self.begin_run(),
@@ -391,20 +413,95 @@ impl App {
     }
 
     fn handle_typing(&mut self, action: Action) {
+        if self
+            .input
+            .as_ref()
+            .is_some_and(|input| input.purpose == InputPurpose::ExportFormat)
+        {
+            match action {
+                Action::ScrollUp => self.shift_export_format(-1),
+                Action::ScrollDown => self.shift_export_format(1),
+                Action::Text(character) if character.is_ascii_digit() => {
+                    if let Some(index) = character
+                        .to_digit(10)
+                        .and_then(|digit| digit.checked_sub(1))
+                        .map(|digit| digit as usize)
+                    {
+                        if index < EXPORT_FORMATS.len() {
+                            self.select_export_format(index);
+                        }
+                    }
+                }
+                Action::Submit => self.submit_input(),
+                Action::Cancel => self.input = None,
+                _ => {}
+            }
+            return;
+        }
+
         match action {
             Action::Text(character) => {
                 if let Some(input) = &mut self.input {
                     input.buffer.push(character);
                 }
+                self.refresh_filter_input();
             }
             Action::Backspace => {
                 if let Some(input) = &mut self.input {
                     input.buffer.pop();
                 }
+                self.refresh_filter_input();
             }
-            Action::Cancel => self.input = None,
+            Action::Cancel => {
+                let original = self
+                    .input
+                    .as_ref()
+                    .filter(|input| input.purpose == InputPurpose::Filter)
+                    .map(|input| input.original.clone());
+                self.input = None;
+                if let Some(original) = original {
+                    self.view.filter = original;
+                    self.refresh_visible();
+                }
+            }
             Action::Submit => self.submit_input(),
             _ => {}
+        }
+    }
+
+    fn refresh_filter_input(&mut self) {
+        let Some(filter) = self
+            .input
+            .as_ref()
+            .filter(|input| input.purpose == InputPurpose::Filter)
+            .map(|input| input.buffer.clone())
+        else {
+            return;
+        };
+        self.view.filter = filter;
+        self.view.reset_position();
+        self.refresh_visible();
+    }
+
+    fn shift_export_format(&mut self, delta: isize) {
+        let Some(input) = &mut self.input else {
+            return;
+        };
+        let len = input.options.len();
+        if len == 0 {
+            return;
+        }
+        input.selected = (input.selected as isize + delta).rem_euclid(len as isize) as usize;
+        input.buffer = input.options[input.selected].clone();
+    }
+
+    fn select_export_format(&mut self, selected: usize) {
+        let Some(input) = &mut self.input else {
+            return;
+        };
+        if selected < input.options.len() {
+            input.selected = selected;
+            input.buffer = input.options[selected].clone();
         }
     }
 
@@ -417,6 +514,17 @@ impl App {
                 self.view.filter = input.buffer.trim().to_owned();
                 self.view.reset_position();
                 self.refresh_visible();
+            }
+            InputPurpose::ExportFormat => {
+                self.spec.output.format = input.buffer;
+                let path = self.default_export_path();
+                self.input = Some(InputBox {
+                    purpose: InputPurpose::ExportPath,
+                    buffer: path,
+                    original: String::new(),
+                    options: Vec::new(),
+                    selected: 0,
+                });
             }
             InputPurpose::ExportPath => self.request_export(input.buffer.trim().to_owned()),
         }
@@ -796,6 +904,20 @@ mod tests {
     }
 
     #[test]
+    fn filter_updates_live_and_esc_restores_the_previous_query() {
+        let mut app = app_with_results(4);
+        app.view.filter = "10.0.0".to_owned();
+        app.refresh_visible();
+        app.handle_action(Action::EditFilter);
+        app.handle_action(Action::Text('1'));
+        assert_eq!(app.view.filter, "10.0.01");
+        assert!(app.visible.len() < 4);
+        app.handle_action(Action::Cancel);
+        assert_eq!(app.view.filter, "10.0.0");
+        assert_eq!(app.visible.len(), 4);
+    }
+
+    #[test]
     fn filtering_rebuilds_the_visible_list() {
         let mut app = app_with_results(4);
         app.handle_action(Action::EditFilter);
@@ -869,11 +991,36 @@ mod tests {
     }
 
     #[test]
+    fn export_opens_a_format_chooser_before_the_path_prompt() {
+        let mut app = app_with_results(2);
+        app.handle_action(Action::Export);
+        assert_eq!(
+            app.input.as_ref().map(|input| input.purpose),
+            Some(InputPurpose::ExportFormat)
+        );
+        app.handle_action(Action::ScrollDown);
+        assert_eq!(
+            app.input.as_ref().map(|input| input.buffer.as_str()),
+            Some("text")
+        );
+        app.handle_action(Action::Submit);
+        assert_eq!(
+            app.input.as_ref().map(|input| input.purpose),
+            Some(InputPurpose::ExportPath)
+        );
+        assert_eq!(app.spec.output.format, "text");
+    }
+
+    #[test]
     fn an_empty_export_path_never_writes() {
         let mut app = app_with_results(2);
         app.handle_action(Action::Export);
-        assert!(app.input.is_some());
-        let input = app.input.as_mut().expect("a prompt is open");
+        assert_eq!(
+            app.input.as_ref().map(|input| input.purpose),
+            Some(InputPurpose::ExportFormat)
+        );
+        app.handle_action(Action::Submit);
+        let input = app.input.as_mut().expect("the path prompt is open");
         input.buffer.clear();
         app.handle_action(Action::Submit);
         let message = app.message.as_ref().expect("the refusal is reported");
@@ -895,7 +1042,8 @@ mod tests {
 
         let mut app = app_with_results(2);
         app.handle_action(Action::Export);
-        let input = app.input.as_mut().expect("a prompt is open");
+        app.handle_action(Action::Submit);
+        let input = app.input.as_mut().expect("the path prompt is open");
         input.buffer = path.to_string_lossy().into_owned();
         app.handle_action(Action::Submit);
 
