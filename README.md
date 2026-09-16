@@ -63,7 +63,9 @@ flx grab --tui -c US,DE
 ```
 
 > [!TIP]
-> Press `?` inside the TUI for the full keymap. Filter with `/`, sort with `s` / `S`, inspect a row with `Enter`, export with `e`.
+> Press `?` inside the TUI for the full keymap. Move with arrows or `j`/`k`, live-filter with `/` as you type, sort with `s` / `S`, inspect a row with `Enter`, export with `e`, and exit with `Ctrl+C` (press twice to exit after cancelling a live run). Press `Esc` while filtering to restore the previous query.
+
+The TUI uses a minimalist full-width layout: a compact header, a separated status line, a borderless results table, and a contextual footer. At 60–79 columns it hides lower-priority fields; below `60×12` it shows a terminal-size message. Detail is a rich drill-down view opened with `Enter` or `d`, showing endpoint, protocols, location, performance, and recent failure metadata; `Esc` returns without losing the selected row. `e` opens an export-format chooser before asking for the destination path. Mouse scrolling and row selection are optional keyboard-equivalent shortcuts; configuration remains controlled by the normal CLI flags and config file.
 
 > [!NOTE]
 > `--tui` needs an interactive terminal and only works with `find` and `grab`.
