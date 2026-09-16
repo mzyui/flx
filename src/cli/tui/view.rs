@@ -22,23 +22,16 @@ pub(crate) const COLUMN_SPACING: u16 = 1;
 pub(crate) const MIN_WIDTH: u16 = 60;
 pub(crate) const MIN_HEIGHT: u16 = 12;
 
-/// Rows spent on chrome that is always present: the two header lines (identity
-/// and the live/done line) and the two-line footer. The table takes the rest.
-const HEADER_ROWS: u16 = 2;
-const FOOTER_ROWS: u16 = 2;
-/// The table never shrinks below this, or its own header and borders would be
-/// all that is left of the panel.
-const MIN_TABLE_ROWS: u16 = 4;
+/// Rows reserved for the compact header and footer.
+const HEADER_ROWS: u16 = 1;
+const FOOTER_ROWS: u16 = 1;
+/// Two rows separate the status line from the main results surface.
+const STATUS_ROWS: u16 = 2;
+/// The table keeps enough room for its header and at least one result row.
+const MIN_TABLE_ROWS: u16 = 2;
 
-/// Above this width the selected row also gets a persistent side panel.
-pub(crate) const WIDE_BREAKPOINT: u16 = 120;
-/// Share of the body the side panel takes once the wide breakpoint is passed.
-const SIDE_DETAIL_PERCENT: u16 = 30;
-
-/// Cells the table block spends on its border and inner padding.
-pub(crate) const TABLE_CHROME_COLUMNS: u16 = 4;
-/// Rows the table block spends on top border, header, and bottom border.
-pub(crate) const TABLE_CHROME_ROWS: u16 = 3;
+/// The borderless table spends one row on its column header.
+pub(crate) const TABLE_CHROME_ROWS: u16 = 1;
 
 /// Columns displayed, including the leading ordinal.
 pub(crate) const COLUMN_COUNT: usize = 9;
@@ -565,43 +558,28 @@ fn ordinal_width(rows: usize) -> u16 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScreenLayout {
     pub(crate) header: Rect,
+    pub(crate) status: Rect,
     pub(crate) table: Rect,
-    pub(crate) side_detail: Option<Rect>,
     pub(crate) footer: Rect,
 }
 
-/// Splits `area` into the header, primary table, optional side detail, and
-/// footer.
-///
-/// The header carries the live line, so no separate progress region exists.
+/// Splits the screen into compact header, status, full-width table, and footer.
 pub(crate) fn compute_layout(area: Rect) -> Option<ScreenLayout> {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return None;
     }
-    let [header, body, footer] = Layout::vertical([
+    let [header, status, table, footer] = Layout::vertical([
         Constraint::Length(HEADER_ROWS),
+        Constraint::Length(STATUS_ROWS),
         Constraint::Min(MIN_TABLE_ROWS),
         Constraint::Length(FOOTER_ROWS),
     ])
     .areas(area);
 
-    // Only ultrawide terminals get a persistent side panel; everything else
-    // reaches detail through the drill-down overlay so the table keeps its width.
-    let (table, side_detail) = if area.width > WIDE_BREAKPOINT {
-        let [table, side] = Layout::horizontal([
-            Constraint::Percentage(100 - SIDE_DETAIL_PERCENT),
-            Constraint::Percentage(SIDE_DETAIL_PERCENT),
-        ])
-        .areas(body);
-        (table, Some(side))
-    } else {
-        (body, None)
-    };
-
     Some(ScreenLayout {
         header,
+        status,
         table,
-        side_detail,
         footer,
     })
 }
@@ -842,51 +820,40 @@ mod tests {
     }
 
     #[test]
-    fn table_reserves_a_line_for_the_header() {
-        assert_eq!(table_rows(14), 11);
-        assert_eq!(table_rows(3), 0);
+    fn table_reserves_only_its_column_header() {
+        assert_eq!(table_rows(14), 13);
+        assert_eq!(table_rows(3), 2);
         assert_eq!(table_rows(0), 0);
     }
 
     #[test]
-    fn layout_hands_the_remainder_to_the_table() {
+    fn minimalist_layout_keeps_the_table_full_width() {
         let layout = compute_layout(Rect::new(0, 0, 80, 24)).expect("80x24 is supported");
         assert_eq!(layout.header.height, HEADER_ROWS);
+        assert_eq!(layout.status.height, STATUS_ROWS);
         assert_eq!(layout.footer.height, FOOTER_ROWS);
-        assert!(
-            layout.side_detail.is_none(),
-            "80 columns is below the wide breakpoint"
-        );
-        assert_eq!(layout.table.height, 24 - HEADER_ROWS - FOOTER_ROWS);
         assert_eq!(layout.table.width, 80);
-    }
-
-    #[test]
-    fn the_header_is_two_rows_whatever_the_screen_is_doing() {
-        // The live line lives in the header, so there is no separate progress
-        // region and the table never shifts when a run starts or ends.
-        let area = Rect::new(0, 0, 80, 24);
-        let layout = compute_layout(area).expect("80x24 is supported");
-        assert_eq!(layout.header.height, HEADER_ROWS);
-        assert_eq!(layout.table.y, layout.header.bottom());
-    }
-
-    #[test]
-    fn wide_terminals_split_off_a_side_panel() {
-        let layout = compute_layout(Rect::new(0, 0, 200, 50)).expect("200x50 is supported");
-        let side = layout.side_detail.expect("ultrawide gets a side panel");
-        assert_eq!(side.width + layout.table.width, 200);
-        assert!(
-            layout.table.width > side.width,
-            "the table keeps the bulk of the width"
+        assert_eq!(layout.table.y, layout.status.bottom());
+        assert_eq!(
+            layout.table.height,
+            24 - HEADER_ROWS - STATUS_ROWS - FOOTER_ROWS
         );
+    }
+
+    #[test]
+    fn wide_terminals_keep_the_same_single_pane_layout() {
+        let layout = compute_layout(Rect::new(0, 0, 200, 50)).expect("200x50 is supported");
+        assert_eq!(layout.table.width, 200);
+        assert_eq!(layout.table.x, 0);
     }
 
     #[test]
     fn the_layout_refuses_terminals_below_the_minimum() {
         assert!(compute_layout(Rect::new(0, 0, 59, 24)).is_none());
         assert!(compute_layout(Rect::new(0, 0, 60, 11)).is_none());
-        assert!(compute_layout(Rect::new(0, 0, 60, 12)).is_some());
+        let minimum = compute_layout(Rect::new(0, 0, 60, 12)).expect("60x12 is supported");
+        assert_eq!(minimum.table.width, 60);
+        assert_eq!(minimum.table.height, 8);
     }
 
     #[test]
