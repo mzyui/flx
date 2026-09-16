@@ -19,6 +19,8 @@ pub(crate) enum Screen {
 pub(crate) enum InputPurpose {
     /// Typing the results filter.
     Filter,
+    /// Choosing the export format.
+    ExportFormat,
     /// Typing the export destination path.
     ExportPath,
 }
@@ -39,7 +41,6 @@ pub(crate) struct KeyContext {
 /// A user intent decoupled from the physical key that produced it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
-    Quit,
     ToggleHelp,
     /// Esc: close the drill-down, dismiss a prompt, or leave the Done screen.
     Back,
@@ -190,7 +191,6 @@ use Scope as S;
 #[rustfmt::skip]
 static KEYMAP: &[Binding] = &[
     // Global
-    row(&[Key::Char('q')], "q", A::Quit, "quit", "leave the run and the UI", S::Screen, false),
     row(&[Key::Char('?')], "?", A::ToggleHelp, "help", "open this key table", S::Screen, false),
     row(&[Key::Esc], "esc", A::Back, "back", "close the drill-down, then leave", S::Screen, false),
     row(&[Key::Up, Key::Char('k')], "\u{2191}/k", A::ScrollUp, "up", "move up one row", S::Screen, false),
@@ -205,7 +205,7 @@ static KEYMAP: &[Binding] = &[
     row(&[Key::Char('c')], "c", A::CancelRun, "cancel", "cancel the run, after asking", S::Running, true),
     // Results, on either screen
     row(&[Key::Char('s')], "s", A::SortCycle, "sort", "cycle the sort key", S::Screen, true),
-    row(&[Key::Char('/')], "/", A::EditFilter, "filter", "filter rows (smart-case)", S::Screen, true),
+    row(&[Key::Char('/')], "/", A::EditFilter, "filter", "live-filter rows (smart-case); Esc restores", S::Screen, true),
     row(&[Key::Char('e')], "e", A::Export, "export", "export the visible rows", S::Screen, true),
     row(&[Key::Char('d')], "d", A::ToggleDetail, "detail", "open or close the drill-down", S::Screen, true),
     row(&[Key::Enter], "enter", A::DrillIn, "open", "open the drill-down", S::Screen, false),
@@ -215,6 +215,8 @@ static KEYMAP: &[Binding] = &[
     row(&[Key::Char('r')], "r", A::Rerun, "re-run", "run again with the same options", S::Done, true),
     // Text prompts
     row(&[Key::Enter], "enter", A::Submit, "submit", "submit the prompt", S::Input, false),
+    row(&[Key::Up], "up", A::ScrollUp, "up", "choose the previous export format", S::Input, false),
+    row(&[Key::Down], "down", A::ScrollDown, "down", "choose the next export format", S::Input, false),
     row(&[Key::Esc], "esc", A::Cancel, "cancel", "abandon the prompt", S::Input, true),
     row(&[Key::Backspace], "backspace", A::Backspace, "delete", "delete one character", S::Input, false),
     row(&[Key::Printable], "text", TEXT_ANY, "type", "type text; digits type here too", S::Input, false),
@@ -222,7 +224,7 @@ static KEYMAP: &[Binding] = &[
     row(&[Key::Char('y'), Key::Char('Y')], "y", A::ConfirmYes, "yes", "yes, go ahead", S::Confirm, true),
     row(&[Key::Char('n'), Key::Char('N')], "n", A::ConfirmNo, "no", "no; any other key declines", S::Confirm, true),
     // The help panel itself, so it can document its own keys
-    row(&[Key::Esc, Key::Char('q'), Key::Char('?')], "esc", A::ToggleHelp, "close", "close this help", S::Help, true),
+    row(&[Key::Esc, Key::Char('?')], "esc", A::ToggleHelp, "close", "close this help", S::Help, true),
     row(&[Key::Down, Key::Char('j'), Key::PageDown], "\u{2193}/j", A::ScrollDown, "scroll", "scroll down", S::Help, true),
     row(&[Key::Up, Key::Char('k'), Key::PageUp], "\u{2191}/k", A::ScrollUp, "scroll", "scroll back up", S::Help, false),
 ];
@@ -231,12 +233,13 @@ static KEYMAP: &[Binding] = &[
 ///
 /// One short line each, short enough for the narrowest supported panel: they
 /// are read as a list, not as prose.
-pub(crate) const HELP_NOTES: [&str; 5] = [
+pub(crate) const HELP_NOTES: [&str; 6] = [
     "Row numbers follow the view, not the run.",
     "The filter is smart-case: lowercase ignores case.",
     "The mouse scrolls and clicks; Shift selects text.",
     "Every flag you passed still configures the run.",
     "Judge health shows only when a judge is down.",
+    "Ctrl+C cancels, then exits on the next press.",
 ];
 
 /// Normalizes a terminal event into a table key, or `None` when the key is one
