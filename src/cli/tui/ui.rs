@@ -20,8 +20,6 @@ use super::view::{self, RowModel};
 const OVERLAY_CHROME_ROWS: u16 = 2;
 /// Cells an overlay spends on its border and inner padding.
 const OVERLAY_CHROME_COLUMNS: u16 = 4;
-/// Share of the terminal a drill-down overlay takes.
-const DETAIL_WIDTH_PERCENT: u16 = 70;
 /// Share of the terminal the help overlay takes.
 const HELP_WIDTH_PERCENT: u16 = 80;
 /// Share of the terminal a text prompt takes.
@@ -50,10 +48,8 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     };
 
     render_header(frame, app, layout.header);
+    render_status(frame, app, layout.status);
     render_table(frame, app, layout.table);
-    if let Some(side) = layout.side_detail {
-        render_side_detail(frame, app, side);
-    }
     render_footer(frame, app, layout.footer);
 
     // Overlays, topmost surface last.
@@ -74,10 +70,9 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
 /// already reachable with the movement keys.
 pub(crate) fn row_at(app: &App, area: Rect, row: u16) -> Option<usize> {
     let layout = view::compute_layout(area)?;
-    let body = table_block(app).inner(layout.table);
-    // The header occupies the first line inside the panel.
-    let first_data_row = body.y.checked_add(1)?;
-    if row < first_data_row || row >= body.bottom() {
+    // The first table row is the column header; data starts immediately after it.
+    let first_data_row = layout.table.y.checked_add(1)?;
+    if row < first_data_row || row >= layout.table.bottom() {
         return None;
     }
     let height = view::table_rows(layout.table.height);
@@ -120,7 +115,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Done => ("done", theme::status_success()),
     };
     let identity = Line::from(vec![
-        Span::styled(" flx", theme::title()),
+        Span::styled("flx", theme::title()),
         Span::styled(format!(" {} ", separator()), theme::text_muted()),
         Span::styled(app.mode_label(), theme::accent_primary()),
         Span::styled(format!(" {} ", separator()), theme::text_muted()),
@@ -130,11 +125,30 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             theme::text_muted(),
         ),
     ]);
-    let live = match app.screen {
+    frame.render_widget(Paragraph::new(identity), area);
+}
+
+fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+    let mut line = match app.screen {
         Screen::Running => running_summary(app, area.width),
         Screen::Done => done_summary(app),
     };
-    frame.render_widget(Paragraph::new(vec![identity, live]), area);
+    if let Some(message) = &app.message {
+        let style = match message.kind {
+            MessageKind::Info => theme::status_info(),
+            MessageKind::Warning => theme::status_warning(),
+            MessageKind::Error => theme::status_error(),
+        };
+        line.spans.push(Span::styled(
+            format!("  {} {}", separator(), message.text),
+            style,
+        ));
+    }
+    line.spans.push(Span::styled(
+        format!("  {} {}", separator(), table_title(app)),
+        theme::text_muted(),
+    ));
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// The live line: the progress bar and its numbers once validation is running,
@@ -322,10 +336,7 @@ fn progress_label(done: usize, total: usize, fraction: f64, rate: f64, budget: u
 
 fn render_table(frame: &mut Frame, app: &App, area: Rect) {
     let rows_in_view = app.visible.len();
-    let fitted = view::fit_columns(
-        area.width.saturating_sub(view::TABLE_CHROME_COLUMNS),
-        rows_in_view,
-    );
+    let fitted = view::fit_columns(area.width, rows_in_view);
     let height = view::table_rows(area.height);
     let (start, end) = view::window(app.view.selected, height, rows_in_view);
 
@@ -336,9 +347,6 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect) {
     )
     .style(theme::title());
 
-    // The row marker identifies *which* row the frame is about, so it stays
-    // while the table is on screen: opening the drill-down or a prompt must not
-    // lose the row it refers to. Focus is signalled by the border, not by this.
     let filter = (!app.view.filter.is_empty()).then_some(app.view.filter.as_str());
     let rows: Vec<Row> = (start..end)
         .map(|position| {
@@ -358,33 +366,13 @@ fn render_table(frame: &mut Frame, app: &App, area: Rect) {
     let widths = fitted.iter().map(|(_, width)| Constraint::Length(*width));
     let table = Table::new(rows, widths)
         .column_spacing(view::COLUMN_SPACING)
-        .header(header)
-        .block(table_block(app));
+        .header(header);
     frame.render_widget(table, area);
-}
-
-/// The primary table's block: the one bordered panel, accent when focused.
-fn table_block(app: &App) -> Block<'static> {
-    let focused = !app.overlay_open();
-    let title_style = if focused {
-        theme::title()
-    } else {
-        theme::text_muted()
-    };
-    Block::bordered()
-        .border_set(theme::border_set())
-        .border_style(if focused {
-            theme::border_focus()
-        } else {
-            theme::border_default()
-        })
-        .padding(Padding::horizontal(1))
-        .title(Line::from(table_title(app)).style(title_style))
 }
 
 fn table_title(app: &App) -> String {
     let mut title = format!(
-        " results {} {}/{} {} sort {} {} ",
+        "results {} {}/{} {} sort {} {}",
         separator(),
         app.visible.len(),
         app.results.len(),
@@ -393,10 +381,10 @@ fn table_title(app: &App) -> String {
         app.view.order_glyph()
     );
     if !app.view.filter.is_empty() {
-        title.push_str(&format!("{} filter \"{}\" ", separator(), app.view.filter));
+        title.push_str(&format!("{} filter \"{}\"", separator(), app.view.filter));
     }
     if app.overflow > 0 {
-        title.push_str(&format!("{} over cap {} ", separator(), app.overflow));
+        title.push_str(&format!("{} over cap {}", separator(), app.overflow));
     }
     title
 }
@@ -467,58 +455,115 @@ fn body_cell(
     Cell::from(Text::from(line).alignment(column.align))
 }
 
-/// The persistent side panel on ultrawide terminals. Deliberately borderless:
-/// the table's right border already separates the two.
-fn render_side_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines = vec![Line::from(Span::styled(" selected", theme::title()))];
-    lines.extend(detail_lines(app));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::new().padding(Padding::horizontal(1)))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
 fn detail_lines(app: &App) -> Vec<Line<'static>> {
     let Some(proxy) = app.selected_proxy() else {
         return vec![Line::from(Span::styled(
-            " no row selected",
+            "no row selected",
             theme::text_muted(),
         ))];
     };
+    let geo = &proxy.geo;
     let mut lines = vec![
-        Line::from(Span::styled(
-            format!(" {}", proxy.as_text()),
-            theme::text_emphasis(),
-        )),
-        field("geo", geo_summary(proxy)),
+        section("endpoint"),
+        field("address", proxy.as_text().to_owned()),
+        field("ip", proxy.ip.to_string()),
+        field("port", proxy.port.to_string()),
+        Line::default(),
+        section("protocols"),
+        field("validated", validated_types(proxy)),
+        field("expected", expected_types(proxy)),
+        Line::default(),
+        section("location"),
+        field("country", option_text(geo.iso_code.as_deref())),
+        field("region", option_text(geo.region_name.as_deref())),
+        field("city", option_text(geo.city_name.as_deref())),
+        field("ip type", ip_type_label(geo.ip_type)),
         field(
-            "org",
-            proxy
-                .geo
-                .aso
-                .as_deref()
-                .unwrap_or("unknown organization")
-                .to_owned(),
+            "asn",
+            geo.asn
+                .map_or_else(|| "unknown".to_owned(), |asn| asn.to_string()),
+        ),
+        field("organization", option_text(geo.aso.as_deref())),
+        field("timezone", option_text(geo.timezone.as_deref())),
+        Line::default(),
+        section("performance"),
+        field(
+            "average",
+            format_duration_seconds(proxy.avg_response_time()),
         ),
         field(
-            "rtt",
-            format!(
-                "{:.2}s {sep} n={} {sep} min {:.2}s max {:.2}s",
-                proxy.avg_response_time(),
-                proxy.sample_count(),
-                proxy.min_response_time(),
-                proxy.max_response_time(),
-                sep = separator()
-            ),
+            "minimum",
+            format_duration_seconds(proxy.min_response_time()),
         ),
-        field("types", types_summary(proxy)),
+        field(
+            "maximum",
+            format_duration_seconds(proxy.max_response_time()),
+        ),
+        field("samples", proxy.sample_count().to_string()),
     ];
     if let Some(failure) = app.failures.last() {
-        lines.push(field("last failure", failure.clone()));
+        lines.extend([
+            Line::default(),
+            section("latest failure"),
+            field("message", failure.clone()),
+        ]);
     }
     lines
+}
+
+fn section(title: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        title,
+        theme::title().add_modifier(ratatui::style::Modifier::UNDERLINED),
+    ))
+}
+
+fn option_text(value: Option<&str>) -> String {
+    value.unwrap_or("unknown").to_owned()
+}
+
+fn ip_type_label(ip_type: flx::IpType) -> String {
+    match ip_type {
+        flx::IpType::Residential => "residential",
+        flx::IpType::Datacenter => "datacenter",
+        flx::IpType::Mobile => "mobile",
+        flx::IpType::Unknown => "unknown",
+    }
+    .to_owned()
+}
+
+fn format_duration_seconds(seconds: f64) -> String {
+    format!("{seconds:.3}s")
+}
+
+fn validated_types(proxy: &flx::Proxy) -> String {
+    if proxy.proxy_types.is_empty() {
+        return "none".to_owned();
+    }
+    proxy
+        .proxy_types
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}{}",
+                entry.protocol,
+                if entry.checked { " (checked)" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn expected_types(proxy: &flx::Proxy) -> String {
+    if proxy.expected_types.is_empty() {
+        return "none".to_owned();
+    }
+    proxy
+        .expected_types
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One `name  value` line, with the name in a fixed muted gutter.
@@ -527,32 +572,6 @@ fn field(name: &'static str, value: String) -> Line<'static> {
         Span::styled(format!(" {name:<11} "), theme::text_muted()),
         Span::styled(value, theme::text_primary()),
     ])
-}
-
-fn geo_summary(proxy: &flx::Proxy) -> String {
-    let city = proxy.geo.city_name.as_deref().unwrap_or("-");
-    let asn = proxy
-        .geo
-        .asn
-        .map(|asn| asn.to_string())
-        .unwrap_or_else(|| "-".to_owned());
-    format!(
-        "{} {sep} {city} {sep} asn {asn}",
-        proxy.geo.iso_code.as_deref().unwrap_or("--"),
-        sep = separator()
-    )
-}
-
-fn types_summary(proxy: &flx::Proxy) -> String {
-    if proxy.proxy_types.is_empty() {
-        return "unvalidated".to_owned();
-    }
-    proxy
-        .proxy_types
-        .iter()
-        .map(|entry| entry.protocol.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -575,19 +594,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled(format!(" {label}"), theme::text_muted()));
         }
     }
-    let mut lines = vec![Line::from(spans)];
-    if let Some(message) = &app.message {
-        let style = match message.kind {
-            MessageKind::Info => theme::status_info(),
-            MessageKind::Warning => theme::status_warning(),
-            MessageKind::Error => theme::status_error(),
-        };
-        lines.push(Line::from(Span::styled(
-            format!(" {}", message.text),
-            style,
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The single border an overlay gets: accent, with the ASCII set when needed.
@@ -620,6 +627,10 @@ fn overlay_width(area: Rect, percent: u16) -> u16 {
 }
 
 fn render_input(frame: &mut Frame, input: &InputBox, area: Rect) {
+    if input.purpose == InputPurpose::ExportFormat {
+        render_export_formats(frame, input, area);
+        return;
+    }
     let target = popup_area(
         area,
         overlay_width(area, PROMPT_WIDTH_PERCENT),
@@ -628,7 +639,8 @@ fn render_input(frame: &mut Frame, input: &InputBox, area: Rect) {
     frame.render_widget(Clear, target);
     let title = match input.purpose {
         InputPurpose::Filter => " filter ",
-        InputPurpose::ExportPath => " export to path ",
+        InputPurpose::ExportPath => " export path ",
+        InputPurpose::ExportFormat => unreachable!(),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -639,11 +651,44 @@ fn render_input(frame: &mut Frame, input: &InputBox, area: Rect) {
         .style(theme::bg_overlay()),
         target,
     );
-    // The caret sits at the end of the buffer: the prompt has no cursor keys.
     let caret = target.x + 2 + input.buffer.width() as u16;
     if caret < target.right().saturating_sub(1) {
         frame.set_cursor_position((caret, target.y + 1));
     }
+}
+
+fn render_export_formats(frame: &mut Frame, input: &InputBox, area: Rect) {
+    let height = (input.options.len() as u16 + 4).min(area.height);
+    let target = popup_area(area, overlay_width(area, PROMPT_WIDTH_PERCENT), height);
+    frame.render_widget(Clear, target);
+    let mut lines = vec![Line::from(Span::styled(
+        "choose an export format",
+        theme::text_emphasis(),
+    ))];
+    for (index, option) in input.options.iter().enumerate() {
+        let marker = if index == input.selected { ">" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker} {} ", index + 1), theme::accent_primary()),
+            Span::styled(
+                option.clone(),
+                if index == input.selected {
+                    theme::text_emphasis()
+                } else {
+                    theme::text_primary()
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        "↑↓/jk choose · Enter continue · Esc cancel",
+        theme::text_muted(),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(overlay_block(" export "))
+            .style(theme::bg_overlay()),
+        target,
+    );
 }
 
 fn render_confirm(frame: &mut Frame, confirm: &Confirm, area: Rect) {
@@ -676,18 +721,45 @@ fn render_confirm(frame: &mut Frame, confirm: &Confirm, area: Rect) {
 
 fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
     let lines = detail_lines(app);
-    let target = popup_area(
-        area,
-        overlay_width(area, DETAIL_WIDTH_PERCENT),
-        (lines.len() as u16 + OVERLAY_CHROME_ROWS).min(area.height),
-    );
-    frame.render_widget(Clear, target);
+    frame.render_widget(Clear, area);
+    let content = Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(3),
+        ..area
+    };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(overlay_block(" detail "))
             .style(theme::bg_overlay())
             .wrap(Wrap { trim: true }),
-        target,
+        content,
+    );
+    let title = Line::from(vec![
+        Span::styled("flx", theme::title()),
+        Span::styled(
+            format!(" {} results / {}", separator(), app.view.selected + 1),
+            theme::text_muted(),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
+    let footer = Line::from(Span::styled(
+        "Esc back · e export · ? help · Ctrl+C quit",
+        theme::text_muted(),
+    ));
+    frame.render_widget(
+        Paragraph::new(footer),
+        Rect {
+            y: area.bottom().saturating_sub(1),
+            height: 1,
+            ..area
+        },
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(area.width as usize)).style(theme::text_muted()),
+        Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        },
     );
 }
 
@@ -997,12 +1069,15 @@ mod tests {
 
         app.view.detail = true;
         let drilled_in = draw(&app, 80, 24);
-        let marked = highlighted_row(&drilled_in)
-            .expect("the detail pane says which row it describes, and so must the table");
+        let drilled_text = text(&drilled_in);
         assert!(
-            marked.contains(app.results[0].as_text()),
-            "the marked row must still be the selected one, got: {marked}"
+            drilled_text.contains(app.results[0].as_text()),
+            "the drill-down must still describe the selected row"
         );
+        assert!(drilled_text.contains("endpoint"));
+        assert!(drilled_text.contains("protocols"));
+        assert!(drilled_text.contains("location"));
+        assert!(drilled_text.contains("performance"));
 
         app.view.detail = false;
         app.confirm = Some(Confirm {
@@ -1017,31 +1092,29 @@ mod tests {
     }
 
     #[test]
-    fn the_focused_table_wears_the_accent_border() {
+    fn the_minimal_table_uses_selection_instead_of_a_focus_border() {
         let _theme = use_theme(false, false);
         let app = sample_app(3);
         let backend = draw(&app, 80, 24);
-        assert_eq!(
-            style_at(&backend, 0, 2).fg,
-            Some(Color::Cyan),
-            "the focused panel must be recognizable without reading its title"
+        assert!(
+            highlighted_row(&backend).is_some(),
+            "the selected row is the focus signal in the borderless table"
         );
+        assert_ne!(style_at(&backend, 0, 2).fg, Some(Color::Cyan));
     }
 
     #[test]
-    fn an_overlay_takes_the_focus_ring_from_the_table() {
+    fn a_detail_overlay_replaces_the_table_with_its_own_title() {
         let _theme = use_theme(false, false);
         let mut app = sample_app(3);
         app.view.detail = true;
         let backend = draw(&app, 80, 24);
-        assert_ne!(
-            style_at(&backend, 0, 2).fg,
-            Some(Color::Cyan),
-            "an open overlay owns the focus"
-        );
+        assert!(text(&backend).contains("results / 1"));
         assert!(
-            any_style(&backend, |style| style.fg == Some(Color::Cyan)),
-            "the overlay itself is accented, so focus has not simply vanished"
+            any_style(&backend, |style| {
+                style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "the drill-down title remains visible"
         );
     }
 
@@ -1092,10 +1165,7 @@ mod tests {
         let app = sample_app(3);
         let backend = draw(&app, 80, 24);
         let rendered = text(&backend);
-        assert!(
-            rendered.contains('+') && rendered.contains('-'),
-            "the ASCII border set must be in use"
-        );
+        assert!(rendered.contains('-'), "the ASCII separator must be in use");
         assert!(
             !rendered
                 .chars()
@@ -1247,7 +1317,7 @@ mod tests {
         app.handle_action(Action::Count(2));
         let backend = draw(&app, 80, 24);
         let frame = frame_text(&backend);
-        let hints = frame.lines().rev().nth(1).expect("the footer's first line");
+        let hints = frame.lines().last().expect("the footer line");
         assert!(
             normalized(hints).contains("12 G go to row"),
             "got {hints:?}"
@@ -1258,7 +1328,7 @@ mod tests {
         assert_eq!(app.view.selected, 11);
         let backend = draw(&app, 80, 24);
         let frame = frame_text(&backend);
-        let hints = frame.lines().rev().nth(1).expect("the footer's first line");
+        let hints = frame.lines().last().expect("the footer line");
         assert!(
             normalized(hints).contains("s sort"),
             "the hints must return, got {hints:?}"
@@ -1317,26 +1387,27 @@ mod tests {
     }
 
     #[test]
-    fn the_header_is_two_rows_of_chrome() {
+    fn the_minimal_frame_uses_one_header_and_one_status_row() {
         let _theme = use_theme(true, false);
         let app = sample_app(40);
         let backend = draw(&app, 80, 24);
         let frame = frame_text(&backend);
-        let rows: Vec<&str> = frame.lines().take(2).collect();
+        let rows: Vec<&str> = frame.lines().take(3).collect();
 
-        assert!(rows[0].starts_with(" flx"), "got {:?}", rows[0]);
+        assert!(rows[0].starts_with("flx"), "got {:?}", rows[0]);
         assert!(
-            rows[1].starts_with(' ') && !rows[1].trim().is_empty(),
-            "the second row is the live line, got {:?}",
+            rows[1].contains("results") && !rows[1].trim().is_empty(),
+            "the second row is the compact status line, got {:?}",
             rows[1]
         );
-        // The table begins immediately after, so no third chrome row exists.
         assert!(
             frame
                 .lines()
-                .nth(2)
-                .is_some_and(|line| line.starts_with('\u{250c}')),
-            "the panel must start on row three"
+                .skip(3)
+                .find(|line| line.contains("IP:PORT"))
+                .is_some(),
+            "the table header follows the breathing room, got {:?}",
+            frame.lines().take(5).collect::<Vec<_>>()
         );
     }
 
@@ -1415,16 +1486,19 @@ mod tests {
         let mut app = sample_app(20);
         let area = Rect::new(0, 0, 80, 24);
 
-        // The first data row sits under the panel's border and header.
+        // The first data row sits directly below the borderless column header.
         let layout = view::compute_layout(area).expect("80x24 is supported");
-        let body = table_block(&app).inner(layout.table);
-        let first = body.y + 1;
+        let first = layout.table.y + 1;
 
         assert_eq!(row_at(&app, area, first), Some(0));
         assert_eq!(row_at(&app, area, first + 4), Some(4));
-        assert_eq!(row_at(&app, area, body.y), None, "the header is not a row");
         assert_eq!(
-            row_at(&app, area, body.bottom()),
+            row_at(&app, area, layout.table.y),
+            None,
+            "the header is not a row"
+        );
+        assert_eq!(
+            row_at(&app, area, layout.table.bottom()),
             None,
             "a click below the last row selects nothing"
         );
