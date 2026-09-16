@@ -119,11 +119,6 @@ pub(crate) fn accent_primary() -> Style {
     Style::default().fg(colored(Color::Cyan))
 }
 
-/// `border.default` — every unfocused border.
-pub(crate) fn border_default() -> Style {
-    Style::default().fg(colored(Color::DarkGray))
-}
-
 /// `border.focus` — the one focused panel's border.
 pub(crate) fn border_focus() -> Style {
     Style::default().fg(colored(Color::Cyan))
