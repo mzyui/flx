@@ -163,6 +163,15 @@ impl RunHandle {
     }
 }
 
+impl Drop for RunHandle {
+    /// A quit while the pipeline is still live must not leave it running
+    /// behind the restored prompt: abort so `TerminalGuard`'s teardown and
+    /// the runtime shutdown never race detached fetch/validate work.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Whether a row may be emitted under the active per-type quotas.
 enum QuotaDecision {
     Emit,
