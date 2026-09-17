@@ -300,14 +300,11 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         }
     }
 
-    // `--tui` redirects a find/grab run into the terminal UI.
-    // Only available with the `tui` Cargo feature; the flag is hidden otherwise.
     #[cfg(feature = "tui")]
     if cli.tui {
         return run_tui(&cli);
     }
 
-    // Reject bare invocations with help and usage error.
     let Some(command) = cli.command else {
         use clap::CommandFactory as _;
         let mut stderr = std::io::stderr().lock();
@@ -324,7 +321,6 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         .build()
         .context("failed to build tokio runtime")?;
 
-    // Share cancel notifications across passes.
     let cancel = Arc::new(tokio::sync::Notify::new());
     // Observe GeoLite2 downloads for progress bars.
     let download = flx::install_download_observer().expect("download observer installs once");
@@ -534,7 +530,6 @@ where
     if let Some(bar) = warmup.as_deref() {
         bar.set_phase("Fetching proxy lists …");
     }
-    // Relay gathering stages to keep the bar live.
     let watcher = match (warmup, stages) {
         (Some(bar), Some(mut rx)) => Some(tokio::spawn(async move {
             while let Some(stage) = rx.recv().await {
@@ -566,7 +561,6 @@ async fn run_grab(
         return Ok(RunOutcome::Finished);
     }
     let fetch_cfg = fetcher_config(&grab.fetcher);
-    // Show the grab bar only when stdout is redirected.
     let show_bar = !quiet && (grab.output.output_file.is_some() || stdout_is_pipe());
     let (gather_tx, gather_rx) = tokio::sync::watch::channel(0usize);
     let warmup = if show_bar {
@@ -991,7 +985,6 @@ async fn run_find(
         if let Some(bar) = &warmup {
             bar.set_phase("Checking online judges …");
         }
-        // Keep source opening interruptible.
         let files = tokio::select! {
             files = file_source(&find.validator.files) => files?,
             _ = cancel.notified() => {
@@ -1080,7 +1073,6 @@ async fn run_find(
         .as_deref()
         .map(|p| p.to_string_lossy().into_owned());
 
-    // Hide the status line around stdout writes.
     let guard1 = make_guard(progress1.clone(), quiet, no_color);
     // Leave pass-1 JSON open when fallback may append.
     let may_fallback = !protocols.is_empty();

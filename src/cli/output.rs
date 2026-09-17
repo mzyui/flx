@@ -315,9 +315,7 @@ where
                 }
                 item = src.next() => {
                     let Some(proxy) = item else { break };
-                    // Filter while buffering so limits count kept results.
                     if filter.matches(&proxy) {
-                        // Skip quota-capped types without counting them.
                         if let Some(enforcer) = &quotas {
                             let mut enforcer = enforcer
                                 .lock()
@@ -360,7 +358,6 @@ where
     // kept rows, never skipped ones.
     let mut rows: usize = 0;
 
-    // Collect all proxies before rendering PAC output.
     if format == "pac" {
         let mut proxies: Vec<Proxy> = Vec::new();
         loop {
@@ -423,12 +420,9 @@ where
         }
         return Ok(RunOutcome::Finished);
     }
-    // Hold one stdout lock for the whole run.
     let mut stdout = std::io::stdout().lock();
 
-    // Assemble each proxy in a reusable buffer with one write per item.
     let mut buf: Vec<u8> = Vec::new();
-    // Stage serializations in scratch space before committing to `buf`.
     let mut body: Vec<u8> = Vec::new();
 
     let mut write_error: Option<anyhow::Error> = None;
@@ -465,7 +459,6 @@ where
             }
             item = source.next() => {
                 let Some(proxy) = item else { break };
-                // Enforce quotas before serializing; filled caps stop early.
                 if !quotas_applied {
                     if let Some(enforcer) = &quotas {
                         let mut enforcer =
@@ -704,7 +697,6 @@ fn ip_type_str(proxy: &Proxy) -> &'static str {
 }
 
 fn write_csv_row(buf: &mut Vec<u8>, proxy: &Proxy) {
-    // Write rows directly into buf to avoid allocations.
     let _ = write!(buf, "{},{}", proxy.ip, proxy.port);
     buf.push(b',');
     for (i, pt) in proxy.proxy_types.iter().enumerate() {
