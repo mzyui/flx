@@ -91,6 +91,8 @@ pub(crate) struct App {
     pub(crate) help: bool,
     /// Rows the `?` panel is scrolled down; clamped to its content at render.
     pub(crate) help_scroll: u16,
+    /// Detail lines are scrollable because the rich record exceeds the inline viewport.
+    pub(crate) detail_scroll: u16,
     pub(crate) message: Option<Message>,
     pub(crate) should_quit: bool,
     pub(crate) started: Option<Instant>,
@@ -126,6 +128,7 @@ impl App {
             confirm: None,
             help: false,
             help_scroll: 0,
+            detail_scroll: 0,
             message: None,
             should_quit: false,
             started: None,
@@ -161,6 +164,7 @@ impl App {
         self.count = None;
         self.finished_at = None;
         self.confirm = None;
+        self.detail_scroll = 0;
         self.view.reset_position();
         self.started = Some(Instant::now());
         self.run = self
@@ -243,6 +247,9 @@ impl App {
             self.handle_typing(action);
             return;
         }
+        if self.view.detail && self.handle_detail_scroll(action) {
+            return;
+        }
 
         let rows = self.visible.len();
         match action {
@@ -311,8 +318,16 @@ impl App {
                 });
             }
             Action::Rerun => self.begin_run(),
-            Action::DrillIn => self.view.detail = true,
-            Action::ToggleDetail => self.view.detail = !self.view.detail,
+            Action::DrillIn => {
+                self.view.detail = true;
+                self.detail_scroll = 0;
+            }
+            Action::ToggleDetail => {
+                self.view.detail = !self.view.detail;
+                if self.view.detail {
+                    self.detail_scroll = 0;
+                }
+            }
             Action::ScrollUp => {
                 self.view.selected = self.view.selected.saturating_sub(1);
             }
@@ -341,6 +356,24 @@ impl App {
             | Action::ConfirmNo => {}
         }
         view::clamp_selection(&mut self.view, rows);
+    }
+
+    /// Scrolls the rich detail record without moving the selected result row.
+    fn handle_detail_scroll(&mut self, action: Action) -> bool {
+        match action {
+            Action::ScrollUp => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+            Action::ScrollDown => self.detail_scroll = self.detail_scroll.saturating_add(1),
+            Action::PageUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(PAGE_ROWS as u16)
+            }
+            Action::PageDown => {
+                self.detail_scroll = self.detail_scroll.saturating_add(PAGE_ROWS as u16)
+            }
+            Action::GotoTop => self.detail_scroll = 0,
+            Action::GotoBottom => self.detail_scroll = u16::MAX,
+            _ => return false,
+        }
+        true
     }
 
     /// The help panel owns the keyboard while it is open: it scrolls itself and

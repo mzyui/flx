@@ -719,6 +719,16 @@ fn render_confirm(frame: &mut Frame, confirm: &Confirm, area: Rect) {
     );
 }
 
+fn detail_line_count(lines: &[Line<'static>], width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    lines
+        .iter()
+        .map(|line| (line.width() as u16).max(1).div_ceil(width))
+        .sum()
+}
+
 fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
     let lines = detail_lines(app);
     frame.render_widget(Clear, area);
@@ -727,22 +737,34 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
         height: area.height.saturating_sub(3),
         ..area
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme::bg_overlay())
-            .wrap(Wrap { trim: true }),
-        content,
-    );
+    let total = detail_line_count(&lines, content.width);
+    let paragraph = Paragraph::new(lines)
+        .style(theme::bg_overlay())
+        .wrap(Wrap { trim: true });
+    let visible = content.height;
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = app.detail_scroll.min(max_scroll);
+    let end = scroll.saturating_add(visible).min(total);
+    frame.render_widget(paragraph.scroll((scroll, 0)), content);
+
     let title = Line::from(vec![
         Span::styled("flx", theme::title()),
         Span::styled(
-            format!(" {} results / {}", separator(), app.view.selected + 1),
+            format!(
+                " {} results / {} {} detail {}-{}/{}",
+                separator(),
+                app.view.selected + 1,
+                separator(),
+                scroll.saturating_add(1),
+                end,
+                total
+            ),
             theme::text_muted(),
         ),
     ]);
     frame.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
     let footer = Line::from(Span::styled(
-        "Esc back · e export · ? help · Ctrl+C quit",
+        "↑↓/pgup/pgdn scroll · Esc back · e export · ? help · Ctrl+C quit",
         theme::text_muted(),
     ));
     frame.render_widget(
@@ -1115,6 +1137,28 @@ mod tests {
                 style.add_modifier.contains(Modifier::BOLD)
             }),
             "the drill-down title remains visible"
+        );
+    }
+
+    #[test]
+    fn inline_detail_scroll_reaches_the_last_metadata_line_without_losing_footer() {
+        let _theme = use_theme(true, false);
+        let mut app = sample_app(1);
+        app.view.detail = true;
+        app.detail_scroll = u16::MAX;
+        let backend = draw(&app, 80, 12);
+        let frame = frame_text(&backend);
+        assert!(
+            frame.contains("samples"),
+            "the last detail field must be reachable in the inline viewport: {frame}"
+        );
+        assert!(
+            frame.contains("Esc back") && frame.contains("Ctrl+C quit"),
+            "the detail footer remains visible: {frame}"
+        );
+        assert!(
+            frame.contains("detail") && frame.contains('/'),
+            "the title reports the detail scroll range: {frame}"
         );
     }
 
