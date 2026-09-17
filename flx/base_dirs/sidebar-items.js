@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["config_dir","data_dir"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["HttpNegotiator","HttpsNegotiator","Socks4Negotiator","Socks5Negotiator"],"trait":["NegotiatorTrait"]};

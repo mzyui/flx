@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["TUI_LOG_FILE"],"fn":["initialize_file_logging","initialize_logging","load_proxy_files","screen_log_path"],"mod":["base_dirs","error","fetcher","filters","geolookup","negotiators","prelude","providers","proxy","rotator","validator"],"struct":["Flx","ProxySource","ValidationRun"]};
