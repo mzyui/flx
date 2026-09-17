@@ -18,8 +18,28 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Position;
 use ratatui::{DefaultTerminal, Terminal, TerminalOptions, Viewport};
 
-/// Fixed height keeps the live UI bounded while preserving the shell scrollback.
-pub(crate) const INLINE_HEIGHT: u16 = 12;
+/// Bounds keep the live UI useful while preserving the shell scrollback:
+/// too short hides the table, too tall pushes history off screen.
+pub(crate) const MIN_INLINE_HEIGHT: u16 = 12;
+pub(crate) const MAX_INLINE_HEIGHT: u16 = 30;
+/// Lines left outside the viewport for the prompt and scrollback margin.
+const RESERVED_ROWS: u16 = 4;
+
+/// Maps a terminal height to a viewport height, clamped to the bounds above.
+fn inline_height_for(terminal_rows: u16) -> u16 {
+    terminal_rows
+        .saturating_sub(RESERVED_ROWS)
+        .clamp(MIN_INLINE_HEIGHT, MAX_INLINE_HEIGHT)
+}
+
+/// Resolves the viewport height from the live terminal size, falling back to
+/// a mid-range default when the size is unavailable (e.g. redirected stdout
+/// in tests).
+fn resolve_inline_height() -> u16 {
+    crossterm::terminal::size()
+        .map(|(_, rows)| inline_height_for(rows))
+        .unwrap_or(20)
+}
 
 pub(crate) type Tui = DefaultTerminal;
 
@@ -108,7 +128,7 @@ impl TerminalGuard {
         let terminal = match Terminal::with_options(
             CrosstermBackend::new(io::stdout()),
             TerminalOptions {
-                viewport: Viewport::Inline(INLINE_HEIGHT),
+                viewport: Viewport::Inline(resolve_inline_height()),
             },
         ) {
             Ok(terminal) => terminal,
@@ -135,5 +155,19 @@ impl Drop for TerminalGuard {
         move_below_viewport(&mut self.terminal);
         restore_terminal_state();
         *RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_height_tracks_the_terminal_with_bounds() {
+        assert_eq!(inline_height_for(10), MIN_INLINE_HEIGHT);
+        assert_eq!(inline_height_for(12), MIN_INLINE_HEIGHT);
+        assert_eq!(inline_height_for(24), 20);
+        assert_eq!(inline_height_for(30), 26);
+        assert_eq!(inline_height_for(100), MAX_INLINE_HEIGHT);
     }
 }

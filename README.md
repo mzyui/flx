@@ -68,7 +68,7 @@ flx grab --tui -c US,DE
 The TUI uses a minimalist full-width layout: a compact header, a separated status line, a borderless results table, and a contextual footer. At 60–79 columns it hides lower-priority fields; below `60×12` it shows a terminal-size message. Detail is a rich drill-down view opened with `Enter` or `d`, showing endpoint, protocols, location, performance, and recent failure metadata; `Esc` returns without losing the selected row. `e` opens an export-format chooser before asking for the destination path. Mouse scrolling and row selection are optional keyboard-equivalent shortcuts; configuration remains controlled by the normal CLI flags and config file.
 
 > [!NOTE]
-> `--tui` needs an interactive terminal and only works with `find` and `grab`. It uses a bounded inline viewport, so the shell scrollback remains visible and the TUI does not switch to the alternate screen.
+> `--tui` needs an interactive terminal and only works with `find` and `grab`. It uses a dynamic-height inline viewport (12–30 rows based on terminal height), so the shell scrollback remains visible and the TUI does not switch to the alternate screen.
 
 ### Serve (beta)
 

@@ -83,7 +83,7 @@ async fn wait_for_termination() {
     }
 }
 
-/// Runs the bounded inline workbench until the user quits.
+/// Runs the dynamic-height inline workbench until the user quits.
 pub(crate) async fn run(ctx: TuiCtx) -> anyhow::Result<RunOutcome> {
     let TuiCtx { no_color, spec } = ctx;
     theme::configure(no_color, theme::detect_ascii());
