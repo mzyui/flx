@@ -284,8 +284,8 @@ fn run_application() -> anyhow::Result<RunOutcome> {
             "trace" => log::LevelFilter::Trace,
             _ => log::LevelFilter::Off,
         };
-        // A run that owns the screen cannot log to it: stderr would paint over
-        // the alternate screen. Nothing is written at `off`, so no file is made.
+        // A run that owns the inline viewport cannot log to it: stderr would
+        // paint over the live UI. Nothing is written at `off`, so no file is made.
         #[cfg(feature = "tui")]
         let owns_screen = cli.tui && log_level != log::LevelFilter::Off;
         #[cfg(not(feature = "tui"))]

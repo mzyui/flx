@@ -20,14 +20,14 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 const TIMEOUT: Duration = Duration::from_secs(20);
 /// How often the readers look for the text they are waiting on.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// The alternate screen's enter and leave sequences, as drawn by Crossterm.
+/// The alternate-screen sequences that inline mode must never emit.
 const ENTER_ALT_SCREEN: &str = "\u{1b}[?1049h";
 const LEAVE_ALT_SCREEN: &str = "\u{1b}[?1049l";
 
 /// A spawned TUI, killed if the test leaves it behind.
 struct Session {
     child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output: Arc<Mutex<Vec<u8>>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
 }
@@ -61,7 +61,10 @@ impl Session {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().expect("the pty is readable");
-        let writer = pair.master.take_writer().expect("the pty is writable");
+        let writer = Arc::new(Mutex::new(
+            pair.master.take_writer().expect("the pty is writable"),
+        ));
+        let response_writer = Arc::clone(&writer);
         let output = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&output);
         std::thread::spawn(move || {
@@ -73,6 +76,13 @@ impl Session {
                 sink.lock()
                     .expect("the sink is not poisoned")
                     .extend_from_slice(&buffer[..read]);
+                if buffer[..read].windows(4).any(|window| window == b"\x1b[6n") {
+                    let mut writer = response_writer.lock().expect("the writer is not poisoned");
+                    writer
+                        .write_all(b"\x1b[1;1R")
+                        .expect("the pty accepts the cursor response");
+                    writer.flush().expect("the pty flushes the cursor response");
+                }
             }
         });
 
@@ -85,8 +95,9 @@ impl Session {
     }
 
     fn send(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).expect("the pty accepts input");
-        self.writer.flush().expect("the pty flushes");
+        let mut writer = self.writer.lock().expect("the writer is not poisoned");
+        writer.write_all(bytes).expect("the pty accepts input");
+        writer.flush().expect("the pty flushes");
     }
 
     fn resize(&mut self, columns: u16, rows: u16) {
@@ -162,7 +173,7 @@ impl Drop for Session {
 }
 
 #[test]
-fn a_run_paints_immediately_survives_a_resize_and_quits_cleanly() {
+fn an_inline_run_paints_immediately_survives_a_resize_and_quits_cleanly() {
     let mut session = Session::start(80, 24);
 
     assert!(
@@ -170,13 +181,14 @@ fn a_run_paints_immediately_survives_a_resize_and_quits_cleanly() {
         "the first frame must paint without waiting for an event; tail: {:?}",
         session.tail()
     );
+    let initial = session.seen();
     assert!(
-        session.seen().contains(ENTER_ALT_SCREEN),
-        "a full-screen session takes the alternate screen"
+        !initial.contains(ENTER_ALT_SCREEN),
+        "inline mode must not enter the alternate screen"
     );
 
     // A resize must re-lay out rather than corrupt or blank the screen.
-    let before_resize = session.seen().len();
+    let before_resize = initial.len();
     session.resize(140, 30);
     assert!(
         session.wait_for_output_after(before_resize),
@@ -195,8 +207,8 @@ fn a_run_paints_immediately_survives_a_resize_and_quits_cleanly() {
     );
     let seen = session.seen();
     assert!(
-        seen.contains(LEAVE_ALT_SCREEN),
-        "the alternate screen must be given back"
+        !seen.contains(LEAVE_ALT_SCREEN),
+        "inline mode must not leave the alternate screen"
     );
     assert!(
         !seen.contains("panicked"),
@@ -206,7 +218,7 @@ fn a_run_paints_immediately_survives_a_resize_and_quits_cleanly() {
 }
 
 #[test]
-fn a_small_terminal_says_so_and_ctrl_c_still_leaves_cleanly() {
+fn a_small_inline_terminal_says_so_and_ctrl_c_still_leaves_cleanly() {
     // Below the supported 60x12 minimum.
     let mut session = Session::start(40, 10);
 
@@ -236,8 +248,12 @@ fn a_small_terminal_says_so_and_ctrl_c_still_leaves_cleanly() {
     );
     let seen = session.seen();
     assert!(
-        seen.contains(LEAVE_ALT_SCREEN),
-        "the alternate screen must be given back after an interrupt"
+        !seen.contains(ENTER_ALT_SCREEN),
+        "inline mode must not enter the alternate screen after an interrupt"
+    );
+    assert!(
+        !seen.contains(LEAVE_ALT_SCREEN),
+        "inline mode must not leave the alternate screen after an interrupt"
     );
     assert!(
         !seen.contains("panicked"),
