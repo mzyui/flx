@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU16, Ordering},
+    sync::atomic::{AtomicU16, Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -27,16 +27,28 @@ const MY_IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PUBLIC_IP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-const DNS_SERVER: Ipv4Addr = Ipv4Addr::new(208, 67, 222, 222);
+/// DNS sources for public-IP discovery: (server, domain, qtype).
+///
+/// `whoami.akamai.net` answers A with the requester's address; Google's
+/// `o-o.myaddr.l.google.com` answers TXT with it. Both are queried directly
+/// so no system resolver is involved.
+const DNS_IP_SOURCES: [(Ipv4Addr, &str, u16); 2] = [
+    (Ipv4Addr::new(8, 8, 8, 8), "whoami.akamai.net", DNS_TYPE_A),
+    (
+        Ipv4Addr::new(216, 239, 32, 10),
+        "o-o.myaddr.l.google.com",
+        DNS_TYPE_TXT,
+    ),
+];
 const DNS_PORT: u16 = 53;
-const MYIP_OPENDNS_DOMAIN: &str = "myip.opendns.com";
 const DNS_QUERY_BUFFER_LEN: usize = DNS_HEADER_LEN + DNS_MAX_NAME_LEN + DNS_QUESTION_TAIL_LEN;
 const DNS_RESPONSE_BUFFER_LEN: usize = 512;
 const DNS_HEADER_LEN: usize = 12;
 const DNS_QUESTION_TAIL_LEN: usize = 4;
 const DNS_ANSWER_FIXED_LEN: usize = 10;
-const DNS_QUERY_FLAGS: u16 = 0x8100; // QR | RD
+const DNS_QUERY_FLAGS: u16 = 0x0100; // RD (QR must be 0 in a query)
 const DNS_TYPE_A: u16 = 1;
+const DNS_TYPE_TXT: u16 = 16;
 const DNS_CLASS_IN: u16 = 1;
 const DNS_FLAG_QR: u16 = 0x8000;
 const DNS_FLAG_TC: u16 = 0x0200;
@@ -125,21 +137,23 @@ async fn fetch_ip_endpoint(
     parse_ip_body(&bytes).with_context(|| format!("invalid response from {endpoint}"))
 }
 
-static DNS_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
-
+/// Resolves the public IP via DNS, racing every [`DNS_IP_SOURCES`] entry.
+///
+/// No sticky kill-switch: a transient failure only fails this call, the next
+/// one retries all sources fresh.
 async fn my_ip_via_dns() -> anyhow::Result<String> {
-    if DNS_UNAVAILABLE.load(Ordering::Relaxed) {
-        anyhow::bail!("OpenDNS lookup previously failed; DNS discovery disabled");
-    }
-    match dns_a_lookup(DNS_SERVER, MYIP_OPENDNS_DOMAIN).await {
-        Ok(ip) => Ok(ip.to_string()),
-        Err(error) => {
-            DNS_UNAVAILABLE.store(true, Ordering::Relaxed);
-            Err(anyhow::anyhow!(
-                "failed to resolve public IP via OpenDNS (myip.opendns.com): {error}"
-            ))
+    let mut pending = DNS_IP_SOURCES
+        .into_iter()
+        .map(|(server, domain, qtype)| dns_ip_lookup(server, domain, qtype))
+        .collect::<FuturesUnordered<_>>();
+    let mut errors = Vec::new();
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(ip) => return Ok(ip),
+            Err(error) => errors.push(format!("{error:#}")),
         }
     }
+    anyhow::bail!("all DNS public-IP sources failed: {}", errors.join("; "))
 }
 
 static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(0);
@@ -152,10 +166,10 @@ fn next_dns_query_id() -> u16 {
     DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed) ^ nanos
 }
 
-async fn dns_a_lookup(server: Ipv4Addr, domain: &str) -> anyhow::Result<Ipv4Addr> {
+async fn dns_ip_lookup(server: Ipv4Addr, domain: &str, qtype: u16) -> anyhow::Result<String> {
     let query_id = next_dns_query_id();
     let mut query = [0u8; DNS_QUERY_BUFFER_LEN];
-    let query_len = build_a_query(domain, query_id, &mut query)?;
+    let query_len = build_dns_query(domain, qtype, query_id, &mut query)?;
 
     let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .await
@@ -170,11 +184,18 @@ async fn dns_a_lookup(server: Ipv4Addr, domain: &str) -> anyhow::Result<Ipv4Addr
         .await
         .context("DNS lookup timed out")?
         .context("DNS recv failed")?;
-    parse_dns_a_response(&response[..response_len], query_id)
+    let message = &response[..response_len];
+    match qtype {
+        DNS_TYPE_A => parse_dns_a_response(message, query_id).map(|ip| ip.to_string()),
+        DNS_TYPE_TXT => parse_dns_txt_response(message, query_id),
+        other => anyhow::bail!("unsupported DNS query type {other} for `{domain}`"),
+    }
+    .with_context(|| format!("invalid DNS response for `{domain}`"))
 }
 
-fn build_a_query(
+fn build_dns_query(
     domain: &str,
+    qtype: u16,
     query_id: u16,
     out: &mut [u8; DNS_QUERY_BUFFER_LEN],
 ) -> anyhow::Result<usize> {
@@ -207,7 +228,7 @@ fn build_a_query(
     }
     out[len] = 0;
     len += 1;
-    out[len..len + 2].copy_from_slice(&DNS_TYPE_A.to_be_bytes());
+    out[len..len + 2].copy_from_slice(&qtype.to_be_bytes());
     out[len + 2..len + 4].copy_from_slice(&DNS_CLASS_IN.to_be_bytes());
     Ok(len + DNS_QUESTION_TAIL_LEN)
 }
@@ -279,6 +300,73 @@ fn skip_dns_name(message: &[u8], mut offset: usize) -> Option<usize> {
         }
         offset += 1 + length;
     }
+}
+
+/// Validates the header and returns the answer section offset plus count.
+fn answers_offset(message: &[u8], query_id: u16) -> anyhow::Result<(usize, u16)> {
+    if message.len() < DNS_HEADER_LEN {
+        anyhow::bail!("DNS response is shorter than its header");
+    }
+    let id = u16::from_be_bytes([message[0], message[1]]);
+    if id != query_id {
+        anyhow::bail!("DNS response id {id} does not match query id {query_id}");
+    }
+    let flags = u16::from_be_bytes([message[2], message[3]]);
+    if flags & DNS_FLAG_QR == 0 {
+        anyhow::bail!("DNS reply is not a response");
+    }
+    if flags & DNS_FLAG_TC != 0 {
+        anyhow::bail!("DNS response was truncated");
+    }
+    let rcode = flags & DNS_RCODE_MASK;
+    if rcode != 0 {
+        anyhow::bail!("DNS server returned rcode {rcode}");
+    }
+    let question_count = u16::from_be_bytes([message[4], message[5]]);
+    let answer_count = u16::from_be_bytes([message[6], message[7]]);
+
+    let mut offset = DNS_HEADER_LEN;
+    for _ in 0..question_count {
+        offset = skip_dns_name(message, offset).context("malformed name in question")?;
+        offset += DNS_QUESTION_TAIL_LEN;
+        if offset > message.len() {
+            anyhow::bail!("question section overruns the response");
+        }
+    }
+    Ok((offset, answer_count))
+}
+
+/// Reads the first TXT record as the public IP (Google's `o-o.myaddr.l.google.com`).
+fn parse_dns_txt_response(message: &[u8], query_id: u16) -> anyhow::Result<String> {
+    let (mut offset, answer_count) = answers_offset(message, query_id)?;
+    for _ in 0..answer_count {
+        offset = skip_dns_name(message, offset).context("malformed name in answer")?;
+        let Some(record) = message.get(offset..offset + DNS_ANSWER_FIXED_LEN) else {
+            anyhow::bail!("answer header overruns the response");
+        };
+        let record_type = u16::from_be_bytes([record[0], record[1]]);
+        let rdlength = u16::from_be_bytes([record[8], record[9]]) as usize;
+        let rdata = offset + DNS_ANSWER_FIXED_LEN;
+        let rdata_end = rdata + rdlength;
+        if rdata_end > message.len() {
+            anyhow::bail!("answer record overruns the response");
+        }
+        if record_type == DNS_TYPE_TXT && rdlength >= 1 {
+            let text_len = message[rdata] as usize;
+            let text_end = rdata + 1 + text_len;
+            if text_end <= rdata_end {
+                let text = std::str::from_utf8(&message[rdata + 1..text_end])
+                    .context("TXT record is not valid UTF-8")?;
+                let ip: std::net::IpAddr = text
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("TXT record is not a valid IP: {text:?}"))?;
+                return Ok(ip.to_string());
+            }
+        }
+        offset = rdata_end;
+    }
+    anyhow::bail!("DNS response carried no TXT record")
 }
 
 async fn my_ip_via_https() -> anyhow::Result<String> {
@@ -381,9 +469,10 @@ async fn race_live_ip_sources() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_a_query, load_cached_public_ip, parse_dns_a_response, parse_ip_body, skip_dns_name,
-        store_public_ip, Ipv4Addr, DNS_CLASS_IN, DNS_HEADER_LEN, DNS_QUERY_BUFFER_LEN,
-        DNS_QUERY_FLAGS, DNS_QUESTION_TAIL_LEN, DNS_TYPE_A, MAX_IP_BODY_BYTES, MYIP_OPENDNS_DOMAIN,
+        build_dns_query, load_cached_public_ip, parse_dns_a_response, parse_dns_txt_response,
+        parse_ip_body, skip_dns_name, store_public_ip, Ipv4Addr, DNS_CLASS_IN, DNS_FLAG_QR,
+        DNS_HEADER_LEN, DNS_QUERY_BUFFER_LEN, DNS_QUERY_FLAGS, DNS_QUESTION_TAIL_LEN, DNS_TYPE_A,
+        DNS_TYPE_TXT, MAX_IP_BODY_BYTES,
     };
     use std::{
         fs::File,
@@ -449,7 +538,13 @@ mod tests {
 
     fn sample_question_name() -> Vec<u8> {
         let mut query = [0u8; DNS_QUERY_BUFFER_LEN];
-        let len = build_a_query(MYIP_OPENDNS_DOMAIN, sample_query_id(), &mut query).unwrap();
+        let len = build_dns_query(
+            "whoami.akamai.net",
+            DNS_TYPE_A,
+            sample_query_id(),
+            &mut query,
+        )
+        .unwrap();
         query[DNS_HEADER_LEN..len - DNS_QUESTION_TAIL_LEN].to_vec()
     }
 
@@ -475,14 +570,17 @@ mod tests {
 
     #[test]
     fn a_query_encodes_name_and_question() {
+        // Regression: QR must be 0 in a query; only RD is set.
+        assert_eq!(DNS_QUERY_FLAGS, 0x0100);
+        assert_eq!(DNS_QUERY_FLAGS & DNS_FLAG_QR, 0);
         let mut buffer = [0u8; DNS_QUERY_BUFFER_LEN];
-        let len = build_a_query(MYIP_OPENDNS_DOMAIN, 0x1234, &mut buffer).unwrap();
+        let len = build_dns_query("whoami.akamai.net", DNS_TYPE_A, 0x1234, &mut buffer).unwrap();
         assert_eq!(&buffer[0..2], &0x1234u16.to_be_bytes());
         assert_eq!(&buffer[2..4], &DNS_QUERY_FLAGS.to_be_bytes());
         assert_eq!(&buffer[4..6], &1u16.to_be_bytes());
         let expected_name = [
-            4, b'm', b'y', b'i', b'p', 7, b'o', b'p', b'e', b'n', b'd', b'n', b's', 3, b'c', b'o',
-            b'm', 0,
+            6, b'w', b'h', b'o', b'a', b'm', b'i', 6, b'a', b'k', b'a', b'm', b'a', b'i', 3, b'n',
+            b'e', b't', 0,
         ];
         assert_eq!(
             &buffer[DNS_HEADER_LEN..len - DNS_QUESTION_TAIL_LEN],
@@ -494,12 +592,22 @@ mod tests {
     }
 
     #[test]
+    fn txt_query_encodes_txt_type() {
+        let mut buffer = [0u8; DNS_QUERY_BUFFER_LEN];
+        let len =
+            build_dns_query("o-o.myaddr.l.google.com", DNS_TYPE_TXT, 0x1234, &mut buffer).unwrap();
+        let tail = &buffer[len - DNS_QUESTION_TAIL_LEN..len];
+        assert_eq!(&tail[..2], &DNS_TYPE_TXT.to_be_bytes());
+        assert_eq!(&tail[2..], &DNS_CLASS_IN.to_be_bytes());
+    }
+
+    #[test]
     fn a_query_rejects_bad_names() {
         let mut buffer = [0u8; DNS_QUERY_BUFFER_LEN];
-        assert!(build_a_query("", 1, &mut buffer).is_err());
-        assert!(build_a_query("a..b", 1, &mut buffer).is_err());
+        assert!(build_dns_query("", DNS_TYPE_A, 1, &mut buffer).is_err());
+        assert!(build_dns_query("a..b", DNS_TYPE_A, 1, &mut buffer).is_err());
         let long_label = "a".repeat(64);
-        assert!(build_a_query(&long_label, 1, &mut buffer).is_err());
+        assert!(build_dns_query(&long_label, DNS_TYPE_A, 1, &mut buffer).is_err());
         let long_name = format!(
             "{}.{}.{}.{}",
             "a".repeat(63),
@@ -507,7 +615,7 @@ mod tests {
             "c".repeat(63),
             "d".repeat(63)
         );
-        assert!(build_a_query(&long_name, 1, &mut buffer).is_err());
+        assert!(build_dns_query(&long_name, DNS_TYPE_A, 1, &mut buffer).is_err());
     }
 
     #[test]
@@ -522,7 +630,7 @@ mod tests {
             "c".repeat(63),
             "d".repeat(62)
         );
-        assert!(build_a_query(&name, 1, &mut buffer).is_err());
+        assert!(build_dns_query(&name, DNS_TYPE_A, 1, &mut buffer).is_err());
     }
 
     #[test]
@@ -578,6 +686,45 @@ mod tests {
         let answer_type = DNS_HEADER_LEN + name_len + DNS_QUESTION_TAIL_LEN + 2;
         non_a_record[answer_type + 1] = 16;
         assert!(parse_dns_a_response(&non_a_record, sample_query_id()).is_err());
+    }
+
+    #[test]
+    fn txt_response_yields_the_first_txt_ip() {
+        let response = sample_txt_response(b"203.0.113.7");
+        assert_eq!(
+            parse_dns_txt_response(&response, sample_query_id()).unwrap(),
+            "203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn txt_response_rejects_garbage() {
+        assert!(
+            parse_dns_txt_response(&sample_txt_response(b"not-an-ip"), sample_query_id()).is_err()
+        );
+        assert!(parse_dns_txt_response(&sample_a_response(), sample_query_id()).is_err());
+        assert!(parse_dns_txt_response(&[], 1).is_err());
+    }
+
+    fn sample_txt_response(text: &[u8]) -> Vec<u8> {
+        let name = sample_question_name();
+        let mut message = Vec::new();
+        message.extend_from_slice(&sample_query_id().to_be_bytes());
+        message.extend_from_slice(&0x8180u16.to_be_bytes());
+        message.extend_from_slice(&1u16.to_be_bytes());
+        message.extend_from_slice(&1u16.to_be_bytes());
+        message.extend_from_slice(&[0, 0, 0, 0]);
+        message.extend_from_slice(&name);
+        message.extend_from_slice(&DNS_TYPE_TXT.to_be_bytes());
+        message.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        message.extend_from_slice(&[0xC0, 0x0C]);
+        message.extend_from_slice(&DNS_TYPE_TXT.to_be_bytes());
+        message.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        message.extend_from_slice(&[0, 0, 0, 42]);
+        message.extend_from_slice(&(1 + text.len() as u16).to_be_bytes());
+        message.push(text.len() as u8);
+        message.extend_from_slice(text);
+        message
     }
 
     #[test]
