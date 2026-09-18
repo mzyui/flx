@@ -299,12 +299,18 @@ pub fn visit_geonode(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) -> 
 
 #[derive(Deserialize)]
 struct ProxyNovaRow<'a> {
+    // Defaults keep one malformed row from failing the whole body:
+    // missing/empty values fall through to the per-row skip below.
+    #[serde(default)]
     ip: Cow<'a, str>,
-    #[serde(deserialize_with = "deserialize_port")]
+    #[serde(default, deserialize_with = "deserialize_port")]
     port: Option<u16>,
 }
 
 /// Accept string or numeric ProxyNova ports without buffering JSON values.
+///
+/// Anything unparseable (`null`, missing, float, garbage) becomes `None` so
+/// the caller skips the row instead of aborting the whole response.
 fn deserialize_port<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
 where
     D: Deserializer<'de>,
@@ -315,7 +321,28 @@ where
         type Value = Option<u16>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a string or numeric port")
+            formatter.write_str("a string, numeric, or null port")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
         }
 
         fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
@@ -326,6 +353,13 @@ where
         }
 
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.trim().parse::<u16>().ok())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
@@ -896,6 +930,33 @@ mod tests {
         let parsed = parse_proxynova(body).unwrap();
         assert_eq!(parsed[0].0.to_string(), "1.2.3.4");
         assert_eq!(parsed[0].1, 3128);
+    }
+
+    #[test]
+    fn proxynova_skips_rows_with_null_or_missing_ports() {
+        // Regression: one malformed row must not fail the whole body.
+        let body = r#"{"data":[
+            {"ip":"1.2.3.4","port":null},
+            {"ip":"5.6.7.8"},
+            {"ip":"9.10.11.12","port":true},
+            {"ip":"13.14.15.16","port":8080}
+        ]}"#;
+        let parsed = parse_proxynova(body).unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|(ip, port, _)| (ip.to_string(), *port))
+                .collect::<Vec<_>>(),
+            vec![("13.14.15.16".to_string(), 8080)]
+        );
+    }
+
+    #[test]
+    fn proxynova_skips_rows_with_missing_ip() {
+        let body = r#"{"data":[{"port":8080},{"ip":"1.2.3.4","port":3128}]}"#;
+        let parsed = parse_proxynova(body).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0.to_string(), "1.2.3.4");
     }
 
     #[test]
