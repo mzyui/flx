@@ -31,7 +31,6 @@ pub fn data_dir() -> Option<PathBuf> {
     {
         #[cfg(windows)]
         {
-            // Reads RoamingAppData without extra dependencies.
             std::env::var_os("APPDATA")
                 .map(PathBuf::from)
                 .filter(|base| base.is_absolute())

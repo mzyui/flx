@@ -53,7 +53,6 @@ fn cursor_escape(prev: usize, next: usize) -> Option<&'static str> {
 fn apply_cursor_escape(escape: Option<&'static str>) {
     use std::io::{IsTerminal as _, Write as _};
     if let Some(escape) = escape {
-        // Emit escapes only on TTY stderr.
         if std::io::stderr().is_terminal() {
             let _ = std::io::stderr().lock().write_all(escape.as_bytes());
         }
@@ -89,7 +88,6 @@ impl Drop for CursorHider {
 fn terminal_width() -> Option<usize> {
     #[cfg(unix)]
     {
-        // SAFETY: TIOCGWINSZ only writes the window size into ws.
         let ws_col = unsafe {
             let mut ws: libc::winsize = std::mem::zeroed();
             if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
@@ -296,7 +294,6 @@ fn show_progress(quiet: bool, stderr_is_terminal: bool, stdout_is_pipe: bool) ->
     !quiet && stderr_is_terminal && !stdout_is_pipe
 }
 
-// Hide warmup bars on TTY stdout to avoid clashing with payloads.
 fn show_warmup(
     quiet: bool,
     stderr_is_terminal: bool,
@@ -366,7 +363,6 @@ impl ValidationBar {
 
 impl OutputGuard for ValidationBar {
     fn before_write(&self) {
-        // Hide the bar while stdout writes to the same terminal.
         self.hide();
     }
 
@@ -573,7 +569,6 @@ impl Display for ServeFrame {
                 }
             }
         };
-        // Shrink the middle (endpoint, then phase) so the trailing rate survives.
         let mut endpoint = self.endpoint.clone();
         let mut phase_string = (*phase_guard).to_owned();
         let width = terminal_width();
@@ -623,7 +618,6 @@ impl ServeBar {
     ) -> Option<Self> {
         use std::io::IsTerminal as _;
 
-        // Serve writes no stdout payload, so only stderr TTY and quiet matter.
         if quiet || !std::io::stderr().is_terminal() {
             return None;
         }

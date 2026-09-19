@@ -71,14 +71,11 @@ async fn wait_for_termination() {
             (None, Some(mut interrupt)) => {
                 interrupt.recv().await;
             }
-            // No handler could be installed; never resolve rather than lie.
             (None, None) => std::future::pending::<()>().await,
         }
     }
     #[cfg(not(unix))]
     {
-        // Windows has no SIGTERM, and a raw-mode process never sees Ctrl+C as
-        // a signal, so there is nothing to watch here.
         std::future::pending::<()>().await;
     }
 }
@@ -96,7 +93,6 @@ pub(crate) async fn run(ctx: TuiCtx) -> anyhow::Result<RunOutcome> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     while !app.should_quit {
-        // The frame's area is what maps a click back to a row.
         let area = guard
             .terminal_mut()
             .draw(|frame| ui::render(frame, &app))?

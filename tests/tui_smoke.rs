@@ -46,10 +46,7 @@ impl Session {
 
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_flx"));
         command.args(["grab", "--tui", "--offline", "--no-config"]);
-        // Crossterm needs a terminfo entry to emit the right sequences.
         command.env("TERM", "xterm-256color");
-        // Pin the locale so the glyph set is deterministic, and keep the run
-        // away from any version check or user cache.
         command.env("LANG", "en_US.UTF-8");
         command.env("LC_ALL", "en_US.UTF-8");
         command.env("NO_COLOR", "1");
@@ -166,7 +163,6 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Never leave a killed-but-unreaped TUI behind on a failed assertion.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -187,7 +183,6 @@ fn an_inline_run_paints_immediately_survives_a_resize_and_quits_cleanly() {
         "inline mode must not enter the alternate screen"
     );
 
-    // A resize must re-lay out rather than corrupt or blank the screen.
     let before_resize = initial.len();
     session.resize(140, 30);
     assert!(
@@ -219,11 +214,8 @@ fn an_inline_run_paints_immediately_survives_a_resize_and_quits_cleanly() {
 
 #[test]
 fn a_small_inline_terminal_says_so_and_ctrl_c_still_leaves_cleanly() {
-    // Below the supported 60x12 minimum.
     let mut session = Session::start(40, 10);
 
-    // The message is "terminal too small — need 60×12"; the spaces between the
-    // words never reach the stream, so the tokens are checked on their own.
     assert!(
         session.wait_for("terminal"),
         "the minimum is enforced with a message; tail: {:?}",
@@ -235,7 +227,6 @@ fn a_small_inline_terminal_says_so_and_ctrl_c_still_leaves_cleanly() {
         session.tail()
     );
 
-    // Ctrl+C stops the run; a second press leaves.
     session.send(b"\x03");
     std::thread::sleep(Duration::from_millis(200));
     session.send(b"\x03");

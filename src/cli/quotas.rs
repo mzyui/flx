@@ -248,7 +248,6 @@ impl QuotaEnforcer {
         if !shares_family {
             return true;
         }
-        // Exact matches with room (uncapped always has room).
         let mut consume: Vec<usize> = Vec::new();
         for (i, quota) in self.quotas.iter().enumerate() {
             if carried
@@ -262,7 +261,6 @@ impl QuotaEnforcer {
                 }
             }
         }
-        // Count every capped match; same-family mismatches stay rejected.
         for i in &consume {
             if self.quotas[*i].quota.is_some() {
                 self.hits[*i] += 1;

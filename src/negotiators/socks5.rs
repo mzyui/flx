@@ -19,17 +19,17 @@ impl Socks5Negotiator {
         port: u16,
     ) -> anyhow::Result<Cow<'a, [u8]>> {
         let mut len = 0usize;
-        buf[len..len + 3].copy_from_slice(&[5u8, 1u8, 0u8]); // VER, CMD, RSV
+        buf[len..len + 3].copy_from_slice(&[5u8, 1u8, 0u8]);
         len += 3;
         match host.parse::<IpAddr>() {
             Ok(IpAddr::V4(ip)) => {
-                buf[len] = 1; // ATYP IPv4
+                buf[len] = 1;
                 len += 1;
                 buf[len..len + 4].copy_from_slice(&ip.octets());
                 len += 4;
             }
             Ok(IpAddr::V6(ip)) => {
-                buf[len] = 4; // ATYP IPv6
+                buf[len] = 4;
                 len += 1;
                 buf[len..len + 16].copy_from_slice(&ip.octets());
                 len += 16;
@@ -37,7 +37,7 @@ impl Socks5Negotiator {
             Err(_) => {
                 let length =
                     u8::try_from(host.len()).context("SOCKS5 target hostname exceeds 255 bytes")?;
-                buf[len] = 3; // ATYP domain
+                buf[len] = 3;
                 len += 1;
                 buf[len] = length;
                 len += 1;
@@ -59,12 +59,10 @@ impl NegotiatorTrait for Socks5Negotiator {
         _proxy_host: &str,
         uri: &hyper::Uri,
     ) -> anyhow::Result<()> {
-        // Method selection: VER=5, NMETHODS=1, METHOD=0 (no authentication).
         let handshake_packet = [5, 1, 0];
 
         stream.write_all(&handshake_packet).await?;
 
-        // Reply is a two-byte [VER, METHOD] selection.
         let mut response_buf = [0; 2];
         stream.read_exact(&mut response_buf).await?;
 
@@ -87,13 +85,11 @@ impl NegotiatorTrait for Socks5Negotiator {
             })
             .context("SOCKS5 target URI has no port")?;
 
-        // Build SOCKS5 CONNECT request; domain names stay within 255 bytes.
         let mut packet_buf = [0u8; 512];
         let connection_packet = Self::build_connect_request(&mut packet_buf, host, port)?;
 
         stream.write_all(&connection_packet).await?;
 
-        // Parse reply header, then discard bound address and port.
         let mut response_buf = [0; 4];
         stream.read_exact(&mut response_buf).await?;
 
@@ -113,7 +109,6 @@ impl NegotiatorTrait for Socks5Negotiator {
             }
             address_type => anyhow::bail!("InvalidData: invalid response ATYP: {address_type}"),
         };
-        // Discard bound address tail and trailing port.
         let mut tail_buf = [0u8; 258];
         let tail_len = address_length + 2;
         stream.read_exact(&mut tail_buf[..tail_len]).await?;

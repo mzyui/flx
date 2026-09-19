@@ -26,7 +26,6 @@ pub enum IpType {
     Unknown,
 }
 
-// Curated hosting ASNs; refresh when assignments shift.
 const HOSTING_ASNS: &[u32] = &[
     174, 2906, 8075, 8560, 12222, 12876, 13335, 13415, 14061, 14618, 15169, 16265, 16276, 16509,
     16625, 19318, 19551, 20454, 20473, 20940, 21859, 24940, 26496, 29802, 31898, 33070, 35540,
@@ -114,7 +113,6 @@ fn has_keyword(name: &str, keywords: &[&str]) -> bool {
     let name_bytes = name.as_bytes();
     keywords.iter().any(|keyword| {
         let keyword_bytes = keyword.as_bytes();
-        // Scan case-insensitively without allocating a lowercase copy.
         keyword_bytes.is_empty()
             || name_bytes
                 .windows(keyword_bytes.len())

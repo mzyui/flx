@@ -132,7 +132,6 @@ impl RotatorPool {
 }
 
 fn random_below(total: usize) -> usize {
-    // Sample RandomState without a rand dependency.
     let hash = RandomState::new().hash_one(total);
     (hash % total as u64) as usize
 }

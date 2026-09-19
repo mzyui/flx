@@ -22,7 +22,6 @@ fn should_colorize() -> bool {
         OVERRIDE_ON => true,
         OVERRIDE_OFF => false,
         _ => {
-            // Prefer TTY stdout unless NO_COLOR or CLICOLOR=0 disables it.
             std::env::var_os("NO_COLOR").is_none()
                 && std::env::var("CLICOLOR").is_ok_and(|value| value != "0")
                 && std::io::stdout().is_terminal()

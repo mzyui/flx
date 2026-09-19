@@ -70,7 +70,6 @@ fn report_download(event: Option<DownloadProgress>) {
     }
 }
 
-// Clear the download event on every install exit path.
 struct DownloadNotifier;
 
 impl Drop for DownloadNotifier {
@@ -79,7 +78,6 @@ impl Drop for DownloadNotifier {
     }
 }
 
-// Announce downloads early so observers see connect-phase progress.
 fn begin_download(name: &'static str) -> DownloadNotifier {
     report_download(Some(DownloadProgress {
         name,
@@ -114,7 +112,6 @@ fn lock_path(path: &Path) -> PathBuf {
 fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
-    // Rely on flock releasing when the descriptor closes.
     loop {
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc == 0 {
@@ -129,13 +126,11 @@ fn lock_file(file: &std::fs::File) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn lock_file(_file: &std::fs::File) -> std::io::Result<()> {
-    // Serialize non-unix runs via the in-process tokio mutex.
     Ok(())
 }
 
 async fn acquire_download_lock(path: &Path) -> anyhow::Result<std::fs::File> {
     let lock = lock_path(path);
-    // Bound lock waits so a wedged holder cannot block forever.
     let acquire = tokio::task::spawn_blocking({
         let lock = lock.clone();
         move || {
@@ -312,7 +307,6 @@ fn migrate_legacy_database(new_path: &Path) {
         let _ = error;
         return;
     }
-    // Move the ETag sidecar so the copy stays verifiable.
     let marker = sync_marker_path(new_path);
     if let Some(legacy_marker) = marker
         .parent()
@@ -377,7 +371,6 @@ async fn fetch_database(
         .body(Empty::<Bytes>::new())
         .context("failed to build GeoLite2 download request")?;
 
-    // Bound connects separately so unreachable mirrors fail fast.
     let request_deadline = deadline.min(tokio::time::Instant::now() + GEOLITE_CONNECT_TIMEOUT);
     let response = tokio::time::timeout_at(request_deadline, client.request(req))
         .await
@@ -489,7 +482,6 @@ async fn sync_one(url: &str, mmdb_path: &Path) -> anyhow::Result<SyncOutcome> {
     let stored_etag = read_synced_etag(mmdb_path);
     let deadline = tokio::time::Instant::now() + DATABASE_DOWNLOAD_TIMEOUT;
 
-    // Skip conditional requests without a valid copy and ETag.
     let conditional = db_valid && stored_etag.is_some();
     let (response, remote_etag) = if conditional {
         fetch_database(url, stored_etag.as_deref(), deadline).await?
@@ -533,7 +525,6 @@ async fn ensure_database(
     match Reader::open_readfile(mmdb_path) {
         Ok(reader) => Ok(reader),
         Err(e) => {
-            // Drop corrupt files so the next run re-downloads.
             if let Err(_remove_err) = remove_file(mmdb_path) {
                 #[cfg(feature = "log")]
                 log::warn!(

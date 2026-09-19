@@ -1,7 +1,7 @@
 //! Rendering for every TUI surface.
 //!
-//! The only panel with a border is the primary table; the side detail, header,
-//! and footer are plain text, and overlays hole-punch the frame with `Clear`.
+//! The results table is borderless; only overlays (help, prompts, confirms)
+//! carry a single rounded border, and they hole-punch the frame with `Clear`.
 //! Nothing here measures a row per frame: the table reads prebuilt
 //! [`RowModel`]s out of `App`.
 
@@ -52,7 +52,6 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
     render_table(frame, app, layout.table);
     render_footer(frame, app, layout.footer);
 
-    // Overlays, topmost surface last.
     if app.help {
         render_help(frame, app, area);
     } else if let Some(confirm) = &app.confirm {
@@ -70,7 +69,6 @@ pub(crate) fn render(frame: &mut Frame, app: &App) {
 /// already reachable with the movement keys.
 pub(crate) fn row_at(app: &App, area: Rect, row: u16) -> Option<usize> {
     let layout = view::compute_layout(area)?;
-    // The first table row is the column header; data starts immediately after it.
     let first_data_row = layout.table.y.checked_add(1)?;
     if row < first_data_row || row >= layout.table.bottom() {
         return None;
@@ -94,7 +92,6 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
         theme::glyph(theme::TIMES),
         view::MIN_HEIGHT
     );
-    // One line, a third of the way down: enough to read, no chrome to mislead.
     let [_, line, _] = Layout::vertical([
         Constraint::Percentage(40),
         Constraint::Length(1),
@@ -174,7 +171,6 @@ fn running_summary(app: &App, width: u16) -> Line<'static> {
                 None => {
                     let elapsed = live.phase_elapsed();
                     spans.push(Span::styled(" ", theme::text_muted()));
-                    // Stay quiet until the phase has visibly not finished.
                     if elapsed >= view::SPINNER_DELAY {
                         spans.push(Span::styled(
                             view::spinner_frame(elapsed),
@@ -204,7 +200,6 @@ fn running_summary(app: &App, width: u16) -> Line<'static> {
             ));
         }
     }
-    // Judge health is only news when it is bad; all-healthy is the norm.
     if let Some(health) = unhealthy_judges(app) {
         spans.push(Span::styled(
             format!("  {} {health}", theme::glyph(theme::WARNING)),
@@ -276,20 +271,14 @@ fn progress_spans(
         theme::glyph(theme::CHECK),
         theme::glyph(theme::CROSS)
     );
-    // Below the supported minimum a row cannot hold the whole strip; the bar and
-    // the counts win, because they are what the user is reading.
     if width < view::MIN_WIDTH {
         split.clear();
     }
     let split_cells = split.width() as u16;
 
-    // A fixed share keeps the numbers beside the bar in the same place from
-    // frame to frame instead of sliding around as they change width.
     let share = (width / BAR_SHARE).clamp(MIN_BAR_CELLS, MAX_BAR_CELLS);
     let budget = width.saturating_sub(share + BAR_GUTTER_CELLS + split_cells);
     let label = progress_label(done, total, fraction, rate, budget);
-    // The bar holds its floor while the row can afford it, and yields rather
-    // than pushing the numbers off the edge.
     let numbers = label.width() as u16 + split_cells + BAR_GUTTER_CELLS;
     let bar_cells = share.min(width.saturating_sub(numbers));
 
@@ -403,7 +392,6 @@ fn header_text(index: usize, width: u16, app: &App) -> String {
         ""
     };
     let arrow_cells = arrow.width() as u16;
-    // The indicator outranks the label: shorten the label rather than drop it.
     if arrow_cells > 0 && arrow_cells < width {
         format!(
             "{} {arrow}",
@@ -426,8 +414,6 @@ fn body_cell(
 ) -> Cell<'static> {
     let column = &view::COLUMNS[index];
     let cell = match column.source {
-        // Numbers are the jump addresses, so they read as metadata and never
-        // compete with the data beside them.
         view::Source::Ordinal => {
             let number = ordinal.to_string();
             let text = view::clamp_cells(&number, width).into_owned();
@@ -440,8 +426,6 @@ fn body_cell(
     };
     let text = view::clamp_cells(&row.cells[cell], width);
     let line = match hit {
-        // The match can sit past the truncation point; then there is nothing on
-        // screen to highlight.
         Some(hit) if hit.column == cell && hit.range.1 <= text.len() => {
             let (begin, end) = hit.range;
             Line::from(vec![
@@ -576,8 +560,6 @@ fn field(name: &'static str, value: String) -> Line<'static> {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::styled(" ", theme::text_muted())];
-    // A half-typed row number replaces the hints: while the user is mid-count,
-    // what completes it is the only thing worth saying.
     if let Some((count, label)) = event::count_hint(app.key_context()) {
         spans.push(Span::styled(count, theme::accent_primary()));
         spans.push(Span::styled(format!(" {label}"), theme::text_muted()));
@@ -597,7 +579,10 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// The single border an overlay gets: accent, with the ASCII set when needed.
+/// The single border an overlay gets: M3 dialog, rounded and accented.
+///
+/// One rounded border only (nesting depth 1); the main list stays borderless.
+/// ASCII fallback degrades `╭╮╰╯` to `+`.
 fn overlay_block(title: impl Into<String>) -> Block<'static> {
     Block::bordered()
         .border_set(theme::border_set())
@@ -648,7 +633,7 @@ fn render_input(frame: &mut Frame, input: &InputBox, area: Rect) {
             theme::text_emphasis(),
         )))
         .block(overlay_block(title))
-        .style(theme::bg_overlay()),
+        .style(theme::surface_container()),
         target,
     );
     let caret = target.x + 2 + input.buffer.width() as u16;
@@ -686,7 +671,7 @@ fn render_export_formats(frame: &mut Frame, input: &InputBox, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(overlay_block(" export "))
-            .style(theme::bg_overlay()),
+            .style(theme::surface_container()),
         target,
     );
 }
@@ -713,7 +698,7 @@ fn render_confirm(frame: &mut Frame, confirm: &Confirm, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(overlay_block(" confirm "))
-            .style(theme::bg_overlay())
+            .style(theme::surface_container())
             .wrap(Wrap { trim: true }),
         target,
     );
@@ -739,7 +724,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
     };
     let total = detail_line_count(&lines, content.width);
     let paragraph = Paragraph::new(lines)
-        .style(theme::bg_overlay())
+        .style(theme::surface_container())
         .wrap(Wrap { trim: true });
     let visible = content.height;
     let max_scroll = total.saturating_sub(visible);
@@ -776,7 +761,7 @@ fn render_detail(frame: &mut Frame, app: &App, area: Rect) {
         },
     );
     frame.render_widget(
-        Paragraph::new("─".repeat(area.width as usize)).style(theme::text_muted()),
+        Paragraph::new("─".repeat(area.width as usize)).style(theme::outline()),
         Rect {
             y: area.y + 1,
             height: 1,
@@ -795,9 +780,6 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         .map(|line| line.width() as u16)
         .max()
         .unwrap_or(0);
-    // Size to the content, so a row is never cut mid-word; take the whole screen
-    // when the body needs it, rather than leaving strips of the app peeking out
-    // from behind a modal that is nearly full anyway.
     let needed_height = (rows + OVERLAY_CHROME_ROWS).min(area.height);
     let target = if needed_height == area.height {
         area
@@ -811,7 +793,6 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let visible = target.height.saturating_sub(OVERLAY_CHROME_ROWS);
     let scroll = app.help_scroll.min(rows.saturating_sub(visible));
     let title = if scroll == 0 && rows <= visible {
-        // Nothing is hidden, so there is no position worth reporting.
         " help ".to_owned()
     } else {
         format!(
@@ -821,16 +802,15 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         )
     };
 
-    let block = overlay_block(title).style(theme::bg_overlay());
+    let block = overlay_block(title).style(theme::surface_container());
     let inner = block.inner(target);
     frame.render_widget(Clear, target);
     frame.render_widget(
         Paragraph::new(body)
-            .style(theme::bg_overlay())
+            .style(theme::surface_container())
             .scroll((scroll, 0)),
         inner,
     );
-    // The border is drawn last so that it frames the content.
     frame.render_widget(block, target);
 }
 
@@ -840,7 +820,6 @@ fn help_body() -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (title, scope) in event::HELP_GROUPS {
         if !lines.is_empty() {
-            // Whitespace separates sections; a rule would just add chrome.
             lines.push(Line::default());
         }
         lines.push(Line::from(Span::styled(
@@ -1294,8 +1273,6 @@ mod tests {
         let mut app = sample_app(3);
         app.help = true;
 
-        // The panel opens at the top, so the first group is on screen and the
-        // notes at the end are not.
         let backend = draw(&app, 80, 24);
         let top = normalized(&frame_text(&backend));
         assert!(top.contains("help"), "the panel is titled");
@@ -1312,7 +1289,6 @@ mod tests {
             "the way out is in the footer: {top:?}"
         );
 
-        // `G` jumps to the end of the body, and the title reports where it is.
         app.handle_action(Action::GotoBottom);
         let backend = draw(&app, 80, 24);
         let end = frame_text(&backend);
@@ -1326,7 +1302,6 @@ mod tests {
             end.lines().find(|line| line.contains("help"))
         );
 
-        // Any unbound key leaves, from wherever the panel is scrolled.
         app.handle_action(Action::ScrollUp);
         assert!(app.help, "scrolling does not close the panel");
         app.handle_action(Action::GotoTop);
@@ -1335,12 +1310,9 @@ mod tests {
 
     #[test]
     fn a_short_help_body_leaves_no_position_in_the_title() {
-        // The title only reports a window when there is something to scroll to.
         let _theme = use_theme(true, false);
         let mut app = sample_app(3);
         app.help = true;
-        // 80x24 shows fewer rows than the body, so the position shows; a taller
-        // terminal shows all of it and the title goes back to just "help".
         let backend = draw(&app, 100, 60);
         let frame = frame_text(&backend);
         assert!(
@@ -1355,8 +1327,6 @@ mod tests {
         let _theme = use_theme(true, false);
         let mut app = sample_app(20);
 
-        // A half-typed number replaces the hints: the footer is where the user
-        // already looks, and the count is the only thing left to decide.
         app.handle_action(Action::Count(1));
         app.handle_action(Action::Count(2));
         let backend = draw(&app, 80, 24);
@@ -1367,7 +1337,6 @@ mod tests {
             "got {hints:?}"
         );
 
-        // Once the jump lands, the ordinary hints come back.
         app.handle_action(Action::GotoCount);
         assert_eq!(app.view.selected, 11);
         let backend = draw(&app, 80, 24);
@@ -1389,8 +1358,6 @@ mod tests {
         let backend = draw(&app, 80, 24);
         let frame = frame_text(&backend);
 
-        // Every data line starts with the row's place in the current view, so a
-        // filter renumbers the table rather than leaving gaps.
         let data_rows: Vec<&str> = frame
             .lines()
             .filter(|line| line.contains("203.0.113."))
@@ -1466,8 +1433,6 @@ mod tests {
         assert!(rendered.contains("240"), "the pass count is shown");
         assert!(rendered.contains("10"), "the fail count is shown");
 
-        // The bar reflects the fraction: three full cells plus a sub-cell
-        // partial, on a bar a quarter of the row wide.
         let bar = spans[0].content.as_ref();
         assert_eq!(bar.width(), 15, "a quarter of 60, got {bar:?}");
         assert_eq!(
@@ -1484,8 +1449,6 @@ mod tests {
 
     #[test]
     fn the_bar_keeps_its_width_as_the_numbers_grow() {
-        // Numbers that change width must not shuffle the row, so the bar's own
-        // width never depends on them.
         let _theme = use_theme(true, false);
         for (done, passed, rate) in [(0usize, 0usize, 0.0), (250, 240, 12.5), (9999, 9990, 3.0)] {
             let share = progress_spans(done, 10000, passed, done as f64 / 10_000.0, rate, 80);
@@ -1509,11 +1472,9 @@ mod tests {
         );
         assert!(rendered.contains("250/1000"), "got {rendered:?}");
 
-        // The split is the last extra to go, and only outside the supported range.
         assert!(at(60).contains("240"), "got {:?}", at(60));
         assert!(!at(40).contains("240"), "got {:?}", at(40));
 
-        // Whatever the row, the strip never spills past it.
         for width in 12..=200u16 {
             let used = cells(&progress_spans(250, 1000, 240, 0.25, 12.5, width));
             assert!(
@@ -1530,7 +1491,6 @@ mod tests {
         let mut app = sample_app(20);
         let area = Rect::new(0, 0, 80, 24);
 
-        // The first data row sits directly below the borderless column header.
         let layout = view::compute_layout(area).expect("80x24 is supported");
         let first = layout.table.y + 1;
 

@@ -16,12 +16,10 @@ pub struct Socks4Negotiator;
 
 impl Socks4Negotiator {
     fn build_connect_request<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, [u8]> {
-        // 2 (VN, CD) + 2 (port) + 4 (DST.IP) + 1 (USERID null) + host + 1.
         let total = 10 + host.len();
         if total > buf.len() {
-            // Fallback for pathologically overlong hosts (domain format).
             let mut packet = Vec::with_capacity(total);
-            packet.extend_from_slice(&[4u8, 1u8]); // VN, command
+            packet.extend_from_slice(&[4u8, 1u8]);
             packet.extend_from_slice(&port.to_be_bytes());
             packet.extend_from_slice(&[0, 0, 0, 1]);
             packet.push(0u8);
@@ -31,7 +29,7 @@ impl Socks4Negotiator {
         }
 
         let mut len = 0usize;
-        buf[len..len + 2].copy_from_slice(&[4u8, 1u8]); // VN, command
+        buf[len..len + 2].copy_from_slice(&[4u8, 1u8]);
         len += 2;
         buf[len..len + 2].copy_from_slice(&port.to_be_bytes());
         len += 2;
@@ -75,7 +73,6 @@ impl NegotiatorTrait for Socks4Negotiator {
             })
             .context("SOCKS4 target URI has no port")?;
 
-        // Build SOCKS4 CONNECT request; use domain fallback for non-IPv4 hosts.
         let mut packet_buf = [0u8; 512];
         let packet = Self::build_connect_request(&mut packet_buf, host, port);
 
@@ -84,7 +81,6 @@ impl NegotiatorTrait for Socks4Negotiator {
         let mut response = [0u8; 8];
         stream.read_exact(&mut response).await?;
 
-        // Reply layout is [VN, CD, DST.PORT, DST.IP]; CD signals success.
         let mut response_slice = &response[..];
         if response_slice.read_u8().await? != 0 {
             anyhow::bail!("InvalidData: invalid response version");

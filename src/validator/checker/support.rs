@@ -103,7 +103,6 @@ pub struct ValidationTarget {
     pub(crate) url: String,
     pub(crate) response_marker: String,
     pub(crate) request_token: String,
-    // Share health state across clones without pool locking.
     pub(crate) health: Arc<TargetHealth>,
 }
 
@@ -246,7 +245,6 @@ async fn to_raw_response_early_exit(
     let header_len = content.len();
     let mut body = response.into_body();
     use http_body_util::BodyExt as _;
-    // Stop early only after proving transparent decision is fixed.
     let should_stop = |buf: &[u8], token: &[u8], ip: &str, cookie: bool, referer: bool| {
         if memchr::memmem::find(buf, token).is_none() {
             return false;
@@ -290,14 +288,10 @@ pub(crate) async fn support_http(
     let support_cookies = params.support_cookies;
     let support_referer = params.support_referer;
     let useragent = crate::user_agent::next_user_agent();
-    // Share one budget across attempts so stalled proxies stay bounded.
     let budget_started = time::Instant::now();
     let budget = timeout.saturating_mul(max_attempts as u32);
 
-    // Snapshot judges once per probe instead of per attempt; track cooldowns
-    // locally so retries skip judges that failed earlier in this probe.
     let candidates = pool.candidates();
-    // Borrow judge URLs from `candidates`; no per-failure String clone.
     let mut cooling_down: HashSet<&str> = HashSet::with_capacity(candidates.len());
     for attempt in 0..max_attempts {
         if attempt > 0 && !params.retry_delay.is_zero() {
@@ -319,7 +313,6 @@ pub(crate) async fn support_http(
             let mut request = Request::get(&target.url)
                 .header(USER_AGENT, useragent)
                 .header("X-Fluxy-Token", &target.request_token);
-            // Send headers unconditionally; check them only when requested.
             request = request.header(hyper::header::COOKIE, "cookie=ok");
             request = request.header(hyper::header::REFERER, "https://google.com/");
             let req = match request.body(Empty::<Bytes>::new()) {
@@ -344,7 +337,6 @@ pub(crate) async fn support_http(
                 Err(_e) => {
                     #[cfg(feature = "log")]
                     log::trace!("{}: local judge unreachable: {:#}", proxy, _e);
-                    // Cool failing judge to steer round-robin away from it.
                     pool.report_failure(target);
                     cooling_down.insert(target.url.as_str());
                     continue;
@@ -365,7 +357,6 @@ pub(crate) async fn support_http(
                 continue;
             }
 
-            // Stream body with early exit when public IP is already cached.
             let cached_ip = crate::resolver::cached_my_ip();
             let (body, my_ip) = if let Some(cached) = cached_ip {
                 let body = match to_raw_response_early_exit(
@@ -385,7 +376,6 @@ pub(crate) async fn support_http(
                         continue;
                     }
                 };
-                // Reverify token echo for the non-transparent path.
                 if memchr::memmem::find(&body, target.response_marker.as_bytes()).is_none() {
                     #[cfg(feature = "log")]
                     log::trace!("{}: response did not originate from the local judge", proxy);
@@ -438,7 +428,6 @@ pub(crate) async fn support_http(
                     log::trace!("{}: proxy did not forward the referer header", proxy);
                     continue;
                 }
-                // Degrade to Unknown when my-IP lookup fails; never fail live proxy.
                 let lookup = match time::timeout_at(deadline, my_ip()).await {
                     Ok(result) => result,
                     Err(elapsed) => Err(anyhow::anyhow!(
@@ -586,18 +575,16 @@ mod tests {
         assert_eq!(first.url, urls[0]);
         assert_eq!(second.url, urls[1]);
         assert_eq!(third.url, urls[2]);
-        // wraps back to the start
         assert_eq!(fourth.url, urls[0]);
     }
 
     #[tokio::test]
     async fn build_returns_once_first_judge_passes() {
-        // Guard build returning once first judge passes.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hanging_url = format!("http://{}/judge", listener.local_addr().unwrap());
         let _server = tokio::spawn(async move {
             let _ = listener.accept().await;
-            std::future::pending::<()>().await; // never reply
+            std::future::pending::<()>().await;
         });
 
         let fast_url = crate::test_support::spawn_echo_judge().await;
@@ -686,7 +673,6 @@ mod tests {
     fn pool_deduplicates_repeated_urls() {
         let url = "http://a.example.com/azenv.php".to_owned();
         let target = ValidationTarget::online(&url).unwrap();
-        // Honour given targets exactly; build() dedupes upstream.
         let pool = JudgePool::from_targets(Vec::from([
             std::sync::Arc::new(target),
             std::sync::Arc::new(ValidationTarget::online(&url).unwrap()),
@@ -694,7 +680,6 @@ mod tests {
         assert_eq!(pool.len(), 2);
     }
 
-    // Self-signed fixtures that strict TLS must reject without insecure.
     const SELF_SIGNED_CERT_PEM: &str = include_str!("../../../tests/fixtures/self_signed_cert.pem");
     const SELF_SIGNED_KEY_PEM: &str = include_str!("../../../tests/fixtures/self_signed_key.pem");
 
@@ -721,7 +706,6 @@ mod tests {
         tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
                 if let Ok(mut tls) = acceptor.accept(stream).await {
-                    // Read the HTTP request so we can echo the per-target token.
                     let mut buf = [0u8; 2048];
                     let mut received = Vec::new();
                     let mut token = String::new();
@@ -763,7 +747,6 @@ mod tests {
 
     #[tokio::test]
     async fn self_signed_judge_passes_preflight_with_insecure() {
-        // Guard insecure flag letting self-signed judges pass preflight.
         let url = spawn_self_signed_judge(true).await;
         let target = ValidationTarget::online(&url).unwrap();
         let err = target
@@ -781,7 +764,6 @@ mod tests {
 
     #[tokio::test]
     async fn self_signed_judge_is_rejected_without_insecure() {
-        // Guard rejection of self-signed certs without insecure flag.
         let url = spawn_self_signed_judge(true).await;
         let result = JudgePool::build(
             &[url],
@@ -798,7 +780,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_online_rejects_judge_without_token_echo() {
-        // Guard rejection of judges skipping token echo.
         let url = spawn_self_signed_judge(false).await;
         let target = ValidationTarget::online(&url).unwrap();
         let err = target
@@ -826,7 +807,6 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_http_proxy_consumes_one_shared_budget() {
-        // Guard shared budget bounding stalled proxies across judges.
         let blackhole = spawn_stalled_clients().await;
         let pool = JudgePool::from_targets(Vec::from([
             std::sync::Arc::new(ValidationTarget::online("http://127.0.0.1:9/judge-a").unwrap()),
@@ -926,7 +906,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_result_carries_the_connection_driver() {
-        // Guard driver surviving into result to linger the connection.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {

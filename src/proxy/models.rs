@@ -154,9 +154,6 @@ pub enum Protocol {
     Connect(u16),
 }
 
-// Serialize every variant as an object so consumers never branch on
-// string-vs-object: Http/Https carry anonymity, Connect carries port,
-// SOCKS carries family only.
 impl Serialize for Protocol {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -322,7 +319,6 @@ pub struct Proxy {
     pub(crate) text: Arc<str>,
 }
 
-// Split latency stats while keeping historical JSON keys intact.
 impl serde::Serialize for Proxy {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -502,7 +498,6 @@ impl FromStr for Proxy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
 
-        // Strip scheme prefix so helper sees clean ip:port head.
         let (scheme, rest) = if let Some(rest) = s.strip_prefix("http://") {
             (Some("http"), rest)
         } else if let Some(rest) = s.strip_prefix("https://") {
@@ -589,7 +584,6 @@ mod tests {
         assert_eq!(value["min_response_time"], serde_json::json!(0.2));
         assert_eq!(value["max_response_time"], serde_json::json!(0.8));
         assert_eq!(value["response_time_samples"], serde_json::json!(2));
-        // `type` is always an array, even when empty.
         assert_eq!(value["type"], serde_json::json!([]));
         assert_eq!(value["ip"], serde_json::json!("192.0.2.50"));
         assert_eq!(value["port"], serde_json::json!(8080));
@@ -599,7 +593,6 @@ mod tests {
 
     #[test]
     fn proxy_without_geo_lookup_serializes_empty_geo_object() {
-        // `Proxy::new` carries the shared default geo (no lookup ran).
         let proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 60), 8080);
         let value: serde_json::Value = serde_json::from_str(&proxy.as_json()).unwrap();
         assert_eq!(value["geo"], serde_json::json!({}));
@@ -698,7 +691,6 @@ mod tests {
 
     #[test]
     fn geo_is_serialized_into_json_output() {
-        // Regression test: `Proxy.geo` must appear in `as_json()` output.
         let mut proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 40), 8080);
         proxy.geo = Arc::new(crate::geolookup::models::GeoData {
             iso_code: Some("ID".into()),

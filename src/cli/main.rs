@@ -10,7 +10,6 @@ use flx::{
     proxy::models::{Anonymity, Protocol, Proxy},
     FetchStage, PauseGate, ProxySource, ProxyValidator, ValidationProgress,
 };
-// `flx serve` uses `.next()`; the CLI test module reaches this through `use super::*`.
 #[allow(unused_imports)]
 use futures_util::StreamExt;
 use quotas::{split_type_requests, QuotaEnforcer, TypeQuota};
@@ -121,7 +120,6 @@ fn format_gathered_stats(
 mod quiet_signal_echo {
     use std::sync::Mutex;
 
-    // Save termios so forced exits can restore it.
     static ORIGINAL: Mutex<Option<(libc::c_int, libc::termios)>> = Mutex::new(None);
 
     /// Restore saved terminal settings at most once.
@@ -191,14 +189,12 @@ const SIGINT_EXIT_CODE: u8 = 130;
 /// Poll the serve pool while it fills.
 #[cfg(feature = "serve")]
 const SERVE_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-// Let a second Ctrl+C force-quit stuck phases.
 const FORCE_EXIT_AFTER_PRESSES: usize = 2;
 
 fn should_force_exit(press_count: usize) -> bool {
     press_count >= FORCE_EXIT_AFTER_PRESSES
 }
 
-// Restore output, cursor, and termios before forced exits.
 fn restore_terminal_and_exit() -> ! {
     let _ = std::io::stdout().lock().flush();
     #[cfg(feature = "progress_bar")]
@@ -219,7 +215,6 @@ fn main() -> std::process::ExitCode {
         Err(e) => {
             #[cfg(feature = "log")]
             log::error!("Error: {e:?}");
-            // Surface fatal errors even when logging is off.
             eprintln!("Error: {e:?}");
             std::process::ExitCode::FAILURE
         }
@@ -259,7 +254,6 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).expect("clap validates args");
 
-    // Apply config patches before reading flags.
     if !matches!(&cli.command, Some(Command::Config(_))) {
         let home = config_home();
         let cwd = std::env::current_dir().unwrap_or_default();
@@ -284,9 +278,6 @@ fn run_application() -> anyhow::Result<RunOutcome> {
             "trace" => log::LevelFilter::Trace,
             _ => log::LevelFilter::Off,
         };
-        // A run that owns the dynamic-height inline viewport cannot log to
-        // it: stderr would paint over the live UI. Nothing is written at
-        // `off`, so no file is made.
         #[cfg(feature = "tui")]
         let owns_screen = cli.tui && log_level != log::LevelFilter::Off;
         #[cfg(not(feature = "tui"))]
@@ -312,7 +303,6 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         return Ok(RunOutcome::NoCommand);
     };
 
-    // Force color choice from --no-color for stderr painters.
     #[cfg(feature = "progress_bar")]
     style::set_override(!cli.no_color);
 
@@ -322,14 +312,12 @@ fn run_application() -> anyhow::Result<RunOutcome> {
         .context("failed to build tokio runtime")?;
 
     let cancel = Arc::new(tokio::sync::Notify::new());
-    // Observe GeoLite2 downloads for progress bars.
     let download = flx::install_download_observer().expect("download observer installs once");
 
     let outcome = runtime.block_on(async move {
         if !cli.skip_version_check && !cli.quiet {
             let current = env!("CARGO_PKG_VERSION").to_owned();
             tokio::spawn(async move {
-                // Prefer cached versions to avoid per-run network hits.
                 let (latest, from_network) = match cached_latest_version() {
                     Some(v) => (v, false),
                     None => match fetch_latest_version().await {
@@ -346,7 +334,6 @@ fn run_application() -> anyhow::Result<RunOutcome> {
             });
         }
         let notify = Arc::clone(&cancel);
-        // Re-arm SIGINT so warmup presses reach process_result.
         let presses = Arc::new(AtomicUsize::new(0));
         tokio::spawn(async move {
             loop {
@@ -374,7 +361,6 @@ fn run_application() -> anyhow::Result<RunOutcome> {
     outcome
 }
 
-// Hand a find/grab run to the terminal UI instead of streaming to stdout.
 #[cfg(feature = "tui")]
 fn run_tui(cli: &Cli) -> anyhow::Result<RunOutcome> {
     use tui::RunSpec;
@@ -483,7 +469,6 @@ fn run_config(
     }
 }
 
-// Unify warmup bars across feature configurations.
 trait PhaseLabel {
     fn set_phase(&self, phase: &'static str);
 }
@@ -502,7 +487,6 @@ impl PhaseLabel for WarmupBar {
     }
 }
 
-// Race fetcher startup against cancel with phase labels.
 async fn start_fetch_phase<B>(
     fetch_cfg: flx::fetcher::Config,
     cancel: &Arc<tokio::sync::Notify>,
@@ -575,7 +559,6 @@ async fn run_grab(
         return Ok(RunOutcome::Cancelled);
     };
     let accepted = fetcher.accepted_handle();
-    // Repaint gathered counts on a fixed cadence.
     let ticker = warmup.as_ref().map(|bar| {
         let bar = Arc::clone(bar);
         let accepted = Arc::clone(&accepted);
@@ -665,13 +648,11 @@ async fn validated_stream(
     Ok((Box::pin(validator), progress, gate))
 }
 
-// Pause validating while the serve pool is full; resume when room frees.
 #[cfg(feature = "serve")]
 fn serve_should_pause(pool_len: usize, pool_size: usize) -> bool {
     pool_len >= pool_size.max(1)
 }
 
-// Print a serve log line without colliding with the status line.
 #[cfg(feature = "serve")]
 fn announce(bar: Option<&impl OutputGuard>, message: &str) {
     match bar {
@@ -732,7 +713,6 @@ async fn run_serve(
         event_tx: Some(event_tx),
         trace: serve.trace,
     };
-    // Fail fast when the endpoint is already claimed (e.g. a stale instance).
     tokio::net::TcpListener::bind((serve.bind, serve.port))
         .await
         .with_context(|| {
@@ -757,7 +737,6 @@ async fn run_serve(
     if let Some(bar) = serve_bar.as_deref() {
         bar.set_phase("Filling the pool …");
     }
-    // Print connection events without colliding with the status line.
     let _event_printer = {
         let bar = serve_bar.clone();
         tokio::spawn(async move {
@@ -767,7 +746,6 @@ async fn run_serve(
         })
     };
 
-    // Fan cancel notifications out to every serve task.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn({
         let cancel = Arc::clone(&cancel);
@@ -783,7 +761,6 @@ async fn run_serve(
         async move { rotator.run_until_shutdown(shutdown).await }
     });
 
-    // Flip the status line live without interrupting active connections.
     let static_pool = !serve.validator.files.is_empty();
     let live = {
         let pool = Arc::clone(&pool);
@@ -801,7 +778,6 @@ async fn run_serve(
             }
         })
     };
-    // Recheck pool room on a fixed cadence while the feed is paused.
     let mut room_tick = tokio::time::interval(SERVE_READY_POLL_INTERVAL);
     loop {
         if let Some(bar) = serve_bar.as_deref() {
@@ -817,11 +793,9 @@ async fn run_serve(
             bar.set_progress(progress);
             bar.set_phase("Checking online judges …");
         }
-        // Hold validating while the pool is full; evictions free room again.
         let mut paused_full = false;
         if serve_should_pause(pool.len(), pool_size) {
             if static_pool {
-                // A full static pool needs no further candidates.
                 drop(stream);
                 rotator.force_ready();
                 break;
@@ -841,7 +815,6 @@ async fn run_serve(
                 _ = shutdown_rx.changed() => break,
                 _ = room_tick.tick() => {}
                 server_result = &mut server => {
-                    // The server only ends early on startup failure.
                     match server_result {
                         Ok(Ok(())) => break,
                         Ok(Err(error)) => return Err(error),
@@ -917,7 +890,6 @@ async fn run_find(
         type_quotas.push(default);
     }
     let protocols: Vec<Protocol> = type_quotas.iter().map(|quota| quota.protocol).collect();
-    // Shared quota state so pass 2 resumes with pass-1 room left.
     let quota_enforcer: Arc<Mutex<QuotaEnforcer>> =
         Arc::new(Mutex::new(QuotaEnforcer::new(type_quotas)));
     {
@@ -931,14 +903,10 @@ async fn run_find(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .has_any_quota();
-    // Probes for filled families are pointless: strict output would reject
-    // their results, so the validator skips them (groups always probe).
     let probe_gate: Option<flx::ProbeGate> = build_probe_gate(&quota_enforcer);
 
-    // Record pass-1 candidates for fallback without re-fetching.
     let recordings: Arc<std::sync::Mutex<Vec<Proxy>>> = Arc::default();
     let recorded_types: Arc<[Protocol]> = Arc::from(protocols.clone());
-    // Toggle validation pause via SIGUSR1 (Unix only) across both passes.
     #[cfg(unix)]
     let pause_holder: Arc<std::sync::Mutex<Option<Arc<PauseGate>>>> = Arc::default();
     #[cfg(unix)]
@@ -1074,7 +1042,6 @@ async fn run_find(
         .map(|p| p.to_string_lossy().into_owned());
 
     let guard1 = make_guard(progress1.clone(), quiet, no_color);
-    // Leave pass-1 JSON open when fallback may append.
     let may_fallback = !protocols.is_empty();
     let json_doc = may_fallback.then(|| Arc::new(JsonDoc::default()));
     let run_stats = crate::output::RunStats::new();
@@ -1113,8 +1080,6 @@ async fn run_find(
         return outcome1;
     }
 
-    // Fall back when pass 1 misses types or the limit. Quota runs compare
-    // emitted rows (not validated probes) so capped types stop at `=n`.
     let limit = find.output.limit;
     let p1_passed = progress1.passed();
     let emitted1 = json_doc.as_ref().map_or(p1_passed, |doc| doc.items());
@@ -1140,7 +1105,6 @@ async fn run_find(
         };
 
         if candidates.is_empty() {
-            // Skip empty fallback passes without judge preflight.
             close_chained_json(&options2, json_doc.as_ref().map_or(0, |doc| doc.items())).await?;
             report_validation_summary(
                 ValidationStats::from_progress(&progress1, started.elapsed()),
@@ -1232,7 +1196,6 @@ async fn run_find(
         return Ok(RunOutcome::Finished);
     }
 
-    // Close pass-1 arrays when fallback never runs.
     if let Some(doc) = &json_doc {
         close_chained_json(&find.output, doc.items()).await?;
     }
@@ -1270,7 +1233,6 @@ async fn write_failures(
             return;
         }
     };
-    // Buffer failure lines to avoid per-record syscalls.
     let mut writer = tokio::io::BufWriter::new(&mut file);
     while let Some(failure) = rx.recv().await {
         let line = serde_json::to_string(&failure).unwrap_or_default();
@@ -1341,7 +1303,6 @@ fn report_validation_summary(
     if quiet || stdout_is_pipe() {
         return;
     }
-    // Same semantics as the live bars: completed probes per second.
     let rate = if stats.elapsed.is_zero() {
         0.0
     } else {

@@ -77,8 +77,6 @@ pub(crate) struct Column {
 }
 
 pub(crate) const COLUMNS: [Column; COLUMN_COUNT] = [
-    // The ordinal never hides and never grows: it is the address the numeric
-    // jump targets, so losing it would make `{n}G` blind.
     Column {
         title: "#",
         source: Source::Ordinal,
@@ -367,7 +365,6 @@ fn chars_eq(left: char, right: char, case: Case) -> bool {
     if left.is_ascii() && right.is_ascii() {
         return left.eq_ignore_ascii_case(&right);
     }
-    // Only the non-ASCII path allocates; ASCII filters stay allocation-free.
     left.to_lowercase().eq(right.to_lowercase())
 }
 
@@ -443,7 +440,6 @@ pub(crate) fn visible(rows: &[RowModel], view: &ViewState) -> Vec<usize> {
         .map(|(index, _)| index)
         .collect();
     if let Some(key) = view.sort {
-        // Stable, so rows that compare equal keep their arrival order.
         indices.sort_by(|a, b| {
             let ordering = compare(&rows[*a], &rows[*b], key);
             match view.order {
@@ -487,7 +483,6 @@ pub(crate) fn fit_columns(available: u16, rows: usize) -> Vec<(usize, u16)> {
     let mut widths: Vec<u16> = COLUMNS
         .iter()
         .map(|column| match column.source {
-            // The ordinal is as wide as the numbers it has to show.
             Source::Ordinal => ordinal_width(rows),
             Source::Cell(_) => column.preferred,
         })
@@ -500,7 +495,6 @@ pub(crate) fn fit_columns(available: u16, rows: usize) -> Vec<(usize, u16)> {
         cells.saturating_add(gaps)
     };
 
-    // Low-priority columns go first: ASN, then N, then TYPE.
     while total(&shown, &widths) > available {
         let next = shown
             .iter()
@@ -511,7 +505,6 @@ pub(crate) fn fit_columns(available: u16, rows: usize) -> Vec<(usize, u16)> {
         shown.retain(|index| *index != next);
     }
 
-    // Still too wide: squeeze the columns that tolerate it, least important first.
     while total(&shown, &widths) > available {
         let next = shown
             .iter()
@@ -525,7 +518,6 @@ pub(crate) fn fit_columns(available: u16, rows: usize) -> Vec<(usize, u16)> {
         widths[next] -= 1;
     }
 
-    // Spare width goes to the widest-information columns first.
     while total(&shown, &widths) < available {
         let next = shown
             .iter()
@@ -869,7 +861,6 @@ mod tests {
             titles(120),
             vec!["#", "IP:PORT", "PROTO", "ANON", "CC", "TYPE", "ASN", "RTT", "N"]
         );
-        // 56 cells is what a 60-column terminal leaves the table.
         assert_eq!(
             titles(56),
             vec!["#", "IP:PORT", "PROTO", "ANON", "CC", "RTT"],
@@ -887,7 +878,6 @@ mod tests {
                 .expect("the ordinal is always shown")
         };
 
-        // Two cells covers the `#` header for short lists.
         assert_eq!(width(1), ORDINAL_MIN);
         assert_eq!(width(99), ORDINAL_MIN);
         assert_eq!(width(100), 3);
@@ -898,8 +888,6 @@ mod tests {
 
     #[test]
     fn the_ordinal_survives_every_narrow_terminal() {
-        // The number is the address `{n}G` takes, so it must never be the
-        // column that hides.
         for available in [12u16, 20, 30, 40, 56] {
             let shown = fit_columns(available, 500);
             assert!(
@@ -913,13 +901,9 @@ mod tests {
 
     #[test]
     fn fitted_columns_use_the_whole_width() {
-        // The ceilings cap how wide the table stretches; below that it must
-        // leave no dead cells at the right edge. Columns that never grow stop
-        // at their preferred width.
         let ceilings: u16 = COLUMNS
             .iter()
             .map(|column| match column.source {
-                // The ordinal is already at the widest it needs to be.
                 Source::Ordinal => ordinal_width(500),
                 Source::Cell(_) => match column.grow_rank {
                     Some(_) => column.max,
@@ -978,7 +962,6 @@ mod tests {
     #[test]
     fn clamping_counts_cells_not_bytes() {
         let _theme = use_theme(true, false);
-        // Three CJK glyphs are six cells wide; the ellipsis needs the seventh.
         let clamped = clamp_cells("\u{4e2d}\u{6587}\u{5b57}\u{4e2d}", 7);
         assert_eq!(clamped.width(), 7);
         assert!(clamped.starts_with("\u{4e2d}\u{6587}\u{5b57}"));
@@ -1000,7 +983,6 @@ mod tests {
         assert_eq!(progress_bar(0.0, 4), "    ");
         assert_eq!(progress_bar(1.0, 4), "\u{2588}\u{2588}\u{2588}\u{2588}");
         assert_eq!(progress_bar(0.5, 4), "\u{2588}\u{2588}  ");
-        // Half a cell is a half-filled leading cell, not a rounded-up one.
         let partial = progress_bar(0.125, 4);
         assert_eq!(partial, "\u{258b}   ", "got {partial:?}");
         assert_eq!(partial.chars().count(), 4);

@@ -20,7 +20,6 @@ use models::{ScrapeContext, ScrapeMode, Source};
 use tokio::time;
 
 const MAX_SOURCE_BODY_BYTES: usize = 8 * 1024 * 1024;
-// Pre-size buffer; sources are small and frames accumulate incrementally.
 const SOURCE_BODY_INITIAL_CAPACITY: usize = 64 * 1024;
 const MAX_REDIRECTS: usize = 10;
 const ACCEPT_ENCODING: &str = "gzip";
@@ -254,7 +253,6 @@ pub trait ProxyProvider {
             let mut decoder = BodyDecoder::new(encoding.as_deref(), capacity)
                 .with_context(|| format!("unsupported encoding from {}", url))?;
 
-            // Bound body reads by the same deadline to release permits on stalls.
             while let Some(next) = time::timeout_at(deadline, response.frame())
                 .await
                 .with_context(|| format!("body stream from {} timed out", url))?

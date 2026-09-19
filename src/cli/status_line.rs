@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-// Erase to screen end, return to line start, then step up per newline.
 const ERASE_DOWN: &str = "\x1b[J";
 const CURSOR_LEFT: &str = "\x1b[1000D";
 const CURSOR_PREV_LINE: &str = "\x1b[F";
@@ -83,7 +82,6 @@ impl<D: Display + Send + Sync + 'static> StatusLine<D> {
         });
         let state_ref = Arc::clone(&state);
         thread::spawn(move || {
-            // Stop when the StatusLine drops its last external reference.
             while Arc::strong_count(&state_ref) > 1 {
                 if state_ref.visible.load(Ordering::Acquire) {
                     redraw(options.enable_ansi_escapes, &state_ref.data);

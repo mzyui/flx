@@ -280,7 +280,6 @@ impl Rotator {
     ///
     /// Returns an error when the bind address cannot be claimed.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        // Never fires: preserves run-until-teardown semantics.
         let (never, shutdown) = tokio::sync::watch::channel(false);
         std::mem::forget(never);
         self.run_until_shutdown(shutdown).await

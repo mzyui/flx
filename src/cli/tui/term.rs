@@ -67,8 +67,6 @@ fn restore_terminal_state() {
 /// on top of the last UI row.
 fn restore() {
     restore_terminal_state();
-    // The cursor may sit mid-line inside the viewport; column 0 + newline puts
-    // the shell on a fresh line even without viewport geometry.
     let _ = execute!(io::stdout(), MoveToColumn(0));
     let _ = writeln!(io::stdout());
     let _ = io::stdout().flush();
@@ -87,13 +85,6 @@ fn move_below_viewport(terminal: &mut Tui) {
         let _ = io::stdout().flush();
         return;
     }
-    // Anchor to the last viewport row (always in bounds), then feed one
-    // newline: with room below it lands on the blank line after the UI,
-    // at the bottom edge it scrolls exactly one line up. This avoids both
-    // failure modes of the old split path — `MoveTo(0, bottom)` is the
-    // exclusive edge (out of bounds when the viewport touches the bottom
-    // and may be ignored, leaving the prompt glued to the footer), while
-    // `append_lines` alone prints at the current cursor, mid-viewport.
     let mut last_row = viewport.bottom().saturating_sub(1);
     if let Ok(size) = terminal.size() {
         if size.height > 0 {
@@ -137,7 +128,6 @@ impl TerminalGuard {
                 return Err(anyhow::Error::new(error).context("failed to open the terminal"));
             }
         };
-        // Cursor hiding and mouse capture are not part of terminal construction.
         let _ = execute!(io::stdout(), Hide, EnableMouseCapture);
         *RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(restore);
         Ok(Self { terminal })
@@ -150,8 +140,6 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Position first while raw mode still holds, then restore modes: the
-        // cursor ends on the line below the UI, so no extra newline is needed.
         move_below_viewport(&mut self.terminal);
         restore_terminal_state();
         *RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None;

@@ -228,9 +228,7 @@ impl App {
     }
 
     pub(crate) fn handle_action(&mut self, action: Action) {
-        // A pending `g` is consumed by whatever key arrives next.
         self.pending_g = matches!(action, Action::PrefixG);
-        // The count survives its own digits and the key that spends it.
         if !matches!(action, Action::Count(_) | Action::GotoCount) {
             self.count = None;
         }
@@ -255,7 +253,6 @@ impl App {
         match action {
             Action::Interrupt => self.interrupt(),
             Action::ToggleHelp => {
-                // Opening always starts at the top, so the panel reads in order.
                 self.help_scroll = 0;
                 self.help = true;
             }
@@ -346,7 +343,6 @@ impl App {
             }
             Action::Count(digit) => self.push_count(digit),
             Action::GotoCount => self.goto_count(rows),
-            // The prompt, confirm, and help branches above own these.
             Action::PrefixG
             | Action::Submit
             | Action::Cancel
@@ -388,8 +384,6 @@ impl App {
                 self.help_scroll = self.help_scroll.saturating_add(PAGE_ROWS as u16)
             }
             Action::GotoTop => self.help_scroll = 0,
-            // How far the bottom is depends on the content height, which is a
-            // render fact: render clamps this to the real maximum.
             Action::GotoBottom => self.help_scroll = u16::MAX,
             _ => {}
         }
@@ -435,7 +429,6 @@ impl App {
                     ConfirmKind::OverwriteExport(path) => self.spawn_export(path),
                 }
             }
-            // The default answer is No: a dismissed prompt changes nothing.
             Action::ConfirmNo => self.confirm = None,
             Action::Interrupt => {
                 self.confirm = None;
@@ -636,7 +629,6 @@ impl App {
                 self.info(format!("validating pass {pass}"));
             }
             EngineEvent::Failure(failure) => {
-                // A ring buffer, so the log cannot grow with the run.
                 if self.failures.len() >= MAX_FAILURE_LOG {
                     self.failures.remove(0);
                 }
@@ -676,8 +668,6 @@ impl App {
     }
 
     fn update_rate(&mut self) {
-        // Nothing is running, so there is no rate left to sample; the last one
-        // stays on screen rather than being recomputed from a frozen count.
         let Some(completed) = self.completed_probes() else {
             return;
         };
@@ -802,7 +792,6 @@ mod tests {
 
     #[test]
     fn an_aborted_run_also_stops_the_clock() {
-        // Cancel and engine error both end the run, so both must freeze it.
         let mut app = App::new(test_spec(true));
         app.started = Some(Instant::now() - Duration::from_secs(3));
         app.cancel_run();
@@ -857,14 +846,12 @@ mod tests {
     #[test]
     fn a_typed_row_number_moves_the_selection_there() {
         let mut app = app_with_results(20);
-        // `1`, `2` then the jump key: the table numbers rows from one.
         app.handle_action(Action::Count(1));
         app.handle_action(Action::Count(2));
         assert_eq!(app.key_context().count, Some(12));
         app.handle_action(Action::GotoCount);
         assert_eq!(app.view.selected, 11);
 
-        // The count is spent, not kept.
         assert_eq!(app.key_context().count, None);
         app.handle_action(Action::GotoCount);
         assert_eq!(app.view.selected, 11, "a second jump needs new digits");
@@ -881,7 +868,6 @@ mod tests {
             "an out-of-range jump clamps instead of doing nothing"
         );
 
-        // `0G` is the first row, as in vim.
         app.handle_action(Action::Count(0));
         app.handle_action(Action::GotoCount);
         assert_eq!(app.view.selected, 0);
@@ -908,7 +894,6 @@ mod tests {
         app.refresh_visible();
         assert_eq!(app.visible.len(), 1);
 
-        // Row 5 of the view does not exist once the filter narrows it.
         app.handle_action(Action::Count(5));
         app.handle_action(Action::GotoCount);
         assert_eq!(app.view.selected, 0);

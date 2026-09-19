@@ -111,11 +111,9 @@ enum Scope {
 
 impl Scope {
     fn applies(self, context: KeyContext) -> bool {
-        // Help is modal: only its own bindings apply while it is open.
         if context.help {
             return self == Scope::Help;
         }
-        // A confirmation is modal too: only its own two answers apply.
         if context.confirm {
             return self == Scope::Confirm;
         }
@@ -175,7 +173,6 @@ const COUNT_ANY: Action = Action::Count(0);
 /// The footer never shows more than this many keys.
 const MAX_HINTS: usize = 5;
 
-// Short aliases, so one binding still fits on one line.
 use Action as A;
 use Scope as S;
 
@@ -190,7 +187,6 @@ use Scope as S;
 /// every call into seven lines instead.
 #[rustfmt::skip]
 static KEYMAP: &[Binding] = &[
-    // Global
     row(&[Key::Char('?')], "?", A::ToggleHelp, "help", "open this key table", S::Screen, false),
     row(&[Key::Esc], "esc", A::Back, "back", "close the drill-down, then leave", S::Screen, false),
     row(&[Key::Up, Key::Char('k')], "\u{2191}/k", A::ScrollUp, "up", "move up one row", S::Screen, false),
@@ -200,10 +196,8 @@ static KEYMAP: &[Binding] = &[
     row(&[Key::Char('g')], "gg/{n}G", A::PrefixG, "top / row n", "top of the list, or row n", S::Screen, false),
     row(&[Key::Char('G')], "G", A::GotoBottom, "bottom", "bottom of the list", S::Screen, false),
     row(&[Key::Digit], "1-9", COUNT_ANY, "then G: row n", "digits, then G: go to that row", S::Screen, false),
-    // Running only
     row(&[Key::Char('p')], "p", A::PauseToggle, "pause", "pause or resume probing", S::Running, true),
     row(&[Key::Char('c')], "c", A::CancelRun, "cancel", "cancel the run, after asking", S::Running, true),
-    // Results, on either screen
     row(&[Key::Char('s')], "s", A::SortCycle, "sort", "cycle the sort key", S::Screen, true),
     row(&[Key::Char('/')], "/", A::EditFilter, "filter", "live-filter rows (smart-case); Esc restores", S::Screen, true),
     row(&[Key::Char('e')], "e", A::Export, "export", "export the visible rows", S::Screen, true),
@@ -211,19 +205,15 @@ static KEYMAP: &[Binding] = &[
     row(&[Key::Enter], "enter", A::DrillIn, "open", "open the drill-down", S::Screen, false),
     row(&[Key::Char('S')], "S", A::OrderToggle, "order", "reverse the sort order", S::Screen, false),
     row(&[Key::Char('x')], "x", A::ClearFilter, "clear filter", "clear the filter", S::Screen, false),
-    // Done only
     row(&[Key::Char('r')], "r", A::Rerun, "re-run", "run again with the same options", S::Done, true),
-    // Text prompts
     row(&[Key::Enter], "enter", A::Submit, "submit", "submit the prompt", S::Input, false),
     row(&[Key::Up], "up", A::ScrollUp, "up", "choose the previous export format", S::Input, false),
     row(&[Key::Down], "down", A::ScrollDown, "down", "choose the next export format", S::Input, false),
     row(&[Key::Esc], "esc", A::Cancel, "cancel", "abandon the prompt", S::Input, true),
     row(&[Key::Backspace], "backspace", A::Backspace, "delete", "delete one character", S::Input, false),
     row(&[Key::Printable], "text", TEXT_ANY, "type", "type text; digits type here too", S::Input, false),
-    // Confirmations
     row(&[Key::Char('y'), Key::Char('Y')], "y", A::ConfirmYes, "yes", "yes, go ahead", S::Confirm, true),
     row(&[Key::Char('n'), Key::Char('N')], "n", A::ConfirmNo, "no", "no; any other key declines", S::Confirm, true),
-    // The help panel itself, so it can document its own keys
     row(&[Key::Esc, Key::Char('?')], "esc", A::ToggleHelp, "close", "close this help", S::Help, true),
     row(&[Key::Down, Key::Char('j'), Key::PageDown], "\u{2193}/j", A::ScrollDown, "scroll", "scroll down", S::Help, true),
     row(&[Key::Up, Key::Char('k'), Key::PageUp], "\u{2191}/k", A::ScrollUp, "scroll", "scroll back up", S::Help, false),
@@ -245,7 +235,6 @@ pub(crate) const HELP_NOTES: [&str; 6] = [
 /// Normalizes a terminal event into a table key, or `None` when the key is one
 /// the table never claims.
 fn resolve_key(event: KeyEvent) -> Option<Key> {
-    // Windows delivers both press and release; only presses are actions.
     if event.kind != KeyEventKind::Press {
         return None;
     }
@@ -301,34 +290,26 @@ fn binding_for(pressed: Key, context: KeyContext) -> Option<&'static Binding> {
 pub(crate) fn action_for(event: KeyEvent, context: KeyContext) -> Option<Action> {
     let pressed = resolve_key(event)?;
 
-    // Ctrl+C is reserved for the interrupt path on every surface, so a prompt
-    // can never swallow it and no binding can repurpose it.
     if pressed == Key::Ctrl('c') {
         return Some(Action::Interrupt);
     }
     if context.confirm {
-        // Default No: only an explicit `y` goes ahead.
         return Some(match pressed {
             Key::Char('y') | Key::Char('Y') => Action::ConfirmYes,
             _ => Action::ConfirmNo,
         });
     }
     if context.help {
-        // Scrolling is bound; anything else dismisses, so the panel can never
-        // trap someone who does not know the way out.
         return Some(match binding_for(pressed, context) {
             Some(binding) => binding.action,
             None => Action::ToggleHelp,
         });
     }
 
-    // A count in front of `G` (or `gg`) turns "go to the bottom" into "go to
-    // that row", which is the vim convention the digits already suggest.
     let has_count = context.count.is_some();
     if has_count && pressed == Key::Char('G') {
         return Some(Action::GotoCount);
     }
-    // `gg` is the one binding that needs the previous press to be remembered.
     if context.pending_g && pressed == Key::Char('g') {
         return Some(if has_count {
             Action::GotoCount
@@ -338,7 +319,6 @@ pub(crate) fn action_for(event: KeyEvent, context: KeyContext) -> Option<Action>
     }
 
     let binding = binding_for(pressed, context)?;
-    // Rows that mean "any key of this kind" carry the key itself.
     if binding.action == TEXT_ANY {
         return match pressed {
             Key::Char(character) => Some(Action::Text(character)),
@@ -353,9 +333,6 @@ pub(crate) fn action_for(event: KeyEvent, context: KeyContext) -> Option<Action>
 
 /// Contextual footer hints: at most [`MAX_HINTS`] keys for the current surface.
 pub(crate) fn hints(context: KeyContext) -> Vec<(&'static str, &'static str)> {
-    // A half-typed count takes the line over: the digits and what finishes them
-    // are the only thing the user needs to see right now. A bare `g` keeps the
-    // usual hints, so `gg` does not blank the footer while it waits.
     if context.count.is_some() {
         return Vec::new();
     }
@@ -501,7 +478,6 @@ mod tests {
 
     #[test]
     fn esc_is_the_one_back_key_on_both_screens() {
-        // What `Back` means differs per screen; that decision lives in `App`.
         for screen in [Screen::Running, Screen::Done] {
             assert_eq!(
                 action_for(key(KeyCode::Esc), context(screen)),
@@ -592,7 +568,6 @@ mod tests {
             action_for(key(KeyCode::Char('G')), counted),
             Some(Action::GotoCount)
         );
-        // `{n}gg` is the same jump, so the count cannot silently mean "top".
         let pending = KeyContext {
             pending_g: true,
             ..counted
@@ -602,7 +577,6 @@ mod tests {
             Some(Action::GotoCount)
         );
 
-        // Without a count both keys keep their documented meaning.
         assert_eq!(
             action_for(key(KeyCode::Char('G')), done),
             Some(Action::GotoBottom)
@@ -646,9 +620,6 @@ mod tests {
             assert_eq!(action_for(key(code), help), Some(expected), "{code:?}");
         }
 
-        // Leaving is explicit; an unbound key leaves too, so the panel can never
-        // trap someone who does not know the way out. A bound browse key is
-        // rebound rather than shadowed: `s` closes instead of sorting.
         for code in [
             KeyCode::Esc,
             KeyCode::Char('q'),
@@ -820,7 +791,6 @@ mod tests {
 
     #[test]
     fn the_footer_word_is_never_longer_than_the_help_text() {
-        // They serve different widths; the footer's must stay the shorter one.
         for binding in KEYMAP {
             assert!(
                 binding.label.len() <= binding.detail.len(),
@@ -832,7 +802,6 @@ mod tests {
 
     #[test]
     fn every_note_fits_the_narrowest_panel() {
-        // Notes render in a single column inside a 60-column terminal.
         for note in HELP_NOTES {
             assert!(
                 note.chars().count() <= 52,

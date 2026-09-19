@@ -15,7 +15,6 @@ use super::guard::OutputGuard;
 use super::quotas::QuotaEnforcer;
 use super::RunOutcome;
 
-// Resolve `default` format from `-o` extension or piped stdout.
 pub(crate) fn effective_format<'a>(
     format: &'a str,
     output_path: Option<&std::path::Path>,
@@ -45,7 +44,6 @@ pub(crate) fn effective_format<'a>(
     }
 }
 
-// Aggregate per-item distribution for the end-of-run summary.
 #[derive(Default)]
 pub struct RunStats {
     protocols: Mutex<HashMap<&'static str, usize>>,
@@ -115,7 +113,6 @@ impl RunStats {
     }
 }
 
-// Count items across chained passes sharing one JSON array.
 #[derive(Default)]
 pub struct JsonDoc {
     items: AtomicUsize,
@@ -131,23 +128,18 @@ impl JsonDoc {
     }
 }
 
-// Link one pass to a shared JsonDoc for chained output.
 #[derive(Clone)]
 pub struct JsonContinuation {
     pub doc: Arc<JsonDoc>,
     pub leave_open: bool,
 }
 
-// Control document finalization across chained output passes.
 #[derive(Clone)]
 pub struct FinalizeOpts {
     pub suppress_empty_json: bool,
     pub emit_csv_header: bool,
-    // Chained passes append so earlier bytes survive.
     pub continue_json: Option<JsonContinuation>,
-    // Shared distribution collector across chained passes.
     pub stats: Option<Arc<RunStats>>,
-    // Shared per-type quotas (`TYPE=n`); None keeps legacy limit-only output.
     pub quotas: Option<Arc<Mutex<QuotaEnforcer>>>,
 }
 
@@ -163,7 +155,6 @@ impl Default for FinalizeOpts {
     }
 }
 
-// Sort proxies by the requested field and order.
 fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
     let key = match sort {
         "avg-response" | "response-time" => flx::SortKey::AvgResponseTime,
@@ -230,7 +221,6 @@ fn render_pac(proxies: &[Proxy]) -> String {
     out
 }
 
-// Whether per-type quotas are all filled with nothing uncapped left.
 fn quotas_satisfied(quotas: &Option<Arc<Mutex<QuotaEnforcer>>>) -> bool {
     quotas.as_ref().is_some_and(|enforcer| {
         enforcer
@@ -258,8 +248,6 @@ where
     if options.append && matches!(format, "json" | "pretty-json") {
         anyhow::bail!("--append cannot be combined with the {format} format");
     }
-    // Only a pass that continues an earlier one appends; the first pass of a
-    // command truncates so stale output from a previous run cannot survive.
     let continuing = finalize
         .continue_json
         .as_ref()
@@ -286,7 +274,6 @@ where
             if matches!(tokio::fs::metadata(file_path).await, Ok(metadata) if metadata.len() > 0));
 
     let json = matches!(format, "json" | "pretty-json");
-    // Resume chained arrays with a `,` separator when items exist.
     let leave_open = finalize
         .continue_json
         .as_ref()
@@ -300,11 +287,8 @@ where
     let filter = Arc::new(ProxyFilter::from_options(&options));
     let quotas = finalize.quotas.clone();
     let buffered_path = options.sort.is_some() || options.shuffle;
-    // The buffering loop already runs `should_emit`, so the emit/PAC loops
-    // must not run it again (it is stateful and would consume caps twice).
     let quotas_applied = buffered_path;
     let source: std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>> = if buffered_path {
-        // Buffer sorted output interruptibly so cancel keeps arrivals.
         let mut buffered: Vec<Proxy> = Vec::new();
         let mut src = std::pin::pin!(source);
         loop {
@@ -348,14 +332,10 @@ where
     } else {
         Box::pin(source)
     };
-    // Reapply the pure filter as a no-op on the buffered path; quotas are
-    // enforced per item below so filled caps stop the stream early.
     let mut source = std::pin::pin!(source.filter_map(move |proxy| {
         let filter = Arc::clone(&filter);
         async move { filter.matches(&proxy).then_some(proxy) }
     }));
-    // Rows emitted by this pass; the global `--limit` and quota caps count
-    // kept rows, never skipped ones.
     let mut rows: usize = 0;
 
     if format == "pac" {
@@ -427,7 +407,6 @@ where
 
     let mut write_error: Option<anyhow::Error> = None;
 
-    // Emit the CSV header once even for empty streams.
     if _csv && finalize.emit_csv_header && !appending_to_existing {
         buf.extend_from_slice(b"ip,port,type,response_time,country,ip_type,asn,aso\n");
         if let Some(ref mut file) = output_file {
@@ -472,7 +451,6 @@ where
                     }
                 }
                 buf.clear();
-                // Skip failed items without leaving dangling separators.
                 let mut emitted = true;
                 match format {
                     "text" => {
@@ -576,7 +554,6 @@ where
     }
 
     if json {
-        // Finalize JSON best-effort without masking prior errors.
         guard.before_write();
         let close_document = !leave_open || cancelled || write_error.is_some();
         if write_error.is_none() {
@@ -604,7 +581,6 @@ where
     if let Some(file) = output_file.as_mut() {
         let _ = file.flush().await;
     }
-    // Flush stdout so cancelled runs still deliver final bytes.
     let _ = stdout.flush();
 
     if cancelled {
@@ -653,7 +629,6 @@ async fn write_output(
     Ok(())
 }
 
-// Close chained JSON documents without truncating earlier passes.
 pub async fn close_chained_json(options: &OutputOptions, item_count: usize) -> anyhow::Result<()> {
     let format = effective_format(
         &options.format,
@@ -738,7 +713,6 @@ fn csv_quote(buf: &mut Vec<u8>, field: &str) {
     }
 }
 
-// Commit JSON items only after successful serialization.
 fn write_json_item<T: ?Sized + serde::Serialize>(
     buf: &mut Vec<u8>,
     body: &mut Vec<u8>,

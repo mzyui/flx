@@ -92,20 +92,15 @@ pub(super) async fn support_tunnel(
 ) -> anyhow::Result<Option<ProxyRuntimes<Protocol>>> {
     let timeout = params.request_timeout;
     let max_attempts = params.max_attempts;
-    // Look up public IP lazily on success; only HTTPS needs anonymity class.
     let needs_anonymity = matches!(protocol, Protocol::Https(_));
 
-    // Parse judge URLs once per proxy instead of per attempt.
     let mut candidates = Vec::new();
     for validation_target in pool.candidates() {
         let target = JudgeTarget::from_validation_target(&validation_target)?;
         candidates.push((validation_target, target));
     }
     let total_attempts = max_attempts.saturating_mul(candidates.len());
-    // Skip judges already cooling down to avoid burning connects.
-    // Borrow URLs from `candidates`; no per-failure String clone.
     let mut cooling_down: HashSet<&str> = HashSet::with_capacity(candidates.len());
-    // Share one budget across attempts so stalled tunnels stay bounded.
     let budget_started = time::Instant::now();
     let budget = timeout.saturating_mul(max_attempts as u32);
 
@@ -134,7 +129,6 @@ pub(super) async fn support_tunnel(
             Ok(Ok((body, driver))) => {
                 pool.report_success(validation_target, started.elapsed());
                 let mut runtimes = RuntimeStats::default();
-                // Bound the my-IP lookup by the probe deadline; never reject live tunnels for it.
                 let protocol = if needs_anonymity {
                     let my_ip = if let Some(cached) = cached_my_ip() {
                         cached
@@ -188,7 +182,6 @@ pub(super) async fn support_tunnel(
                     protocol,
                     _error
                 );
-                // Cool failing judge to mirror HTTP path behaviour.
                 pool.report_failure(validation_target);
                 cooling_down.insert(validation_target.url.as_str());
             }
@@ -221,7 +214,6 @@ async fn probe_once(
         .context("tunnel validation timed out before TCP connect")?;
     let mut stream = BufReader::new(proxy.connect_timeout(remaining).await?.inner);
 
-    // Reuse cached authority except for CONNECT tunnels.
     let mut authority_buf = [0u8; 64];
     let authority = match protocol {
         Protocol::Connect(port) => authority_for(&mut authority_buf, &target.host, *port),
@@ -558,7 +550,6 @@ mod tests {
 
     #[test]
     fn failed_judge_is_skipped_while_on_cooldown() {
-        // Guard cooldown steering round-robin away from failed judge.
         let targets: Vec<_> = (0..2)
             .map(|i| {
                 std::sync::Arc::new(
@@ -575,10 +566,8 @@ mod tests {
 
     #[tokio::test]
     async fn tunnel_error_path_reports_failure_without_panic() {
-        // Guard failed probes reporting failure without panicking.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        // Accept then drop immediately so probe fails without response.
         let server = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
@@ -615,7 +604,6 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_tunnel_consumes_one_shared_budget() {
-        // Guard shared budget bounding stalled tunnels across judges.
         let blackhole = spawn_stalled_clients().await;
         let pool = JudgePool::from_targets(Vec::from([
             std::sync::Arc::new(ValidationTarget::online("http://127.0.0.1:9/judge-a").unwrap()),

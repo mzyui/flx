@@ -16,7 +16,6 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", proxy.as_text());
     }
 
-    // Counters are final once the stream ends.
     let progress = run.progress();
     println!(
         "{} passed of {} checked",

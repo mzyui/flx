@@ -59,8 +59,6 @@ fn build_client_config(insecure: bool) -> Arc<rustls::ClientConfig> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.add_parsable_certificates(roots);
         if root_store.is_empty() {
-            // Some minimal environments ship no OS store; fall back to the
-            // bundled webpki roots so HTTPS targets stay reachable.
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -96,7 +94,6 @@ pub(crate) fn https_connector_with_config(
     mut http: hyper_util::client::legacy::connect::HttpConnector,
     insecure: bool,
 ) -> HttpsConnector {
-    // Disable http-only enforcement so hyper-rustls can dial HTTPS.
     http.enforce_http(false);
     hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config((**tls_client_config(insecure)).clone())
@@ -122,7 +119,6 @@ pub(crate) async fn tls_connect(
         .map_err(|err| anyhow::anyhow!("TLS handshake with {host} failed: {err}"))
 }
 
-// Skip certificate validation only via explicit insecure opt-in.
 #[derive(Debug)]
 struct AcceptAnyServerCert;
 
@@ -221,7 +217,6 @@ pub struct ProxyRuntimes<T> {
 impl<T> ProxyRuntimes<T> {
     /// Records the average runtime onto the proxy when a sample exists.
     pub fn apply(&self, proxy: &mut Proxy) {
-        // Fold single end-to-end sample into proxy stats.
         let avg = self.runtimes.avg();
         if avg > 0.0 {
             proxy.runtimes.record(avg);
@@ -257,7 +252,6 @@ pub trait ProxyClient {
             .await
             .with_context(|| format!("timed out connecting to {} after {:?}", host, timeout))?
             .with_context(|| format!("failed to connect to {}", host))?;
-        // Disable Nagle to avoid buffering small handshake greetings.
         let _ = tcp_stream.set_nodelay(true);
         let elapsed_time = start_time.elapsed().as_secs_f64();
         self.log_trace(format!("Connected in {:.3}s", elapsed_time));
@@ -290,7 +284,6 @@ pub trait ProxyClient {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
         N: NegotiatorTrait + Sync + Send,
     {
-        // Share one deadline across phases to bound total request time.
         let deadline = time::Instant::now() + timeout;
 
         let remaining = deadline
@@ -470,12 +463,10 @@ pub struct SendOptions {
 
 impl ProxyClient for Proxy {
     fn host(&self) -> Cow<'_, str> {
-        // Borrow precomputed endpoint text to avoid allocation.
         Cow::Borrowed(self.as_text())
     }
 
     fn host_arc(&self) -> Arc<str> {
-        // Clone precomputed endpoint Arc without reallocating.
         Arc::clone(&self.text)
     }
 }

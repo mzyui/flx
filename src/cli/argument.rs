@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 pub(crate) fn is_valid_type_value(value: &str) -> bool {
-    // Accepts `TYPE=n` quotas and `+` AND-groups (no quotas inside groups).
     super::quotas::is_valid_type_value(value)
 }
 

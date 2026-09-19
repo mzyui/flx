@@ -13,8 +13,6 @@ async fn main() -> anyhow::Result<()> {
         .stream_with_progress()
         .await?;
 
-    // Take the failure feed before draining the stream; an undrained
-    // receiver silently drops failures once its buffer fills.
     let mut failures = run.take_failures().expect("report_failures was set");
 
     while run.next().await.is_some() {}

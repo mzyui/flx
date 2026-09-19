@@ -69,7 +69,6 @@ pub(crate) fn validator_config(
     }
 }
 
-// Match advertised types tolerating Unknown anonymity sides.
 pub(crate) fn advertised_covers_request(advertised: &[Protocol], requested: Protocol) -> bool {
     advertised.iter().any(|adv| match (*adv, requested) {
         (Protocol::Http(a), Protocol::Http(b)) | (Protocol::Https(a), Protocol::Https(b)) => {
@@ -80,7 +79,6 @@ pub(crate) fn advertised_covers_request(advertised: &[Protocol], requested: Prot
     })
 }
 
-// Probe missed types when advertisements leave gaps.
 pub(crate) fn needs_missed_probe(proxy: &Proxy, requested: &[Protocol]) -> bool {
     let advertised = proxy.expected_types.as_ref();
     advertised.is_empty()
@@ -89,7 +87,6 @@ pub(crate) fn needs_missed_probe(proxy: &Proxy, requested: &[Protocol]) -> bool 
             .any(|req| !advertised_covers_request(advertised, *req))
 }
 
-// Forward candidates while recording fallbacks for replay.
 pub(crate) fn tee_recorder<S>(
     inner: S,
     recordings: Arc<std::sync::Mutex<Vec<Proxy>>>,
@@ -103,7 +100,6 @@ where
         let requested = Arc::clone(&requested);
         async move {
             match inner.next().await {
-                // Record only fallback candidates worth a deep copy.
                 Some(proxy) if needs_missed_probe(&proxy, &requested) => {
                     recordings
                         .lock()

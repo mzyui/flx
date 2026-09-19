@@ -22,7 +22,6 @@ static HTTP_IP_ENDPOINTS: [&str; 3] = [
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IP_BODY_BYTES: usize = 64;
 
-// Bounds DNS plus HTTPS fallback within a fixed budget.
 const MY_IP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PUBLIC_IP_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -46,7 +45,7 @@ const DNS_RESPONSE_BUFFER_LEN: usize = 512;
 const DNS_HEADER_LEN: usize = 12;
 const DNS_QUESTION_TAIL_LEN: usize = 4;
 const DNS_ANSWER_FIXED_LEN: usize = 10;
-const DNS_QUERY_FLAGS: u16 = 0x0100; // RD (QR must be 0 in a query)
+const DNS_QUERY_FLAGS: u16 = 0x0100;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_TXT: u16 = 16;
 const DNS_CLASS_IN: u16 = 1;
@@ -201,7 +200,7 @@ fn build_dns_query(
 ) -> anyhow::Result<usize> {
     out[..2].copy_from_slice(&query_id.to_be_bytes());
     out[2..4].copy_from_slice(&DNS_QUERY_FLAGS.to_be_bytes());
-    out[4..6].copy_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    out[4..6].copy_from_slice(&1u16.to_be_bytes());
 
     let mut len = DNS_HEADER_LEN;
     let mut labels = 0usize;
@@ -214,7 +213,6 @@ fn build_dns_query(
             anyhow::bail!("DNS label exceeds {DNS_MAX_LABEL_LEN} bytes in `{domain}`");
         }
         let end = len + 1 + label.len();
-        // Reserve the trailing root label plus TYPE/CLASS, not just the tail.
         if end + 1 + DNS_QUESTION_TAIL_LEN > out.len() {
             anyhow::bail!("DNS name `{domain}` exceeds the {DNS_MAX_NAME_LEN}-byte wire limit");
         }
@@ -233,7 +231,6 @@ fn build_dns_query(
     Ok(len + DNS_QUESTION_TAIL_LEN)
 }
 
-// Reads only A records; avoids AAAA-query failure modes.
 fn parse_dns_a_response(message: &[u8], query_id: u16) -> anyhow::Result<Ipv4Addr> {
     if message.len() < DNS_HEADER_LEN {
         anyhow::bail!("DNS response is shorter than its header");
@@ -402,7 +399,6 @@ pub fn cached_my_ip() -> Option<String> {
 ///
 /// Returns an error when every source fails or the lookup times out.
 pub async fn my_ip() -> anyhow::Result<String> {
-    // Caches successes only; retries transient failures.
     MY_IP_CACHE
         .get_or_try_init(|| async {
             time::timeout(MY_IP_LOOKUP_TIMEOUT, resolve_public_ip())
@@ -416,7 +412,6 @@ pub async fn my_ip() -> anyhow::Result<String> {
 async fn resolve_public_ip() -> anyhow::Result<String> {
     let start_time = Instant::now();
 
-    // Races live sources; consults disk cache only as last resort.
     let live = race_live_ip_sources().await;
     let ip = match live {
         Ok(ip) => {
@@ -570,7 +565,6 @@ mod tests {
 
     #[test]
     fn a_query_encodes_name_and_question() {
-        // Regression: QR must be 0 in a query; only RD is set.
         assert_eq!(DNS_QUERY_FLAGS, 0x0100);
         assert_eq!(DNS_QUERY_FLAGS & DNS_FLAG_QR, 0);
         let mut buffer = [0u8; DNS_QUERY_BUFFER_LEN];
@@ -621,8 +615,6 @@ mod tests {
     #[test]
     fn a_query_rejects_a_name_exactly_filling_the_buffer() {
         let mut buffer = [0u8; DNS_QUERY_BUFFER_LEN];
-        // 63+63+63+62 payload bytes land the last label end at 267, the old
-        // guard's off-by-one boundary that then wrote past the buffer.
         let name = format!(
             "{}.{}.{}.{}",
             "a".repeat(63),
@@ -654,7 +646,6 @@ mod tests {
         message.extend_from_slice(&name);
         message.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
         message.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
-        // Skips CNAME answers carrying compressed names.
         message.extend_from_slice(&[0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 0, 1, 0, 2, 0xC0, 0x0C]);
         message.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 10, 1, 2, 3]);
         assert_eq!(

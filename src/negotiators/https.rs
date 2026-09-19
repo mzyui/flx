@@ -48,7 +48,6 @@ impl NegotiatorTrait for HttpsNegotiator {
             let mut request_buf = [0u8; 1024];
             let connect_request = Self::write_connect_request(&mut request_buf, &authority);
 
-            // CONNECT only applies when tunnelling to an HTTPS target.
             if !uri.scheme().is_some_and(|s| s.as_str() == "https") {
                 anyhow::bail!("Scheme is empty or not https");
             }
@@ -59,8 +58,6 @@ impl NegotiatorTrait for HttpsNegotiator {
             );
             stream.write_all(connect_request.as_bytes()).await?;
 
-            // Read byte-by-byte: a buffered reader would swallow any bytes the
-            // upstream sends after the header, corrupting the established tunnel.
             let mut buf = Vec::with_capacity(1024);
             let mut byte = [0u8; 1];
             loop {

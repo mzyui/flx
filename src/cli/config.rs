@@ -442,8 +442,6 @@ pub fn apply_config(cli: &mut Cli, cfg: &FileConfig, matches: &ArgMatches) {
         }
         Some(Command::GeoUpdate) | Some(Command::Config(_)) | None => {}
     }
-    // Tolerate `[serve]` in files built without the feature: parse + keep it,
-    // but never fail and never apply it.
     #[cfg(not(feature = "serve"))]
     if cfg.serve.is_some() {
         #[cfg(feature = "log")]

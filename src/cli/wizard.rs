@@ -11,7 +11,6 @@ use crate::config::{
 };
 use crate::RunOutcome;
 
-// Mirror CLI defaults so generated files only carry changed values.
 const DEFAULT_FORMAT: &str = "default";
 const DEFAULT_LIMIT: usize = 0;
 const DEFAULT_CACHE_TTL: u64 = 15;
@@ -503,7 +502,7 @@ mod tests {
         let answers = Answers {
             providers: vec!["geonode".to_owned()],
             countries: vec!["US".to_owned()],
-            cache_ttl: 15, // default: must not be written
+            cache_ttl: 15,
             ..Default::default()
         };
         let cfg = build_config(&answers);

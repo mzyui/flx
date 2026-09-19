@@ -50,7 +50,7 @@ impl JudgePool {
         let mut candidates = Vec::with_capacity(urls.len());
         for url in urls {
             if !seen.insert(url.clone()) {
-                continue; // de-duplicate without a redundant preflight
+                continue;
             }
             match ValidationTarget::online(url) {
                 Ok(target) => candidates.push((url.clone(), target)),
@@ -58,7 +58,6 @@ impl JudgePool {
             }
         }
 
-        // Append passing judges immediately without waiting for stragglers.
         let pool = Arc::new(Self::empty());
         let mut tasks = JoinSet::new();
         for (url, target) in candidates {
@@ -72,13 +71,12 @@ impl JudgePool {
             });
         }
 
-        // Wait for first passing judge while still reporting early failures.
         loop {
             if !pool.is_empty() {
                 break;
             }
             match tasks.join_next().await {
-                Some(Ok((_url, Ok(())))) => {} // already appended by the task
+                Some(Ok((_url, Ok(())))) => {}
                 Some(Ok((url, Err(error)))) => on_dropped(&url, &format!("{error:#}")),
                 Some(Err(error)) => {
                     return Err(error).context("online judge preflight task failed");
@@ -93,7 +91,6 @@ impl JudgePool {
             );
         }
 
-        // Settle remaining candidates in background after first pass.
         tokio::spawn(async move {
             while let Some(joined) = tasks.join_next().await {
                 match joined {
@@ -141,7 +138,6 @@ impl JudgePool {
             let start = self.cursor.fetch_add(1, Ordering::Relaxed) % judges.len();
             candidates.push(Arc::clone(&judges[start]));
         }
-        // Order fastest judges first; unknown RTTs sink to the end.
         candidates.sort_unstable_by_key(|target| {
             let ema = target.health.rtt_ema_ms.load(Ordering::Relaxed);
             if ema == 0 {
@@ -160,7 +156,6 @@ impl JudgePool {
             .elapsed()
             .saturating_add(JUDGE_FAILURE_COOLDOWN)
             .as_millis() as u64;
-        // Update health lock-free to avoid contending on judge-list lock.
         target
             .health
             .cooldown_until_ms
@@ -177,7 +172,6 @@ impl JudgePool {
         let next = if prev == 0 {
             elapsed_ms
         } else {
-            // EMA with alpha 0.3: ema = ema*0.7 + sample*0.3
             (prev * 7 + elapsed_ms * 3) / 10
         };
         ema.store(next, Ordering::Relaxed);

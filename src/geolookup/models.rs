@@ -77,7 +77,6 @@ impl GeoData {
     }
 }
 
-// Custom serializer so empty records render as `{}`.
 impl Serialize for GeoData {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

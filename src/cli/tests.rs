@@ -685,7 +685,6 @@ fn process_result_mixed_quota_and_uncapped_fills_global_limit() {
     assert_eq!(http, 2, "capped HTTP must stop at =2");
 }
 
-// Counts upstream polls to prove filled quotas stop the stream early.
 struct CountingStream {
     items: std::vec::IntoIter<Proxy>,
     polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -912,7 +911,6 @@ fn json_empty_is_suppressed_when_requested() {
     assert_eq!(content, "");
 }
 
-// Run chained find passes against one output file.
 fn run_chained_passes(format: &str, pass1: &[Proxy], pass2: &[Proxy]) -> String {
     let rt = runtime::Builder::new_current_thread().build().unwrap();
     let (options, path) = output_options(format, 0);
@@ -1171,7 +1169,6 @@ fn json_multiple_is_valid_array() {
 
 #[test]
 fn json_one_entry_per_line_with_trailing_commas() {
-    // Guard one-entry-per-line JSON layout without blank lines.
     let proxies = [sample_proxy(1), sample_proxy(2), sample_proxy(3)];
     let out = run_json(&proxies, 0);
     let lines: Vec<&str> = out.lines().collect();
@@ -1857,7 +1854,6 @@ fn append_csv_skips_duplicate_header() {
     );
 }
 
-// Stream items then hold cancel permits like a live upstream.
 struct CancelAfterStream {
     items: std::vec::IntoIter<Proxy>,
     cancel: Arc<tokio::sync::Notify>,
@@ -1971,7 +1967,6 @@ fn second_ctrl_c_press_forces_the_exit() {
     assert!(should_force_exit(3));
 }
 
-// Record items leaking past the output limit.
 struct EarlyStopProbe {
     items: std::vec::IntoIter<Proxy>,
     allowed: usize,

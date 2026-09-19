@@ -29,6 +29,7 @@
 //! - `log` (default): emit `flx::*` records via the `log` crate.
 //! - `progress_bar` (default): CLI progress rendering.
 //! - `clap` (default): enables the `flx` binary.
+//! - `tui` (optional): interactive live view (`flx find --tui`, `flx grab --tui`).
 //! - `serve` (optional): rotating proxy endpoint (`flx serve`);
 //!   off by default while experimental.
 //!
@@ -136,7 +137,6 @@ pub fn initialize_file_logging(
 /// Where a run that owns the screen writes its log.
 #[cfg(feature = "log")]
 pub fn screen_log_path() -> anyhow::Result<std::path::PathBuf> {
-    // Reuses the database directory: the one flx path already created on demand.
     Ok(geolookup::data_dir()?.join(TUI_LOG_FILE))
 }
 
@@ -164,7 +164,6 @@ const LOG_MODULE_ROOT: &str = "flx";
 #[cfg(feature = "log")]
 fn log_module_allowed(target: &str) -> bool {
     match target.strip_prefix(LOG_MODULE_ROOT) {
-        // Matches Rust module paths split by `::`.
         Some(rest) => rest.is_empty() || rest.starts_with("::"),
         None => false,
     }
@@ -233,7 +232,6 @@ fn write_record_to(
     color: bool,
 ) -> std::io::Result<()> {
     if color {
-        // Keeps prefix bytes identical to the previous logger.
         write!(
             target,
             "\x1b[0m{}{}: {} ",
@@ -400,7 +398,6 @@ impl Iterator for ProxySource {
                     continue;
                 }
             };
-            // Pins scheme-prefixed lines; bare lines inherit defaults.
             if proxy.expected_types.is_empty() {
                 proxy.expected_types = Arc::clone(&self.default_proxy_types);
             }
@@ -535,7 +532,6 @@ mod tests {
                     .level(log::Level::Warn)
                     .args(format_args!("noise"))
                     .build(),
-                // Color is only ever requested for a terminal.
                 false,
             )
             .unwrap();

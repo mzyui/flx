@@ -19,7 +19,6 @@ use crate::{
 };
 
 const ORPHANED_TMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-// Bump on encoding or parser changes to reject stale rows.
 const CACHE_MAGIC: &[u8; 8] = b"FLXPCW02";
 const MEMO_MAX_ENTRIES: usize = 256;
 
@@ -171,8 +170,6 @@ impl Cache {
     }
 }
 
-// Row layout: IP(4) + port(2 LE) + proto code(1) + optional CONNECT port(2).
-
 fn anon_code(anonymity: Anonymity) -> u8 {
     match anonymity {
         Anonymity::Elite => 0,
@@ -217,8 +214,6 @@ fn decode_rows(body: &[u8]) -> Option<Vec<ParsedProxy>> {
         return None;
     }
     let n = u32::from_le_bytes(body[8..12].try_into().ok()?) as usize;
-    // Bound the reservation by what the body can actually hold: a corrupted
-    // header must not trigger a multi-gigabyte allocation.
     let max_rows = (body.len() - 12) / 7;
     let mut rows = Vec::with_capacity(n.min(max_rows));
     let mut cursor = 12;
@@ -292,7 +287,6 @@ mod tests {
 
     #[test]
     fn decode_rows_rejects_an_impossible_row_count() {
-        // Magic + a row count the body cannot possibly back.
         let mut body = Vec::from(&CACHE_MAGIC[..]);
         body.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode_rows(&body).is_none());

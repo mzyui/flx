@@ -10,7 +10,6 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "socks.txt".to_owned());
 
-    // SOCKS proxies have no anonymity level; they only prove tunnel capability.
     let proxies = Flx::from_file(&path)?
         .types([Protocol::Socks5])
         .collect()

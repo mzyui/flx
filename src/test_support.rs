@@ -1,4 +1,3 @@
-// Provides loopback judge fixtures for validator tests.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;

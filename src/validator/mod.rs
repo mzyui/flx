@@ -98,8 +98,6 @@ impl PauseGate {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
-            // Register before re-checking: `resume` uses `notify_waiters`, which
-            // is a no-op when no waiter is registered yet.
             notified.as_mut().enable();
             if !self.is_paused() {
                 break;
@@ -150,7 +148,6 @@ struct JudgeTargets {
     tunnel: Arc<checker::JudgePool>,
 }
 
-// Reuse verified judge pool across passes within short TTL.
 const JUDGE_POOL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -173,8 +170,6 @@ fn pool_cache() -> &'static Mutex<HashMap<PoolKey, CachedJudgePool>> {
 
 fn cached_judge_pool(urls: &[String], insecure: bool) -> Option<Arc<checker::JudgePool>> {
     let mut cache = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
-    // Prune every expired entry, not just the requested key, so abandoned
-    // configurations cannot accumulate.
     cache.retain(|_, entry| entry.created.elapsed() <= JUDGE_POOL_CACHE_TTL);
     let key = PoolKey {
         urls: urls.to_vec(),
@@ -200,7 +195,6 @@ fn cache_judge_pool(urls: &[String], insecure: bool, pool: &Arc<checker::JudgePo
         );
 }
 
-// Retry preflight once so transient blips cannot abort the run.
 async fn preflight_pool(
     urls: &[String],
     timeout: Duration,
@@ -209,7 +203,6 @@ async fn preflight_pool(
     const PREFLIGHT_RETRIES: usize = 1;
     const PREFLIGHT_RETRY_DELAY: Duration = Duration::from_secs(1);
     if let Some(pool) = cached_judge_pool(urls, insecure) {
-        // Report real counts for cached pools without rerunning preflight.
         let report = JudgeHealthReport {
             candidates: unique_count(urls),
             healthy: pool.len(),
@@ -235,7 +228,6 @@ async fn preflight_pool(
         {
             Ok(pool) => {
                 let candidates = unique_count(urls);
-                // Snapshot report once candidates resolve or short grace elapses.
                 let deadline = tokio::time::Instant::now() + timeout + Duration::from_secs(1);
                 let grace = tokio::time::Instant::now() + Duration::from_millis(250);
                 loop {
@@ -317,7 +309,6 @@ impl ProxyValidator {
         let manager_done = Arc::clone(&progress.done);
         let manager_passed = Arc::clone(&progress.passed);
         let expected: Arc<[Protocol]> = Arc::from(config.types.into_boxed_slice());
-        // Deduplicate group members to avoid double probes and records.
         let groups: Arc<Vec<Vec<Protocol>>> = Arc::new(
             config
                 .groups
@@ -336,7 +327,6 @@ impl ProxyValidator {
                 })
                 .collect(),
         );
-        // Flatten groups once to avoid per-proxy allocation.
         let group_spec: Arc<Vec<(usize, usize, Protocol)>> = Arc::from(
             groups
                 .iter()
@@ -367,7 +357,6 @@ impl ProxyValidator {
             .chain(groups.iter().flatten())
             .any(|protocol| !matches!(protocol, Protocol::Http(_)));
 
-        // Buffer source during preflight to avoid stalling the fetcher.
         let (buf_tx, buf_rx) = mpsc::channel(validator_channel_capacity(concurrency_limit));
         let proxy_source: Pin<Box<dyn Stream<Item = Proxy> + Send>> = {
             let mut src: Pin<Box<dyn Stream<Item = Proxy> + Send>> = Box::pin(proxy_source);
@@ -406,7 +395,6 @@ impl ProxyValidator {
                     .context("HTTPS online judge pool is empty after preflight")?;
             Ok::<_, anyhow::Error>(Some((pool, report)))
         };
-        // Warm public-IP cache in parallel with judge preflights.
         let my_ip_warmup = async {
             let _ = crate::resolver::my_ip().await;
         };
@@ -443,10 +431,8 @@ impl ProxyValidator {
             mpsc::Receiver<GroupWorkResult>,
         ) = mpsc::channel(validator_channel_capacity(concurrency_limit));
 
-        // Forward proxies only after every group slot reports.
         let aggregate_sender = sender.clone();
         let aggregate_progress = progress.clone();
-        // Share dead flags so failed members short-circuit siblings.
         let worker_group_dead: work::GroupDeadMap =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let group_aggregator = tokio::spawn(aggregate_groups(
@@ -473,16 +459,13 @@ impl ProxyValidator {
                 },
             }
 
-            // Clone counters for workers; total moves into job closure.
             let worker_counters = ValidationProgress {
                 total: Arc::clone(&manager_total),
                 done: Arc::clone(&manager_done),
                 passed: Arc::clone(&manager_passed),
             };
 
-            // Expand proxies into singleton plus group jobs with monotonic ids.
             let next_proxy_id = AtomicU64::new(0);
-            // Count total in job units matching done/passed increments.
             let stream_total = Arc::clone(&manager_total);
             let jobs = proxy_source.flat_map(move |proxy: Proxy| {
                 let proxy = Arc::new(proxy);
@@ -490,7 +473,6 @@ impl ProxyValidator {
                 let advertised = Arc::clone(&proxy.expected_types);
                 let has_group = !group_spec.is_empty();
 
-                // Collapse to unique probes; see `work::singleton_jobs`.
                 let singleton_jobs =
                     work::singleton_jobs(advertised.as_ref(), expected.as_ref(), probe_missed);
 
@@ -543,7 +525,6 @@ impl ProxyValidator {
                         Job::Singleton { .. } => {
                             stream_total.fetch_add(1, Ordering::Relaxed);
                         }
-                        // Count each group once via its slot-0 member.
                         Job::GroupMember { slot, .. } if *slot == 0 => {
                             stream_total.fetch_add(1, Ordering::Relaxed);
                         }
@@ -574,8 +555,6 @@ impl ProxyValidator {
                     retry_delay: config.retry_delay,
                 };
                 async move {
-                    // Hold new probes while paused; in-flight probes already
-                    // past this gate run to completion.
                     pause.wait_if_paused().await;
                     match job {
                         Job::Singleton {
@@ -583,8 +562,6 @@ impl ProxyValidator {
                             protocol,
                             requested,
                         } => {
-                            // Quota runs close filled protocols: count the job
-                            // done without probing or reporting a failure.
                             if gate.as_ref().is_some_and(|gate| !gate(requested)) {
                                 counters.done.fetch_add(1, Ordering::Relaxed);
                                 return;
@@ -641,7 +618,6 @@ impl ProxyValidator {
             })
             .await;
 
-            // Close the group channel so the aggregator drains and stops.
             drop(group_tx);
         });
 
@@ -808,7 +784,6 @@ mod tests {
         assert_eq!(finished.proxy_types[0].protocol, Protocol::Socks4);
         assert_eq!(finished.proxy_types[1].protocol, Protocol::Socks5);
         assert!(finished.to_string().contains("[SOCKS4, SOCKS5]"));
-        // Per-protocol latencies merge into one non-zero average.
         let average = finished.avg_response_time();
         assert!(
             (average - 0.4).abs() < f64::EPSILON,
@@ -844,7 +819,6 @@ mod tests {
 
     #[tokio::test]
     async fn validator_drop_closes_channel_without_panic() {
-        // Guard synchronous panic-free drop closing receiver and manager.
         let config = Config {
             types: vec![Protocol::Socks5],
             ..Config::default()
@@ -867,7 +841,6 @@ mod tests {
 
     #[tokio::test]
     async fn failure_report_emits_one_reason_per_failed_probe() {
-        // Probe closed ports via echo judge so failures stay fast and offline.
         let judge = spawn_echo_judge().await;
         let config = Config {
             types: vec![Protocol::Http(Anonymity::Unknown)],
@@ -915,7 +888,6 @@ mod tests {
 
     #[tokio::test]
     async fn progress_advances_as_candidates_are_probed() {
-        // Probe closed ports via echo judge to advance counters without passes.
         let judge = spawn_echo_judge().await;
         let config = Config {
             types: vec![Protocol::Http(Anonymity::Unknown)],
@@ -965,7 +937,6 @@ mod tests {
 
     #[tokio::test]
     async fn pause_holds_new_probes_until_resume() {
-        // Feed candidates through a channel so pause applies before any probe.
         let judge = spawn_echo_judge().await;
         let config = Config {
             types: vec![Protocol::Http(Anonymity::Unknown)],
@@ -992,7 +963,6 @@ mod tests {
             .await
             .unwrap();
         }
-        // Held jobs must not probe while paused (closed ports fail fast offline).
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(progress.done(), 0);
 
@@ -1027,7 +997,6 @@ mod tests {
 
     #[tokio::test]
     async fn judge_preflight_retries_after_transient_failure() {
-        // Guard preflight retry passing after one transient drop.
         let judge = spawn_flaky_echo_judge().await;
         let config = Config {
             types: vec![Protocol::Http(Anonymity::Unknown)],
@@ -1044,7 +1013,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_missed_types_probes_only_unmatched_types() {
-        // Probe unmatched types on closed ports for fast failures.
         let judge = spawn_echo_judge().await;
         let candidates = (1u16..=5)
             .map(|port| {
@@ -1075,7 +1043,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_missed_types_skips_already_covered_types() {
-        // Skip reprobe when advertisement already covers the request.
         let judge = spawn_echo_judge().await;
         let candidate = Proxy::with_expected_types(
             std::net::Ipv4Addr::LOCALHOST,
@@ -1101,8 +1068,6 @@ mod tests {
 
     #[tokio::test]
     async fn total_counts_each_singleton_job_not_each_proxy() {
-        // Guard job-based total matching done on multi-type runs; the two
-        // advertised families are distinct, so each yields one probe.
         let http_judge = spawn_echo_judge().await;
         let tunnel_judge = spawn_echo_judge().await;
         let candidates = (1u16..=2).map(|port| {
@@ -1131,7 +1096,6 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_http_families_collapse_to_one_probe() {
-        // Guard collapsing advertised HTTP levels that probe identically.
         let judge = spawn_echo_judge().await;
         let candidates: Vec<Proxy> = (1u16..=3)
             .map(|port| {
@@ -1157,14 +1121,12 @@ mod tests {
                 .unwrap();
         let progress = validator.progress();
         while validator.get_one().await.is_some() {}
-        // One probe per candidate, not two.
         assert_eq!(progress.total(), 3);
         assert_eq!(progress.done(), 3);
     }
 
     #[tokio::test]
     async fn group_failure_does_not_leak_to_the_next_candidate() {
-        // Guard monotonic ids keeping candidates independently probeable.
         let judge = spawn_echo_judge().await;
         let proxy_port = spawn_mock_http_proxy().await;
         let candidates = [
@@ -1198,8 +1160,6 @@ mod tests {
 
     #[tokio::test]
     async fn probe_gate_skips_closed_protocols_without_probing() {
-        // Close HTTP from the start: advertised HTTP jobs must count done
-        // without touching the judge or emitting output.
         let judge = spawn_echo_judge().await;
         let gate: ProbeGate =
             std::sync::Arc::new(|requested: Protocol| !matches!(requested, Protocol::Http(_)));
@@ -1210,7 +1170,6 @@ mod tests {
             probe_gate: Some(gate),
             ..Config::default()
         };
-        // Closed ports fail fast if anything is ever probed.
         let candidates = (1u16..=2).map(|port| {
             Proxy::with_expected_types(
                 std::net::Ipv4Addr::LOCALHOST,

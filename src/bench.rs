@@ -94,8 +94,6 @@ async fn bench_fetch_throughput() {
 #[ignore = "throughput harness; run with --release --ignored --nocapture"]
 async fn bench_validate_throughput() {
     let judge = spawn_echo_judge().await;
-    // Duplicated HTTP families so job collapsing is observable in `total`.
-    // Closed loopback ports keep probes fast and fully offline.
     let expected = Arc::from([
         Protocol::Http(Anonymity::Anonymous),
         Protocol::Http(Anonymity::Unknown),

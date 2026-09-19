@@ -51,7 +51,6 @@ impl<B: OutputGuard> OutputGuard for OutputGuardEither<B> {
 pub(crate) fn stdout_is_pipe() -> bool {
     use std::os::unix::io::AsRawFd as _;
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    // fstat cannot fail on the already-open stdout descriptor.
     (unsafe { libc::fstat(std::io::stdout().as_raw_fd(), &mut stat) } == 0)
         && stat.st_mode & libc::S_IFMT == libc::S_IFIFO
 }

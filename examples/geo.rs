@@ -9,8 +9,8 @@ use flx::Flx;
 async fn main() -> anyhow::Result<()> {
     let proxies = Flx::fetch()
         .validate_http()
-        .with_geo() // annotate every result with country/IP-class data
-        .countries(["ID".to_owned()]) // implies with_geo; keeps ISO code `ID` only
+        .with_geo()
+        .countries(["ID".to_owned()])
         .limit(10)
         .collect()
         .await?;

@@ -40,7 +40,6 @@ impl fmt::Display for FlxError {
 impl StdError for FlxError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            // Derefs anyhow errors to plain std errors.
             FlxError::Fetch(error) => Some(&**error),
             FlxError::Validate(error) => Some(&**error),
             FlxError::Geo(error) => Some(&**error),

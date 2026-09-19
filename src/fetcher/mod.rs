@@ -93,7 +93,6 @@ impl ProxyFetcher {
         if config.concurrency_limit == 0 {
             anyhow::bail!("config.concurrency_limit must be greater than zero");
         }
-        // Reject country filter without GeoIP instead of dropping everything.
         if (!config.countries.is_empty() || !config.excluded_countries.is_empty())
             && !config.enable_geo_lookup
         {
@@ -167,7 +166,6 @@ impl ProxyFetcher {
 
         let client = {
             let mut http = HttpConnector::new();
-            // Cap TCP connect so dead hosts fail fast.
             http.set_connect_timeout(Some(Duration::from_secs(6)));
             http.enforce_http(false);
             Arc::new(
@@ -182,7 +180,6 @@ impl ProxyFetcher {
         let offline = config.offline;
         let fetch_delay = config.fetch_delay;
 
-        // Proceed without caching when the cache dir is unusable.
         let fetch_cache = match config.cache_ttl {
             Some(ttl) => match cache::Cache::new(ttl, config.refresh_cache) {
                 Ok(cache) => Some(Arc::new(cache)),
@@ -199,7 +196,6 @@ impl ProxyFetcher {
         let throttle = Arc::new(Throttle::new());
         let hosts = Arc::new(HostLimiter::new(DEFAULT_HOST_CONCURRENCY_LIMIT));
 
-        // Size primary phase from accepted count without extra channel hop.
         let produced = Arc::clone(&accepted);
 
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -209,7 +205,6 @@ impl ProxyFetcher {
 
         let (stage_tx, stages) = mpsc::channel(16);
 
-        // Run primary phase, then decide fallback; stop signal aborts early.
         let coordinator = tokio::spawn({
             let sender = sender.clone();
             async move {
@@ -429,7 +424,6 @@ impl ProxyFetcher {
         };
         let result = accept_proxy(&mut ctx, proxy, |ip| {
             self.geolookup.as_ref().map(|geolookup| {
-                // Move mmdb reads off async workers; read directly inline otherwise.
                 let do_lookup = || geolookup.lookup(ip);
                 match tokio::runtime::Handle::try_current() {
                     Ok(handle)
@@ -444,7 +438,6 @@ impl ProxyFetcher {
         });
         if result.is_some() {
             if let Some(threshold) = self.config.fallback_threshold {
-                // Bump stop version exactly once via atomic compare-exchange.
                 if self.accepted.load(Ordering::Relaxed) >= threshold
                     && self
                         .stop_signaled
@@ -545,7 +538,6 @@ impl Stream for ProxyFetcher {
 
 impl Drop for ProxyFetcher {
     fn drop(&mut self) {
-        // Fail pending sends to unwind producers before aborting coordinator.
         self.receiver.close();
 
         self.coordinator.abort();
@@ -697,7 +689,6 @@ mod tests {
 
     #[test]
     fn protocol_hash_preserves_protocol_set_equality() {
-        // Guard u64 dedup key: identical sets collide, distinct sets differ.
         let http = Arc::from([Protocol::Http(Anonymity::Unknown)]);
         let socks5 = Arc::from([Protocol::Socks5]);
         let both = Arc::from([Protocol::Socks5, Protocol::Http(Anonymity::Unknown)]);
@@ -713,7 +704,6 @@ mod tests {
 
     #[test]
     fn dedup_table_is_bounded_and_evicts_oldest() {
-        // Guard bounded dedup table evicting oldest entries.
         let mut table = DedupTable::with_capacity(2);
         let base = Ipv4Addr::new(192, 0, 2, 1);
         let key = |offset: u16| (base, offset, 7u64);
@@ -823,7 +813,6 @@ mod tests {
 
     #[tokio::test]
     async fn gather_rejects_country_filter_without_geo_lookup() {
-        // Guard fast failure for country filter without GeoIP.
         let config = Config {
             countries: Arc::from(vec!["ID".to_owned()]),
             enable_geo_lookup: false,
@@ -850,13 +839,11 @@ mod tests {
 
     #[tokio::test]
     async fn gather_allows_country_filter_with_geo_lookup() {
-        // Pass guard with GeoIP on; only geo-DB errors may surface.
         let config = Config {
             countries: Arc::from(vec!["ID".to_owned()]),
             enable_geo_lookup: true,
             ..Config::default()
         };
-        // Accept success or geo-DB error, never the guard error.
         match ProxyFetcher::gather(config).await {
             Ok(_) => {}
             Err(e) => assert!(
@@ -928,7 +915,6 @@ mod tests {
 
     #[tokio::test]
     async fn stage_events_report_phases_then_done() {
-        // Disable cache to keep the run fully offline.
         let mut fetcher = ProxyFetcher::gather(Config {
             offline: true,
             cache_ttl: None,
@@ -1114,7 +1100,6 @@ mod tests {
 
     #[tokio::test]
     async fn finish_phase_returns_true_when_primary_completes() {
-        // Guard fallback proceeding when primary finishes in time.
         let mut handles = JoinSet::new();
         handles.spawn(async {});
         assert!(finish_phase(handles, Duration::from_secs(5)).await);
@@ -1152,7 +1137,6 @@ mod tests {
 
     #[tokio::test]
     async fn throttle_spaces_concurrent_same_host_requests_cumulatively() {
-        // Guard cumulative spacing for concurrent same-host requests.
         let throttle = Arc::new(Throttle::new());
         let delay = Duration::from_millis(100);
         let start = tokio::time::Instant::now();

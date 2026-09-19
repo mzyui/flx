@@ -101,7 +101,6 @@ fn is_excluded(excluded: &[Protocol], proxy: &Proxy) -> bool {
     if excluded.is_empty() {
         return false;
     }
-    // Judges unvalidated proxies by their advertised set.
     let types: Vec<Protocol> = if proxy.proxy_types.is_empty() {
         proxy.expected_types.to_vec()
     } else {

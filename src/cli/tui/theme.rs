@@ -1,13 +1,18 @@
 //! Semantic style tokens for the TUI.
 //!
-//! Call sites name a *function* (`status_error`, `text_muted`), never an
-//! appearance, so monochrome and ASCII fallbacks stay in one place. Meaning is
-//! never carried by color alone: every colored signal is paired with a symbol
-//! or a word by the caller.
+//! Call sites name a *meaning* (`status_error`, `text_muted`), never an
+//! appearance, so monochrome and ASCII fallbacks stay in one place. Every
+//! colored signal is paired with a symbol or word by the caller.
+//!
+//! Roles follow Material 3 loosely: [`accent_primary`] is M3 `primary`,
+//! [`surface_container`] is `surface-container-high` (dialog fill),
+//! [`outline`] is `outline-variant`, and `status_*` carry the conventional
+//! error/warning/info meanings. No hex is hardcoded: the 16 ANSI colors are
+//! theme variables owned by the user's terminal. Overlays use rounded borders;
+//! the main list stays borderless.
 //!
 //! The palette is installed once, before the event loop, from `--no-color` and
-//! the environment. `NO_COLOR` set to a non-empty value suppresses color the
-//! same way the flag does.
+//! the environment. A non-empty `NO_COLOR` suppresses color like the flag.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -115,8 +120,29 @@ pub(crate) fn bg_overlay() -> Style {
 }
 
 /// `accent.primary` — the mode label, the live phase, the focus ring.
+///
+/// M3 `primary`. Stays a 16-color ANSI token on purpose: the user's terminal
+/// theme owns the hue (`red` may be Material, Solarized, or Catppuccin), so no
+/// `#D0BCFF`-style hex is hardcoded here.
 pub(crate) fn accent_primary() -> Style {
     Style::default().fg(colored(Color::Cyan))
+}
+
+/// M3 `primary-container` needs no separate token: the list selection itself
+/// is `selected()` reverse video (the canonical terminal signal), which is the
+/// container contrast M3 asks for without filling whole rows.
+
+/// M3 `surface-container-high` — dialog and sheet fill.
+///
+/// Same fill as `bg_overlay`; kept as a separate name so call sites can say
+/// "surface" (M3 meaning) instead of "overlay" (position).
+pub(crate) fn surface_container() -> Style {
+    bg_overlay()
+}
+
+/// M3 `outline-variant` — dividers, gutters, unfocused rules.
+pub(crate) fn outline() -> Style {
+    text_muted()
 }
 
 /// `border.focus` — the one focused panel's border.
@@ -143,11 +169,14 @@ pub(crate) fn match_highlight() -> Style {
 }
 
 /// Border set for a panel, honoring the ASCII fallback.
+///
+/// M3 dialogs use large rounded corners, so overlays draw `ROUNDED`
+/// (`╭╮╰╯`). The main list stays borderless and never touches this.
 pub(crate) fn border_set() -> border::Set<'static> {
     if ascii() {
         ASCII_BORDER
     } else {
-        border::PLAIN
+        border::ROUNDED
     }
 }
 

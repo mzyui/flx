@@ -56,7 +56,6 @@ pub(super) async fn accept_loop(
     options: Arc<ServeOptions>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    // Run until runtime teardown aborts the task.
     let mut next_id = 0u64;
     let mut connections = JoinSet::new();
     loop {
@@ -102,7 +101,6 @@ async fn handle_connection(
     let _ = client.set_nodelay(true);
     let peer = client.peer_addr().ok();
     let started = Instant::now();
-    // Share one deadline across head, connect, handshake, and relay.
     let deadline = started + options.request_timeout;
     let expected_auth = options.auth.as_ref().map(|(user, pass)| {
         let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
@@ -219,7 +217,6 @@ async fn handle_connection(
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_default();
-            // Legacy: only the timeout decides; inner io errors still count.
             let relay_start = Instant::now();
             let (relayed, up, down) = if !sent {
                 (false, 0, 0)
@@ -353,7 +350,6 @@ async fn read_request(
         (host, uri.port_u16().unwrap_or(DEFAULT_TARGET_PORT))
     };
 
-    // Preserve bytes trailing the head for upstream replay.
     let body_start = consumed.min(head_end);
     if tunnel {
         bytes.drain(..body_start);
@@ -524,8 +520,6 @@ async fn connect_http(
     );
     let handshake = async {
         stream.write_all(request.as_bytes()).await?;
-        // Read byte-by-byte: a buffered reader would swallow bytes a
-        // speak-first upstream sends right after the header, corrupting relay.
         let mut response = Vec::with_capacity(128);
         let mut byte = [0u8; 1];
         loop {
@@ -612,7 +606,6 @@ mod tests {
             auth,
             ..ServeOptions::default()
         });
-        // Never fires: tests drive shutdown by dropping the listener task.
         tokio::spawn(accept_loop(listener, pool, options, never_shutdown()));
         address
     }
@@ -855,7 +848,6 @@ mod tests {
 
         let client =
             tokio::spawn(async move { exchange(address, plain_request(target).as_bytes()).await });
-        // Fire shutdown mid-relay, long before the slow upstream replies.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         shutdown_tx.send(true).unwrap();
 

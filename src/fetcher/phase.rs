@@ -78,7 +78,6 @@ pub enum FetchStage {
     Done,
 }
 
-// Always close with Done, even on early return.
 pub(crate) struct StageReporter {
     pub(crate) tx: mpsc::Sender<FetchStage>,
 }
@@ -118,7 +117,6 @@ pub(crate) fn spawn_phase(
         let job = FetchJob { provider, source };
         let ctx = ctx.clone();
         handles.spawn(async move {
-            // Keep the source Arc for the error path only; success never formats.
             let source = Arc::clone(&job.source);
             if let Err(e) = do_work(job, ctx).await {
                 #[cfg(feature = "log")]
@@ -157,7 +155,6 @@ impl Throttle {
         let available_at = {
             let mut next_slot = self.next_slot.lock().unwrap_or_else(|e| e.into_inner());
             let now = time::Instant::now();
-            // Reuse key allocation to avoid per-call String alloc.
             match next_slot.get_mut(host) {
                 Some(previous) => {
                     let avail_at = (*previous).max(now);
@@ -250,10 +247,7 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
                 log::warn!("offline: no cached rows for {url}; skipping");
                 return Ok(());
             }
-            // Throttle before taking a permit so a sleeping host holds no slot.
             throttle_wait(&ctx.settings, &source).await;
-            // Hold the network permit only for the fetch; parsing and cache
-            // writes must not occupy a fetch slot.
             #[cfg(feature = "log")]
             let fetch_started = time::Instant::now();
             let body = {

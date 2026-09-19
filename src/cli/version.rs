@@ -6,7 +6,6 @@ use std::{
 
 const VERSION_CHECK_URL: &str = "https://raw.githubusercontent.com/mzyui/flx/main/Cargo.toml";
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-// Cache version checks for a day to avoid per-run network hits.
 const VERSION_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn version_cache_path() -> Option<PathBuf> {

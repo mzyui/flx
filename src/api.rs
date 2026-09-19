@@ -378,7 +378,6 @@ impl Flx {
                     .await
                     .map_err(FlxError::Validate)?;
                 let progress = validator.progress();
-                // Takes failures before boxing; undrained receivers drop buffered items.
                 let failures = validator.take_failures();
                 let pause_gate = validator.pause_gate();
                 (
@@ -449,7 +448,6 @@ impl Flx {
         while let Some(proxy) = stream.next().await {
             pool.add(proxy);
         }
-        // Forces readiness; finished feeds never wait for min_ready.
         rotator.force_ready();
         let _ = server.await;
         Ok(())
@@ -939,7 +937,6 @@ mod tests {
         );
     }
 
-    // Spawns an offline echo judge for validation tests.
     async fn spawn_echo_judge() -> String {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio::net::TcpListener;
@@ -990,7 +987,6 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        // Uses closed local ports so candidates fail fast offline.
         let body: String = (1..=count)
             .map(|port| format!("127.0.0.1:{port}\n"))
             .collect();
@@ -1053,7 +1049,6 @@ mod tests {
             .expect("first item must arrive promptly");
         }
 
-        // Verifies a fresh pipeline still completes after abort.
         let judge = spawn_echo_judge().await;
         let second_path = write_candidate_file("drop-second", 2).await;
         let started = std::time::Instant::now();

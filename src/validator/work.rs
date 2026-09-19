@@ -46,7 +46,6 @@ pub(crate) struct SingletonJob {
     pub(crate) requested: Protocol,
 }
 
-// Key groups by monotonic proxy id, never reused addresses.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GroupKey {
     proxy_id: u64,
@@ -175,7 +174,6 @@ async fn run_probe(
     params: &WorkParams,
 ) -> anyhow::Result<Option<ProxyType>> {
     if let Protocol::Http(_) = protocol {
-        // Skip TCP preflight; judge request already connects and negotiates.
         let result = checker::support_http(proxy, &targets.http, params)
             .await
             .with_context(|| format!("{}: HTTP check failed", proxy.as_text()))?;
@@ -311,7 +309,6 @@ pub(crate) async fn do_group_work(
                 .clone()
         };
         if dead.load(Ordering::Relaxed) {
-            // Skip probe; sibling failure already doomed the group.
             let probe = proxy.validation_probe();
             report_failure(&failures, &probe, protocol, "group-dead".to_owned());
             let _ = group_tx
@@ -374,7 +371,6 @@ pub(crate) fn group_finish(state: GroupState) -> Option<Proxy> {
         .iter()
         .filter_map(|proxy| proxy.proxy_types.first().cloned())
         .collect();
-    // Merge per-protocol latencies as one sample per passing slot.
     merged.runtimes = RuntimeStats::default();
     for slot in &slots {
         let avg = slot.runtimes.avg();
@@ -403,7 +399,6 @@ pub(crate) async fn aggregate_groups(
             let finished = states
                 .remove(&msg.key)
                 .expect("current group state was pushed above");
-            // Evict dead flag once every member has reported.
             if let Some(map) = dead_map.as_ref() {
                 map.lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -416,7 +411,6 @@ pub(crate) async fn aggregate_groups(
                 aggregate_progress
                     .passed
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // A closed receiver simply means the consumer stopped early.
                 let _ = aggregate_sender.send(proxy).await;
             }
         }
@@ -473,7 +467,6 @@ mod tests {
         .unwrap();
         let result = group_rx.recv().await.unwrap();
         assert!(result.proxy.is_none());
-        // Guard dead flag scoping to its own proxy key.
         let guard = dead_map.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(guard.len(), 1);
         assert!(guard.values().all(|flag| flag.load(Ordering::Relaxed)));
@@ -509,7 +502,6 @@ mod tests {
             .await
             .unwrap();
         drop(group_tx);
-        // Guard dead-flag eviction on completed groups.
         assert!(pass_rx.recv().await.is_none());
         aggregator.await.unwrap();
         assert!(
