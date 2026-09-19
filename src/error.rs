@@ -89,6 +89,8 @@ impl StdError for ProxyParseError {
 pub enum ProtocolParseError {
     /// Reports an unknown protocol.
     Unknown(String),
+    /// Reports an unknown anonymity qualifier.
+    UnknownAnonymity(String),
     /// Reports an invalid CONNECT port.
     InvalidConnectPort(String),
 }
@@ -97,6 +99,9 @@ impl fmt::Display for ProtocolParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProtocolParseError::Unknown(value) => write!(f, "unknown protocol `{value}`"),
+            ProtocolParseError::UnknownAnonymity(value) => {
+                write!(f, "unknown anonymity level `{value}`")
+            }
             ProtocolParseError::InvalidConnectPort(value) => {
                 write!(f, "invalid CONNECT port `{value}`")
             }

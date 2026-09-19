@@ -218,6 +218,16 @@ impl Display for Protocol {
     }
 }
 
+fn parse_anonymity(qualifier: Option<&str>) -> Result<Anonymity, ProtocolParseError> {
+    match qualifier.map(str::trim) {
+        None | Some("") => Ok(Anonymity::Unknown),
+        Some(level) if level.eq_ignore_ascii_case("transparent") => Ok(Anonymity::Transparent),
+        Some(level) if level.eq_ignore_ascii_case("anonymous") => Ok(Anonymity::Anonymous),
+        Some(level) if level.eq_ignore_ascii_case("elite") => Ok(Anonymity::Elite),
+        Some(level) => Err(ProtocolParseError::UnknownAnonymity(level.to_string())),
+    }
+}
+
 impl FromStr for Protocol {
     type Err = ProtocolParseError;
 
@@ -225,18 +235,8 @@ impl FromStr for Protocol {
         let mut parts = s.split(':');
         let head = parts.next().unwrap_or_default();
         match head {
-            "HTTP" => Ok(Protocol::Http(match parts.next() {
-                Some("Transparent") => Anonymity::Transparent,
-                Some("Anonymous") => Anonymity::Anonymous,
-                Some("Elite") => Anonymity::Elite,
-                _ => Anonymity::Unknown,
-            })),
-            "HTTPS" => Ok(Protocol::Https(match parts.next() {
-                Some("Transparent") => Anonymity::Transparent,
-                Some("Anonymous") => Anonymity::Anonymous,
-                Some("Elite") => Anonymity::Elite,
-                _ => Anonymity::Unknown,
-            })),
+            "HTTP" => Ok(Protocol::Http(parse_anonymity(parts.next())?)),
+            "HTTPS" => Ok(Protocol::Https(parse_anonymity(parts.next())?)),
             "SOCKS4" => Ok(Protocol::Socks4),
             "SOCKS5" => Ok(Protocol::Socks5),
             "CONNECT" => parts
@@ -658,23 +658,32 @@ mod tests {
     }
 
     #[test]
-    fn typo_qualifier_falls_back_to_unknown_wildcard() {
-        // Guard fallback to Unknown on misspelled qualifier.
+    fn unknown_qualifier_rejects_typos_but_accepts_any_case() {
+        assert!("HTTP:Elit".parse::<Protocol>().is_err());
+        assert!("HTTPS:Anonimous".parse::<Protocol>().is_err());
         assert_eq!(
-            "HTTP:Elit".parse::<Protocol>().unwrap(),
+            "HTTP:elite".parse::<Protocol>().unwrap(),
+            Protocol::Http(Anonymity::Elite)
+        );
+        assert_eq!(
+            "HTTPS:ANONYMOUS".parse::<Protocol>().unwrap(),
+            Protocol::Https(Anonymity::Anonymous)
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_qualifier_stays_an_unknown_wildcard() {
+        assert_eq!(
+            "HTTP".parse::<Protocol>().unwrap(),
             Protocol::Http(Anonymity::Unknown)
         );
         assert_eq!(
-            "HTTPS:Anonimous".parse::<Protocol>().unwrap(),
-            Protocol::Https(Anonymity::Unknown)
+            "HTTP:".parse::<Protocol>().unwrap(),
+            Protocol::Http(Anonymity::Unknown)
         );
         assert_eq!(
             "HTTP:Elite".parse::<Protocol>().unwrap(),
             Protocol::Http(Anonymity::Elite)
-        );
-        assert_eq!(
-            "HTTP".parse::<Protocol>().unwrap(),
-            Protocol::Http(Anonymity::Unknown)
         );
     }
 
