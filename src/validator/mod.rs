@@ -395,11 +395,10 @@ impl ProxyValidator {
                     .context("HTTPS online judge pool is empty after preflight")?;
             Ok::<_, anyhow::Error>(Some((pool, report)))
         };
-        let my_ip_warmup = async {
+        tokio::spawn(async {
             let _ = crate::resolver::my_ip().await;
-        };
-        let (http_target, tunnel_target, _) =
-            tokio::join!(http_preflight, tunnel_preflight, my_ip_warmup);
+        });
+        let (http_target, tunnel_target) = tokio::join!(http_preflight, tunnel_preflight);
         let http_target = http_target?;
         let tunnel_target = tunnel_target?;
         let mut judge_health = JudgeHealthReport::default();
