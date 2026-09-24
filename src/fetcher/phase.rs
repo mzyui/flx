@@ -292,11 +292,14 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
             let forward_types = Arc::clone(&expected_types);
             #[cfg(feature = "log")]
             let parse_started = time::Instant::now();
+            let want_rows = ctx.settings.fetch_cache.is_some();
             let (rows, complete) = tokio::task::spawn_blocking(move || {
-                let mut rows = Vec::new();
+                let mut rows = Vec::with_capacity(if want_rows { body.len() / 16 } else { 0 });
                 let mut closed = false;
                 let mut forward = |(ip, port, protocol): ParsedProxy| {
-                    rows.push((ip, port, protocol));
+                    if want_rows {
+                        rows.push((ip, port, protocol));
+                    }
                     if closed {
                         return false;
                     }
@@ -315,8 +318,7 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
             .context("provider parser task failed")??;
             #[cfg(feature = "log")]
             log::debug!(
-                "{url}: fetched {body_len} bytes in {fetch_elapsed:?}, parsed {} rows in {:?}",
-                rows.len(),
+                "{url}: fetched {body_len} bytes in {fetch_elapsed:?}, parsed in {:?}",
                 parse_started.elapsed(),
             );
             if complete {
