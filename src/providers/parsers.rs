@@ -221,6 +221,10 @@ fn anonymity_from_str(raw: &str) -> Anonymity {
     }
 }
 
+fn valid_port(port: u16) -> Option<u16> {
+    (port != 0).then_some(port)
+}
+
 pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
     let text = text.trim();
     let head = text
@@ -239,7 +243,7 @@ pub(crate) fn parse_pair(text: &str) -> Option<(Ipv4Addr, u16)> {
 
     let mut fields = head.split(':');
     let ip = fields.next()?.trim().parse().ok()?;
-    let port = fields.next()?.trim().parse().ok()?;
+    let port = valid_port(fields.next()?.trim().parse().ok()?)?;
     Some((ip, port))
 }
 
@@ -277,6 +281,9 @@ struct GeonodeRow<'a> {
 pub fn visit_geonode(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) -> anyhow::Result<()> {
     visit_json_data::<GeonodeRow, _>(body, |row| {
         let (Ok(ip), Ok(port)) = (row.ip.parse::<Ipv4Addr>(), row.port.parse::<u16>()) else {
+            return true;
+        };
+        let Some(port) = valid_port(port) else {
             return true;
         };
         if row.protocols.is_empty() {
@@ -341,35 +348,35 @@ where
         where
             E: serde::de::Error,
         {
-            Ok(value.trim().parse::<u16>().ok())
+            Ok(value.trim().parse::<u16>().ok().and_then(valid_port))
         }
 
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
-            Ok(value.trim().parse::<u16>().ok())
+            Ok(value.trim().parse::<u16>().ok().and_then(valid_port))
         }
 
         fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
-            Ok(value.trim().parse::<u16>().ok())
+            Ok(value.trim().parse::<u16>().ok().and_then(valid_port))
         }
 
         fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
-            Ok(u16::try_from(value).ok())
+            Ok(u16::try_from(value).ok().and_then(valid_port))
         }
 
         fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
-            Ok(u16::try_from(value).ok())
+            Ok(u16::try_from(value).ok().and_then(valid_port))
         }
 
         fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
@@ -497,16 +504,18 @@ fn find_column(by_text: &HashMap<&str, usize>, lower: &[String], names: &[&str])
 }
 
 /// Parse port cell using last token to skip proxydb hidden prefix.
-fn parse_port(text: &str) -> Result<u16, std::num::ParseIntError> {
+fn parse_port(text: &str) -> Option<u16> {
     let trimmed = text.trim();
-    match trimmed.parse::<u16>() {
-        Ok(port) => Ok(port),
-        Err(error) => trimmed
+    let port = match trimmed.parse::<u16>().ok() {
+        Some(port) => port,
+        None => trimmed
             .split_whitespace()
-            .last()
-            .and_then(|token| token.trim().parse::<u16>().ok())
-            .ok_or(error),
-    }
+            .last()?
+            .trim()
+            .parse::<u16>()
+            .ok()?,
+    };
+    valid_port(port)
 }
 
 fn is_simple_text(text: &str) -> bool {
@@ -607,7 +616,7 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
             else {
                 continue;
             };
-            let (Ok(ip), Ok(port)) = (ip_cell.trim().parse::<Ipv4Addr>(), parse_port(port_cell))
+            let (Ok(ip), Some(port)) = (ip_cell.trim().parse::<Ipv4Addr>(), parse_port(port_cell))
             else {
                 continue;
             };
@@ -642,7 +651,7 @@ pub fn visit_html_table(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) 
 pub fn visit_regex_pairs(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
     for row in RE_IP_PORT_PAIR.captures_iter(body).filter_map(|caps| {
         let ip = caps.get(1)?.as_str().parse::<Ipv4Addr>().ok()?;
-        let port = caps.get(2)?.as_str().parse::<u16>().ok()?;
+        let port = valid_port(caps.get(2)?.as_str().parse::<u16>().ok()?)?;
         Some((ip, port, None))
     }) {
         if !visit(row) {
@@ -736,7 +745,7 @@ pub fn visit_json_strings(
 pub fn visit_gatherproxy(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool) {
     for row in RE_GATHERPROXY_ROW.captures_iter(body).filter_map(|caps| {
         let ip = caps.get(1)?.as_str().parse::<Ipv4Addr>().ok()?;
-        let port = caps.get(2)?.as_str().parse::<u16>().ok()?;
+        let port = valid_port(caps.get(2)?.as_str().parse::<u16>().ok()?)?;
         Some((ip, port, None))
     }) {
         if !visit(row) {
@@ -826,6 +835,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn plaintext_rejects_zero_ports() {
+        assert_eq!(parse_pair("1.2.3.4:0"), None);
+        let parsed = parse_plaintext("1.2.3.4:0\n5.6.7.8:1080\n");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].1, 1080);
+    }
+
+    #[test]
+    fn all_parsers_reject_zero_ports() {
+        assert!(parse_geonode(r#"{"data":[{"ip":"1.2.3.4","port":"0"}]}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_proxynova(r#"{"data":[{"ip":"1.2.3.4","port":0}]}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_regex_pairs("1.2.3.4:0").is_empty());
+        assert!(parse_gatherproxy(r#"{"ip": "1.2.3.4", "port": "0"}"#).is_empty());
+        let body = r#"<table><tr><th>IP</th><th>Port</th></tr>
+            <tr><td>1.2.3.4</td><td>0</td></tr></table>"#;
+        assert!(parse_html_table(body).is_empty());
     }
 
     #[test]
