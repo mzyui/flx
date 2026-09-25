@@ -105,6 +105,8 @@ pub(crate) struct App {
     pending_g: bool,
     /// Digits typed so far, waiting for `G` to turn them into a row number.
     count: Option<usize>,
+    /// True = selection sticks to the last row while the run is live.
+    follow: bool,
     spec: RunSpec,
     tx: Option<Sender<EngineEvent>>,
     rate_mark: Option<(Instant, usize)>,
@@ -137,6 +139,7 @@ impl App {
             rate: 0.0,
             pending_g: false,
             count: None,
+            follow: true,
             spec,
             tx: None,
             rate_mark: None,
@@ -166,6 +169,7 @@ impl App {
         self.confirm = None;
         self.detail_scroll = 0;
         self.view.reset_position();
+        self.follow = true;
         self.started = Some(Instant::now());
         self.run = self
             .tx
@@ -203,6 +207,7 @@ impl App {
     /// Moves the selection to a browsed row, as a mouse click does.
     pub(crate) fn select_visible(&mut self, index: usize) {
         if index < self.visible.len() {
+            self.follow = false;
             self.view.selected = index;
         }
     }
@@ -277,10 +282,12 @@ impl App {
                 }
             }
             Action::SortCycle => {
+                self.follow = false;
                 self.view.cycle_sort();
                 self.refresh_visible();
             }
             Action::OrderToggle => {
+                self.follow = false;
                 self.view.toggle_order();
                 self.refresh_visible();
             }
@@ -294,6 +301,7 @@ impl App {
                 });
             }
             Action::ClearFilter => {
+                self.follow = false;
                 self.view.filter.clear();
                 self.view.reset_position();
                 self.refresh_visible();
@@ -352,6 +360,16 @@ impl App {
             | Action::ConfirmNo => {}
         }
         view::clamp_selection(&mut self.view, rows);
+        match action {
+            Action::ScrollUp | Action::PageUp | Action::GotoTop | Action::GotoCount => {
+                self.follow = false;
+            }
+            Action::ScrollDown | Action::PageDown => {
+                self.follow = rows > 0 && self.view.selected + 1 >= rows;
+            }
+            Action::GotoBottom => self.follow = true,
+            _ => {}
+        }
     }
 
     /// Scrolls the rich detail record without moving the selected result row.
@@ -505,6 +523,7 @@ impl App {
             return;
         };
         self.view.filter = filter;
+        self.follow = false;
         self.view.reset_position();
         self.refresh_visible();
     }
@@ -538,6 +557,7 @@ impl App {
         match input.purpose {
             InputPurpose::Filter => {
                 self.view.filter = input.buffer.trim().to_owned();
+                self.follow = false;
                 self.view.reset_position();
                 self.refresh_visible();
             }
@@ -663,7 +683,11 @@ impl App {
             }
         }
         self.refresh_visible();
-        view::clamp_selection(&mut self.view, self.visible.len());
+        if self.follow && self.screen == Screen::Running && !self.visible.is_empty() {
+            self.view.selected = self.visible.len() - 1;
+        } else {
+            view::clamp_selection(&mut self.view, self.visible.len());
+        }
         self.update_rate();
     }
 
@@ -1216,5 +1240,59 @@ mod tests {
         assert_eq!(app.default_export_path(), "grab.txt");
         let app = App::new(test_spec(true));
         assert_eq!(app.default_export_path(), "find.txt");
+    }
+
+    fn push_proxy(app: &mut App, slot: usize) {
+        let last = 1 + (slot % 254) as u8;
+        let mut proxy = Proxy::new(Ipv4Addr::new(10, 0, 0, last), 8000 + slot as u16);
+        proxy.proxy_types.push(ProxyType::checked(Protocol::Socks5));
+        app.on_engine_event(EngineEvent::Proxy(Box::new(proxy)));
+    }
+
+    #[test]
+    fn a_live_tick_pins_the_selection_to_the_last_row() {
+        let mut app = app_with_results(3);
+        app.screen = Screen::Running;
+        app.on_tick();
+        assert_eq!(app.view.selected, 2);
+        push_proxy(&mut app, 3);
+        push_proxy(&mut app, 4);
+        app.on_tick();
+        assert_eq!(app.view.selected, app.visible.len() - 1);
+    }
+
+    #[test]
+    fn scrolling_up_breaks_the_follow() {
+        let mut app = app_with_results(3);
+        app.screen = Screen::Running;
+        app.on_tick();
+        app.handle_action(Action::ScrollUp);
+        assert!(!app.follow);
+        push_proxy(&mut app, 3);
+        app.on_tick();
+        assert_eq!(app.view.selected, 1);
+        assert!(!app.follow);
+    }
+
+    #[test]
+    fn going_to_the_bottom_rejoins_the_follow() {
+        let mut app = app_with_results(3);
+        app.screen = Screen::Running;
+        app.handle_action(Action::ScrollUp);
+        app.handle_action(Action::GotoBottom);
+        assert!(app.follow);
+        push_proxy(&mut app, 3);
+        app.on_tick();
+        assert_eq!(app.view.selected, app.visible.len() - 1);
+        assert!(app.follow);
+    }
+
+    #[test]
+    fn rerunning_rejoins_the_follow() {
+        let mut app = app_with_results(4);
+        app.follow = false;
+        app.handle_action(Action::Rerun);
+        assert!(app.follow);
+        assert_eq!(app.view.selected, 0);
     }
 }
