@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_BIND","DEFAULT_MIN_READY","DEFAULT_POOL_SIZE","DEFAULT_PORT","DEFAULT_REFRESH_SECS","DEFAULT_REQUEST_TIMEOUT","EVENT_CHANNEL_CAPACITY","MAX_POOL_SIZE"],"enum":["ServeEvent","Strategy"],"struct":["Rotator","RotatorPool","ServeOptions"]};
