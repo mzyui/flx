@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 use crate::{
     error::FlxError,
     proxy::models::{Anonymity, Protocol, Proxy},
-    FetcherConfig, PauseGate, ProxySource, ProxyValidator, ValidationProgress, ValidatorConfig,
+    FetcherConfig, HealthStore, PauseGate, ProxySource, ProxyStreamExt, ProxyValidator, SortKey,
+    SortOrder, ValidationProgress, ValidatorConfig,
 };
 
 /// Marks stdin as a proxy source.
@@ -66,6 +67,10 @@ pub struct Flx {
     validator_config: ValidatorConfig,
     validation_choice: ValidationChoice,
     limit: usize,
+    health_enabled: bool,
+    health_path: Option<PathBuf>,
+    min_score: Option<f64>,
+    sort: Option<(SortKey, SortOrder)>,
 }
 
 impl Default for Flx {
@@ -76,6 +81,10 @@ impl Default for Flx {
             validator_config: ValidatorConfig::default(),
             validation_choice: ValidationChoice::Unset,
             limit: 0,
+            health_enabled: false,
+            health_path: None,
+            min_score: None,
+            sort: None,
         }
     }
 }
@@ -310,6 +319,33 @@ impl Flx {
         self
     }
 
+    /// Enables the default persistent health store.
+    pub fn health(mut self) -> Self {
+        self.health_enabled = true;
+        self
+    }
+
+    /// Uses a custom persistent health store path.
+    pub fn health_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.health_enabled = true;
+        self.health_path = Some(path.into());
+        self
+    }
+
+    /// Keeps only proxies whose score reaches `minimum` (0–100).
+    pub fn min_score(mut self, minimum: f64) -> Self {
+        self.min_score = Some(minimum);
+        self.health_enabled = true;
+        self
+    }
+
+    /// Sorts output by persistent health score.
+    pub fn sort_score(mut self, order: SortOrder) -> Self {
+        self.sort = Some((SortKey::Score, order));
+        self.health_enabled = true;
+        self
+    }
+
     /// Runs the pipeline as a proxy stream.
     ///
     /// # Errors
@@ -336,8 +372,19 @@ impl Flx {
             validator_config,
             validation_choice,
             limit,
+            health_enabled,
+            health_path,
+            min_score,
+            sort,
         } = self;
 
+        if let Some(minimum) = min_score {
+            if !minimum.is_finite() || !(0.0..=100.0).contains(&minimum) {
+                return Err(FlxError::Config(
+                    "min score must be finite and between 0 and 100".to_owned(),
+                ));
+            }
+        }
         if validation_choice == ValidationChoice::Unset {
             return Err(FlxError::Config(
                 "no validation target selected; call .types(..), .groups(..), \
@@ -370,13 +417,33 @@ impl Flx {
             }
         };
 
+        let health = if health_enabled {
+            let store = match health_path {
+                Some(path) => HealthStore::open(path).await,
+                None => HealthStore::open_default().await,
+            }
+            .map_err(|error| FlxError::Io(std::io::Error::other(error)))?;
+            Some(Arc::new(store))
+        } else {
+            None
+        };
+
         let (mut output, progress, failures, pause_gate) =
             if validator_config.types.is_empty() && validator_config.groups.is_empty() {
-                (source, ValidationProgress::default(), None, None)
+                let output = if let Some(health) = health.clone() {
+                    Box::pin(source.map(move |mut proxy| {
+                        proxy.set_health_score(health.score(proxy.ip, proxy.port));
+                        proxy
+                    })) as BoxStream
+                } else {
+                    source
+                };
+                (output, ValidationProgress::default(), None, None)
             } else {
-                let mut validator = ProxyValidator::validate(source, validator_config)
-                    .await
-                    .map_err(FlxError::Validate)?;
+                let mut validator =
+                    ProxyValidator::validate_with_health(source, validator_config, health)
+                        .await
+                        .map_err(FlxError::Validate)?;
                 let progress = validator.progress();
                 let failures = validator.take_failures();
                 let pause_gate = validator.pause_gate();
@@ -388,6 +455,12 @@ impl Flx {
                 )
             };
 
+        if let Some(minimum) = min_score {
+            output = Box::pin(output.filter_min_score(minimum));
+        }
+        if let Some((key, order)) = sort {
+            output = Box::pin(output.into_sorted(key, order));
+        }
         if limit > 0 {
             output = Box::pin(output.take(limit));
         }
