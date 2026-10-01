@@ -13,7 +13,10 @@ use tokio::sync::mpsc;
 
 use super::progress::ValidationProgress;
 use super::{checker, tunnel, JudgeTargets};
-use crate::proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
+use crate::{
+    health::HealthStore,
+    proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats},
+};
 
 pub(crate) struct WorkParams {
     pub(crate) max_attempts: usize,
@@ -232,6 +235,47 @@ fn report_failure(
     }
 }
 
+async fn record_success(
+    health: &Option<Arc<HealthStore>>,
+    proxy: &mut Proxy,
+    protocol: Protocol,
+    anonymity: Option<Anonymity>,
+) {
+    let Some(health) = health else { return };
+    if let Err(error) = health
+        .record_success(
+            proxy.ip,
+            proxy.port,
+            protocol,
+            proxy.runtimes.avg(),
+            anonymity,
+        )
+        .await
+    {
+        #[cfg(feature = "log")]
+        log::warn!("failed to persist proxy health: {error:#}");
+        let _ = error;
+    }
+    proxy.set_health_score(health.score(proxy.ip, proxy.port));
+}
+
+async fn record_failure(
+    health: &Option<Arc<HealthStore>>,
+    proxy: &Proxy,
+    protocol: Protocol,
+    reason: &str,
+) {
+    let Some(health) = health else { return };
+    if let Err(error) = health
+        .record_failure(proxy.ip, proxy.port, protocol, reason)
+        .await
+    {
+        #[cfg(feature = "log")]
+        log::warn!("failed to persist proxy health: {error:#}");
+        let _ = error;
+    }
+}
+
 pub(crate) async fn do_work(
     job: SingletonJob,
     sender: mpsc::Sender<Proxy>,
@@ -239,6 +283,7 @@ pub(crate) async fn do_work(
     targets: JudgeTargets,
     params: &WorkParams,
     failures: Option<mpsc::Sender<ProxyFailure>>,
+    health: Option<Arc<HealthStore>>,
 ) -> anyhow::Result<()> {
     let SingletonJob {
         proxy,
@@ -252,19 +297,26 @@ pub(crate) async fn do_work(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match result {
         Ok(Some(proxy_type)) => {
+            let anonymity = match proxy_type.protocol {
+                Protocol::Http(level) | Protocol::Https(level) => Some(level),
+                _ => None,
+            };
             proxy.proxy_types.push(proxy_type);
+            record_success(&health, &mut proxy, protocol, anonymity).await;
             counters
                 .passed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = sender.send(proxy).await;
         }
-        Ok(None) => report_failure(&failures, &proxy, protocol, "unsatisfied".to_owned()),
-        Err(error) => report_failure(
-            &failures,
-            &proxy,
-            protocol,
-            classify_failure(&error, protocol),
-        ),
+        Ok(None) => {
+            record_failure(&health, &proxy, protocol, "unsatisfied").await;
+            report_failure(&failures, &proxy, protocol, "unsatisfied".to_owned());
+        }
+        Err(error) => {
+            let reason = classify_failure(&error, protocol);
+            record_failure(&health, &proxy, protocol, &reason).await;
+            report_failure(&failures, &proxy, protocol, reason);
+        }
     }
     Ok(())
 }
@@ -287,6 +339,7 @@ pub(crate) async fn do_group_work(
     params: &WorkParams,
     failures: Option<mpsc::Sender<ProxyFailure>>,
     dead_map: Option<GroupDeadMap>,
+    health: Option<Arc<HealthStore>>,
 ) -> anyhow::Result<()> {
     let GroupMemberJob {
         proxy,
@@ -310,6 +363,7 @@ pub(crate) async fn do_group_work(
         };
         if dead.load(Ordering::Relaxed) {
             let probe = proxy.validation_probe();
+            record_failure(&health, &probe, protocol, "group-dead").await;
             report_failure(&failures, &probe, protocol, "group-dead".to_owned());
             let _ = group_tx
                 .send(GroupWorkResult {
@@ -325,20 +379,23 @@ pub(crate) async fn do_group_work(
     let mut probe = proxy.validation_probe();
     let result = match run_probe(&mut probe, protocol, protocol, &targets, params).await {
         Ok(Some(proxy_type)) => {
+            let anonymity = match proxy_type.protocol {
+                Protocol::Http(level) | Protocol::Https(level) => Some(level),
+                _ => None,
+            };
             probe.proxy_types.push(proxy_type);
+            record_success(&health, &mut probe, protocol, anonymity).await;
             Some(probe)
         }
         Ok(None) => {
+            record_failure(&health, &probe, protocol, "unsatisfied").await;
             report_failure(&failures, &probe, protocol, "unsatisfied".to_owned());
             None
         }
         Err(error) => {
-            report_failure(
-                &failures,
-                &probe,
-                protocol,
-                classify_failure(&error, protocol),
-            );
+            let reason = classify_failure(&error, protocol);
+            record_failure(&health, &probe, protocol, &reason).await;
+            report_failure(&failures, &probe, protocol, reason);
             None
         }
     };
@@ -386,6 +443,7 @@ pub(crate) async fn aggregate_groups(
     aggregate_sender: mpsc::Sender<Proxy>,
     aggregate_progress: ValidationProgress,
     dead_map: Option<GroupDeadMap>,
+    health: Option<Arc<HealthStore>>,
 ) {
     let mut states: HashMap<GroupKey, GroupState> = HashMap::new();
     while let Some(msg) = group_rx.recv().await {
@@ -407,10 +465,11 @@ pub(crate) async fn aggregate_groups(
             aggregate_progress
                 .done
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(proxy) = group_finish(finished) {
-                aggregate_progress
-                    .passed
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(mut proxy) = group_finish(finished) {
+                if let Some(health) = &health {
+                    proxy.set_health_score(health.score(proxy.ip, proxy.port));
+                }
+                aggregate_progress.passed.fetch_add(1, Ordering::Relaxed);
                 let _ = aggregate_sender.send(proxy).await;
             }
         }
@@ -462,6 +521,7 @@ mod tests {
             &test_params(),
             None,
             Some(Arc::clone(&dead_map)),
+            None,
         )
         .await
         .unwrap();
@@ -491,6 +551,7 @@ mod tests {
             pass_tx,
             ValidationProgress::default(),
             Some(Arc::clone(&dead_map)),
+            None,
         ));
         group_tx
             .send(GroupWorkResult {

@@ -273,6 +273,18 @@ impl ProxyValidator {
     where
         S: Stream<Item = Proxy> + Send + 'static,
     {
+        Self::validate_with_health(proxy_source, config, None).await
+    }
+
+    /// Validates candidates and persists probe outcomes when a health store is provided.
+    pub async fn validate_with_health<S>(
+        proxy_source: S,
+        config: Config,
+        health: Option<Arc<crate::HealthStore>>,
+    ) -> anyhow::Result<Self>
+    where
+        S: Stream<Item = Proxy> + Send + 'static,
+    {
         if config.types.is_empty() && config.groups.is_empty() {
             anyhow::bail!("config.types and config.groups cannot both be empty; please specify at least one type.");
         }
@@ -432,6 +444,7 @@ impl ProxyValidator {
 
         let aggregate_sender = sender.clone();
         let aggregate_progress = progress.clone();
+        let aggregate_health = health.clone();
         let worker_group_dead: work::GroupDeadMap =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let group_aggregator = tokio::spawn(aggregate_groups(
@@ -439,6 +452,7 @@ impl ProxyValidator {
             aggregate_sender,
             aggregate_progress,
             Some(std::sync::Arc::clone(&worker_group_dead)),
+            aggregate_health,
         ));
 
         let manager = tokio::spawn(async move {
@@ -534,6 +548,7 @@ impl ProxyValidator {
 
             let worker_group_tx = group_tx.clone();
             let worker_failures = failure_tx.clone();
+            let worker_health = health.clone();
             let worker_pause = Arc::clone(&manager_pause);
             let worker_gate = probe_gate.clone();
             jobs.for_each_concurrent(concurrency_limit, move |job| {
@@ -544,6 +559,7 @@ impl ProxyValidator {
                 let targets = targets.clone();
                 let group_tx = worker_group_tx.clone();
                 let failures = worker_failures.clone();
+                let health = worker_health.clone();
                 let group_dead = std::sync::Arc::clone(&worker_group_dead);
                 let params = WorkParams {
                     max_attempts,
@@ -576,6 +592,7 @@ impl ProxyValidator {
                                 targets,
                                 &params,
                                 failures,
+                                health.clone(),
                             )
                             .await
                             {
@@ -605,6 +622,7 @@ impl ProxyValidator {
                                 &params,
                                 failures,
                                 Some(group_dead),
+                                health,
                             )
                             .await
                             {
