@@ -189,6 +189,7 @@ pub(crate) struct RowModel {
     /// back what the table just formatted.
     rtt: f64,
     anonymity_rank: u8,
+    score: Option<f64>,
     /// Organization name. The filter matches it, but no column shows it, so a
     /// hit here highlights nothing rather than pointing at the wrong column.
     organization: String,
@@ -213,6 +214,7 @@ impl RowModel {
             ],
             rtt: proxy.avg_response_time(),
             anonymity_rank: flx::proxy_anonymity_rank(proxy),
+            score: proxy.health_score().map(|score| score.total),
             organization: proxy.geo.aso.as_deref().unwrap_or_default().to_owned(),
         }
     }
@@ -241,13 +243,14 @@ impl Default for ViewState {
 }
 
 impl ViewState {
-    /// Cycles `None -> AvgResponseTime -> Country -> Anonymity -> None`.
+    /// Cycles through the available table sort keys.
     pub(crate) fn cycle_sort(&mut self) {
         self.sort = match self.sort {
             None => Some(SortKey::AvgResponseTime),
             Some(SortKey::AvgResponseTime) => Some(SortKey::Country),
             Some(SortKey::Country) => Some(SortKey::Anonymity),
-            Some(SortKey::Anonymity) => None,
+            Some(SortKey::Anonymity) => Some(SortKey::Score),
+            Some(SortKey::Score) => None,
         };
         self.reset_position();
     }
@@ -271,6 +274,7 @@ impl ViewState {
             Some(SortKey::AvgResponseTime) => "response-time".to_owned(),
             Some(SortKey::Country) => "country".to_owned(),
             Some(SortKey::Anonymity) => "anonymity".to_owned(),
+            Some(SortKey::Score) => "score".to_owned(),
         }
     }
 
@@ -423,11 +427,24 @@ pub(crate) fn matches_filter(row: &RowModel, filter: &str) -> bool {
         || find_match(&row.organization, filter, case).is_some()
 }
 
-fn compare(left: &RowModel, right: &RowModel, key: SortKey) -> Ordering {
+fn compare(left: &RowModel, right: &RowModel, key: SortKey, descending: bool) -> Ordering {
     match key {
         SortKey::AvgResponseTime => left.rtt.partial_cmp(&right.rtt).unwrap_or(Ordering::Equal),
         SortKey::Country => left.cells[COUNTRY_COLUMN].cmp(&right.cells[COUNTRY_COLUMN]),
         SortKey::Anonymity => left.anonymity_rank.cmp(&right.anonymity_rank),
+        SortKey::Score => match (left.score, right.score) {
+            (Some(left), Some(right)) => {
+                let ordering = left.partial_cmp(&right).unwrap_or(Ordering::Equal);
+                if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        },
     }
 }
 
@@ -441,10 +458,12 @@ pub(crate) fn visible(rows: &[RowModel], view: &ViewState) -> Vec<usize> {
         .collect();
     if let Some(key) = view.sort {
         indices.sort_by(|a, b| {
-            let ordering = compare(&rows[*a], &rows[*b], key);
-            match view.order {
-                SortOrder::Asc => ordering,
-                SortOrder::Desc => ordering.reverse(),
+            let descending = view.order == SortOrder::Desc;
+            let ordering = compare(&rows[*a], &rows[*b], key, descending);
+            if descending && key != SortKey::Score {
+                ordering.reverse()
+            } else {
+                ordering
             }
         });
     }
@@ -785,6 +804,9 @@ mod tests {
         assert_eq!(view.sort, Some(SortKey::Country));
         view.cycle_sort();
         assert_eq!(view.sort, Some(SortKey::Anonymity));
+        view.cycle_sort();
+        assert_eq!(view.sort, Some(SortKey::Score));
+        assert_eq!(view.sort_label(), "score");
         view.cycle_sort();
         assert_eq!(view.sort, None);
         assert_eq!(view.sort_label(), "arrival");

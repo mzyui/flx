@@ -128,10 +128,6 @@ pub(crate) fn accent_primary() -> Style {
     Style::default().fg(colored(Color::Cyan))
 }
 
-/// M3 `primary-container` needs no separate token: the list selection itself
-/// is `selected()` reverse video (the canonical terminal signal), which is the
-/// container contrast M3 asks for without filling whole rows.
-
 /// M3 `surface-container-high` — dialog and sheet fill.
 ///
 /// Same fill as `bg_overlay`; kept as a separate name so call sites can say
