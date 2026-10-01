@@ -15,6 +15,8 @@ pub enum SortKey {
     Country,
     /// Orders by best anonymity rank.
     Anonymity,
+    /// Orders by persistent health score.
+    Score,
 }
 
 /// Selects the direction a buffered sort applies.
@@ -45,8 +47,27 @@ pub fn sort_proxies(proxies: &mut [Proxy], key: SortKey, order: SortOrder) {
         }),
         SortKey::Country => proxies.sort_by(|a, b| a.geo.iso_code.cmp(&b.geo.iso_code)),
         SortKey::Anonymity => proxies.sort_by_key(proxy_anonymity_rank),
+        SortKey::Score => {
+            let descending = order == SortOrder::Desc;
+            proxies.sort_by(|a, b| match (a.health_score(), b.health_score()) {
+                (Some(left), Some(right)) => {
+                    let ordering = left
+                        .total
+                        .partial_cmp(&right.total)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            });
+        }
     }
-    if order == SortOrder::Desc {
+    if order == SortOrder::Desc && key != SortKey::Score {
         proxies.reverse();
     }
 }
@@ -145,6 +166,15 @@ pub trait ProxyStreamExt: Stream<Item = Proxy> + Sized {
         Filtered::new(self, move |proxy| proxy.avg_response_time() <= seconds)
     }
 
+    /// Keeps proxies reaching the minimum persistent health score.
+    fn filter_min_score(self, score: f64) -> Filtered<Self> {
+        Filtered::new(self, move |proxy| {
+            proxy
+                .health_score()
+                .is_some_and(|health| health.total >= score)
+        })
+    }
+
     /// Drops proxies matching any excluded protocol family.
     fn exclude_types(self, excluded: impl IntoIterator<Item = Protocol>) -> Filtered<Self> {
         let excluded: Arc<[Protocol]> = excluded.into_iter().collect();
@@ -167,11 +197,11 @@ impl<T: Stream<Item = Proxy>> ProxyStreamExt for T {}
 /// Applies a per-item predicate to a proxy stream.
 pub struct Filtered<S> {
     inner: Pin<Box<S>>,
-    predicate: Box<dyn Fn(&Proxy) -> bool>,
+    predicate: Box<dyn Fn(&Proxy) -> bool + Send + Sync>,
 }
 
 impl<S: Stream<Item = Proxy>> Filtered<S> {
-    fn new(inner: S, predicate: impl Fn(&Proxy) -> bool + 'static) -> Self {
+    fn new(inner: S, predicate: impl Fn(&Proxy) -> bool + Send + Sync + 'static) -> Self {
         Self {
             inner: Box::pin(inner),
             predicate: Box::new(predicate),
@@ -392,6 +422,59 @@ mod tests {
         let mut expected = times.clone();
         expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(times, expected);
+    }
+
+    #[tokio::test]
+    async fn score_filter_keeps_only_scored_proxies_above_threshold() {
+        let mut high = proxy(1);
+        high.set_health_score(Some(crate::HealthScore {
+            reliability: 100.0,
+            speed: 100.0,
+            anonymity: 100.0,
+            total: 90.0,
+        }));
+        let mut low = proxy(2);
+        low.set_health_score(Some(crate::HealthScore {
+            reliability: 50.0,
+            speed: 50.0,
+            anonymity: 50.0,
+            total: 50.0,
+        }));
+        let kept = collect(stream::iter(vec![high, low]).filter_min_score(75.0)).await;
+        assert_eq!(
+            kept.iter().map(|proxy| proxy.port).collect::<Vec<_>>(),
+            [8081]
+        );
+    }
+
+    #[test]
+    fn score_sort_keeps_missing_history_last_in_both_directions() {
+        let mut high = proxy(1);
+        high.set_health_score(Some(crate::HealthScore {
+            reliability: 100.0,
+            speed: 100.0,
+            anonymity: 100.0,
+            total: 90.0,
+        }));
+        let mut low = proxy(2);
+        low.set_health_score(Some(crate::HealthScore {
+            reliability: 50.0,
+            speed: 50.0,
+            anonymity: 50.0,
+            total: 50.0,
+        }));
+        let missing = proxy(3);
+        let mut proxies = vec![missing, low, high];
+        sort_proxies(&mut proxies, SortKey::Score, SortOrder::Desc);
+        assert_eq!(
+            proxies.iter().map(|proxy| proxy.port).collect::<Vec<_>>(),
+            [8081, 8082, 8083]
+        );
+        sort_proxies(&mut proxies, SortKey::Score, SortOrder::Asc);
+        assert_eq!(
+            proxies.iter().map(|proxy| proxy.port).collect::<Vec<_>>(),
+            [8082, 8081, 8083]
+        );
     }
 
     #[test]
