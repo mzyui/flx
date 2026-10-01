@@ -571,6 +571,12 @@ async fn run_grab(
             }
         })
     });
+    let health = open_health_store(&grab.output).await?;
+    let fetcher = if let Some(health) = health {
+        Box::pin(annotate_health(fetcher, health)) as pipeline::BoxStream
+    } else {
+        Box::pin(fetcher) as pipeline::BoxStream
+    };
     let started = std::time::Instant::now();
     let dst: Option<String> = grab
         .output
@@ -945,6 +951,7 @@ async fn run_find(
             }
         })
     };
+    let health = open_health_store(&find.output).await?;
     let warmup = make_warmup(quiet, no_color, download, false, None);
     let mut config = validator_config(&find.validator, protocols.clone(), groups.clone(), false);
     config.probe_gate = probe_gate.clone();
@@ -965,7 +972,7 @@ async fn run_find(
             recordings.clone(),
             Arc::clone(&recorded_types),
         ));
-        let validate = ProxyValidator::validate(source, config);
+        let validate = ProxyValidator::validate_with_health(source, config, health.clone());
         tokio::pin!(validate);
         let pass = tokio::select! {
             pass = &mut validate => pass.context("failed to start proxy validator")?,
@@ -994,7 +1001,7 @@ async fn run_find(
             recordings.clone(),
             Arc::clone(&recorded_types),
         ));
-        let validate = ProxyValidator::validate(source, config);
+        let validate = ProxyValidator::validate_with_health(source, config, health.clone());
         tokio::pin!(validate);
         let pass = tokio::select! {
             pass = &mut validate => pass.context("failed to start proxy validator")?,
@@ -1117,7 +1124,11 @@ async fn run_find(
 
         let mut config2 = validator_config(&find.validator, requested, Vec::new(), true);
         config2.probe_gate = probe_gate.clone();
-        let validate2 = ProxyValidator::validate(futures_util::stream::iter(candidates), config2);
+        let validate2 = ProxyValidator::validate_with_health(
+            futures_util::stream::iter(candidates),
+            config2,
+            health.clone(),
+        );
         tokio::pin!(validate2);
         let mut pass2 = tokio::select! {
             pass = &mut validate2 => pass.context("failed to start proxy validator")?,

@@ -9,10 +9,36 @@ use std::sync::{Arc, Mutex};
 use flx::proxy::models::{Anonymity, Protocol, Proxy};
 use futures_util::{Stream, StreamExt};
 
-use crate::argument::{FetcherArgs, ValidatorArgs};
+use crate::argument::{FetcherArgs, OutputOptions, ValidatorArgs};
 use crate::quotas::QuotaEnforcer;
 
 pub(crate) type BoxStream = std::pin::Pin<Box<dyn Stream<Item = Proxy> + Send>>;
+
+pub(crate) async fn open_health_store(
+    options: &OutputOptions,
+) -> anyhow::Result<Option<std::sync::Arc<flx::HealthStore>>> {
+    if options.no_health {
+        return Ok(None);
+    }
+    let store = match &options.health_file {
+        Some(path) => flx::HealthStore::open(path).await?,
+        None => flx::HealthStore::open_default().await?,
+    };
+    Ok(Some(std::sync::Arc::new(store)))
+}
+
+pub(crate) fn annotate_health<S>(
+    source: S,
+    health: std::sync::Arc<flx::HealthStore>,
+) -> impl Stream<Item = Proxy>
+where
+    S: Stream<Item = Proxy>,
+{
+    source.map(move |mut proxy| {
+        proxy.set_health_score(health.score(proxy.ip, proxy.port));
+        proxy
+    })
+}
 
 pub(crate) async fn file_source(paths: &[std::path::PathBuf]) -> anyhow::Result<BoxStream> {
     let proxies = flx::load_proxy_files(paths.to_owned()).await?;

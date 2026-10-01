@@ -45,6 +45,9 @@ pub struct OutputSection {
     pub levels: Option<Vec<String>>,
     pub max_response_time: Option<f64>,
     pub min_response_time: Option<f64>,
+    pub min_score: Option<f64>,
+    pub health_file: Option<PathBuf>,
+    pub no_health: Option<bool>,
     pub exclude_types: Option<Vec<String>>,
     pub shuffle: Option<bool>,
     pub append: Option<bool>,
@@ -190,7 +193,13 @@ pub(crate) const FORMATS: &[&str] = &[
     "pac",
     "proxychains",
 ];
-const SORTS: &[&str] = &["avg-response", "response-time", "country", "anonymity"];
+const SORTS: &[&str] = &[
+    "avg-response",
+    "response-time",
+    "country",
+    "anonymity",
+    "score",
+];
 const ORDERS: &[&str] = &["asc", "desc"];
 pub(crate) const ANONYMITY_LEVELS: &[&str] = &["transparent", "anonymous", "elite", "unknown"];
 
@@ -209,6 +218,13 @@ fn validate_enum_values(cfg: &FileConfig) -> Result<(), ConfigError> {
         )?;
         for level in o.levels.iter().flatten() {
             ensure_member(Some(level), ANONYMITY_LEVELS, "output.levels")?;
+        }
+        if let Some(score) = o.min_score {
+            if !score.is_finite() || !(0.0..=100.0).contains(&score) {
+                return Err(ConfigError::message(
+                    "`output.min_score` must be finite and between 0 and 100",
+                ));
+            }
         }
         for token in o.exclude_types.iter().flatten() {
             ensure_valid_type(token, "output.exclude_types")?;
@@ -314,6 +330,9 @@ overlay_section!(OutputSection {
     levels,
     max_response_time,
     min_response_time,
+    min_score,
+    health_file,
+    no_health,
     exclude_types,
     shuffle,
     append,
@@ -614,6 +633,24 @@ fn apply_output(cli: &mut OutputOptions, cfg: Option<&OutputSection>, sub: Optio
         Some
     );
     apply_field!(
+        provided(sub, "min_score"),
+        &cfg.min_score,
+        cli.min_score,
+        Some
+    );
+    apply_field!(
+        provided(sub, "health_file"),
+        &cfg.health_file,
+        cli.health_file,
+        Some
+    );
+    apply_field!(
+        provided(sub, "no_health"),
+        &cfg.no_health,
+        cli.no_health,
+        |v| v
+    );
+    apply_field!(
         provided(sub, "exclude_type"),
         &cfg.exclude_types,
         cli.exclude_type,
@@ -759,8 +796,11 @@ pub fn template() -> &'static str {
 # format = "default"                       # default|text|json|json-lines|pretty-json|csv|prefix|pac|proxychains
 # limit = 50
 # output_file = "proxies.csv"              # relative to the current directory
-# sort = "response-time"                   # avg-response|response-time|country|anonymity
+# sort = "response-time"                   # avg-response|response-time|country|anonymity|score
 # order = "asc"                            # asc|desc
+# min_score = 75.0                         # persistent health score, 0–100
+# health_file = "~/.local/share/flx/health/health.jsonl"
+# no_health = false
 # shuffle = false
 # append = false
 # min_anonymity = "anonymous"              # transparent|anonymous|elite|unknown

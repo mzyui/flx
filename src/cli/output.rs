@@ -159,6 +159,7 @@ fn sort_proxies(proxies: &mut [Proxy], sort: &str, order: Option<&str>) {
     let key = match sort {
         "avg-response" | "response-time" => flx::SortKey::AvgResponseTime,
         "country" => flx::SortKey::Country,
+        "score" => flx::SortKey::Score,
         _ => flx::SortKey::Anonymity,
     };
     let order = if order == Some("desc") {
@@ -312,7 +313,10 @@ where
                             }
                         }
                         buffered.push(proxy);
-                        if options.limit > 0 && buffered.len() >= options.limit {
+                        if options.limit > 0
+                            && options.sort.as_deref() != Some("score")
+                            && buffered.len() >= options.limit
+                        {
                             break;
                         }
                         if quotas_satisfied(&quotas) {

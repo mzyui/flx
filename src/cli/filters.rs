@@ -29,6 +29,7 @@ pub struct ProxyFilter {
     levels: Vec<Anonymity>,
     min_response_time: Option<f64>,
     max_response_time: Option<f64>,
+    min_score: Option<f64>,
     exclude_types: Vec<Protocol>,
 }
 
@@ -46,6 +47,7 @@ impl ProxyFilter {
                 .collect(),
             min_response_time: options.min_response_time,
             max_response_time: options.max_response_time,
+            min_score: options.min_score,
             exclude_types: options
                 .exclude_type
                 .iter()
@@ -70,6 +72,14 @@ impl ProxyFilter {
             })
         {
             return false;
+        }
+        if let Some(min_score) = self.min_score {
+            if !proxy
+                .health_score()
+                .is_some_and(|score| score.total >= min_score)
+            {
+                return false;
+            }
         }
         let response_time = proxy.avg_response_time();
         if let Some(min_time) = self.min_response_time {

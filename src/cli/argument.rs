@@ -18,6 +18,16 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+fn parse_score(value: &str) -> Result<f64, String> {
+    let score: f64 = value
+        .parse()
+        .map_err(|_| format!("{value} is not a valid score"))?;
+    if !score.is_finite() || !(0.0..=100.0).contains(&score) {
+        return Err(format!("{value} must be finite and between 0 and 100"));
+    }
+    Ok(score)
+}
+
 #[derive(Clone)]
 struct TypesValueParser;
 
@@ -133,7 +143,7 @@ pub struct OutputOptions {
         default_value = "default",
         help_heading = "Output",
         value_parser([
-            PossibleValue::new("csv").help("Comma-separated ip,port,type,response_time,country,ip_type,asn,aso"),
+            PossibleValue::new("csv").help("Comma-separated ip,port,type,response_time,country,ip_type,asn,aso (score is available in JSON)"),
             PossibleValue::new("default").help("Human-readable summary (json-lines when piped; -o infers format from extension)"),
             PossibleValue::new("json").help("Compact JSON array"),
             PossibleValue::new("json-lines").help("One JSON object per line"),
@@ -164,6 +174,7 @@ pub struct OutputOptions {
             PossibleValue::new("country").help("Country ISO code"),
             PossibleValue::new("anonymity").help("Anonymity level"),
             PossibleValue::new("response-time").help("Response time"),
+            PossibleValue::new("score").help("Persistent health score"),
         ])
     )]
     pub sort: Option<String>,
@@ -210,6 +221,18 @@ pub struct OutputOptions {
     /// Drop proxies faster than this many seconds.
     #[arg(long, help_heading = "Filtering")]
     pub min_response_time: Option<f64>,
+
+    /// Only keep proxies whose persistent health score reaches this value (0–100).
+    #[arg(long, value_parser = parse_score, help_heading = "Filtering")]
+    pub min_score: Option<f64>,
+
+    /// Read and update health history at this path instead of the default.
+    #[arg(long, help_heading = "Health")]
+    pub health_file: Option<PathBuf>,
+
+    /// Disable loading and writing persistent health history.
+    #[arg(long, help_heading = "Health")]
+    pub no_health: bool,
 
     /// Skip proxies supporting one of these protocol types.
     #[arg(long, num_args(1..), value_parser = TypesValueParser, help_heading = "Filtering")]
