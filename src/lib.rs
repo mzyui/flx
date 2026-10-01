@@ -48,6 +48,7 @@ pub mod error;
 pub mod fetcher;
 pub mod filters;
 pub mod geolookup;
+pub mod health;
 
 #[cfg(test)]
 mod bench;
@@ -84,6 +85,7 @@ pub use geolookup::models::GeoData;
 pub use geolookup::{
     install_download_observer, sync_database, DownloadProgress, GeoLookup, IpType, SyncOutcome,
 };
+pub use health::{HealthScore, HealthStats, HealthStore};
 pub use providers::all_providers;
 pub use providers::models::{ProviderTier, ScrapeMode, Source};
 pub use providers::ProxyProvider;
@@ -99,10 +101,10 @@ pub use validator::{
 pub mod prelude {
     pub use crate::{
         all_providers, load_proxy_files, sync_database, Anonymity, FetcherConfig, Flx, FlxError,
-        GeoData, GeoLookup, IpType, JudgeHealthReport, PauseGate, ProbeGate, Protocol, Proxy,
-        ProxyFailure, ProxyFetcher, ProxyParseError, ProxySource, ProxyStreamExt, ProxyType,
-        ProxyValidator, RuntimeStats, ScrapeMode, SortKey, SortOrder, Source, SyncOutcome,
-        ValidationProgress, ValidationRun, ValidatorConfig,
+        GeoData, GeoLookup, HealthScore, HealthStats, HealthStore, IpType, JudgeHealthReport,
+        PauseGate, ProbeGate, Protocol, Proxy, ProxyFailure, ProxyFetcher, ProxyParseError,
+        ProxySource, ProxyStreamExt, ProxyType, ProxyValidator, RuntimeStats, ScrapeMode, SortKey,
+        SortOrder, Source, SyncOutcome, ValidationProgress, ValidationRun, ValidatorConfig,
     };
 }
 
