@@ -284,11 +284,24 @@ fn validation_filter_flags_are_accepted() {
         "1.5",
         "--min-response-time",
         "0.5",
+        "--min-score",
+        "75",
+        "--sort",
+        "score",
+        "--health-file",
+        "health.jsonl",
     ]);
     assert_eq!(args.output.min_anonymity.as_deref(), Some("anonymous"));
     assert_eq!(args.output.max_response_time, Some(1.5));
     assert_eq!(args.output.min_response_time, Some(0.5));
+    assert_eq!(args.output.min_score, Some(75.0));
+    assert_eq!(args.output.sort.as_deref(), Some("score"));
+    assert_eq!(
+        args.output.health_file.as_deref(),
+        Some(std::path::Path::new("health.jsonl"))
+    );
     assert!(Cli::try_parse_from(["flx", "find", "--min-anonymity", "super"]).is_err());
+    assert!(Cli::try_parse_from(["flx", "find", "--min-score", "101"]).is_err());
 }
 
 #[test]
@@ -446,6 +459,9 @@ fn output_options(format: &str, limit: usize) -> (OutputOptions, std::path::Path
             levels: Vec::new(),
             min_response_time: None,
             max_response_time: None,
+            min_score: None,
+            health_file: None,
+            no_health: false,
             sort: None,
             order: "asc".to_owned(),
             exclude_type: Vec::new(),
