@@ -12,9 +12,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{error::ProtocolParseError, error::ProxyParseError, geolookup::models::GeoData};
+use crate::{
+    error::ProtocolParseError, error::ProxyParseError, geolookup::models::GeoData,
+    health::HealthScore,
+};
 
 /// Running response-time statistics for one proxy.
 ///
@@ -92,7 +95,7 @@ impl RuntimeStats {
 /// let elite = Protocol::Http(Anonymity::Elite);
 /// assert!(matches!(elite, Protocol::Http(Anonymity::Elite)));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Anonymity {
     /// Server sees neither client IP nor proxy usage.
     Elite,
@@ -316,6 +319,7 @@ pub struct Proxy {
     pub expected_types: Arc<[Protocol]>,
     /// Protocols that passed validation.
     pub proxy_types: Vec<ProxyType>,
+    pub(crate) health_score: Option<HealthScore>,
     pub(crate) text: Arc<str>,
 }
 
@@ -325,7 +329,7 @@ impl serde::Serialize for Proxy {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct as _;
-        let mut state = serializer.serialize_struct("Proxy", 8)?;
+        let mut state = serializer.serialize_struct("Proxy", 9)?;
         state.serialize_field("ip", &self.ip)?;
         state.serialize_field("port", &self.port)?;
         state.serialize_field("geo", &self.geo)?;
@@ -334,6 +338,9 @@ impl serde::Serialize for Proxy {
         state.serialize_field("max_response_time", &self.runtimes.max)?;
         state.serialize_field("response_time_samples", &self.runtimes.count)?;
         state.serialize_field("type", &self.proxy_types)?;
+        if let Some(score) = self.health_score {
+            state.serialize_field("score", &score.total)?;
+        }
         state.end()
     }
 }
@@ -361,6 +368,7 @@ impl Proxy {
             runtimes: RuntimeStats::default(),
             expected_types: Arc::from([]),
             proxy_types: Vec::new(),
+            health_score: None,
             text: Arc::from(text.as_ref()),
         }
     }
@@ -413,6 +421,7 @@ impl Proxy {
             runtimes: self.runtimes,
             expected_types: Arc::from([]),
             proxy_types: Vec::new(),
+            health_score: self.health_score,
             text: Arc::clone(&self.text),
         }
     }
@@ -437,6 +446,16 @@ impl Proxy {
     /// ```
     pub fn avg_response_time(&self) -> f64 {
         self.runtimes.avg()
+    }
+
+    /// Returns the persistent health score, when history is available.
+    pub fn health_score(&self) -> Option<HealthScore> {
+        self.health_score
+    }
+
+    /// Attaches a score loaded from a [`HealthStore`](crate::HealthStore).
+    pub fn set_health_score(&mut self, score: Option<HealthScore>) {
+        self.health_score = score;
     }
 
     /// Format proxy as ip:port text.
