@@ -8,7 +8,8 @@ Fast proxy scraper and validator written in Rust. Collects free proxies from 12 
 
 - Scrape from 12 primary providers + GitHub raw mirrors, or plug in your own plaintext source
 - Validate with end-to-end deadlines over hyper + rustls, with anti-replay judge tokens
-- Filter and sort by protocol, anonymity level, country, IP type (residential / datacenter / mobile), and response time
+- Filter and sort by protocol, anonymity level, country, IP type (residential / datacenter / mobile), response time, and persistent health score
+- Persistent JSONL health history with reliability, speed, and anonymity scoring
 - GeoIP via GeoLite2 City + ASN, with a one-command database sync
 - 9 output formats including JSON, CSV, PAC, and proxychains config
 - Streaming-first pipeline with backpressure, atomic parse cache, and graceful Ctrl+C finalization
@@ -110,7 +111,17 @@ flx find -l 5 -f pac -o proxy.pac
 flx find -a elite --levels anonymous elite
 flx find --max-response-time 2 --min-response-time 0.1 --exclude-type SOCKS4
 flx find -s response-time --order desc --shuffle
+flx find --min-score 75 --sort score --order desc
+flx find --min-score 75 --health-file ./health.jsonl --format json-lines
 ```
+
+`flx` stores health history by default at `<data-dir>/flx/health/health.jsonl`; use `--health-file` for another path or `--no-health` to disable it. Scores range from 0 to 100:
+
+- Reliability contributes 60% (`successful probes / all probes`).
+- Speed contributes 25% and decreases linearly from 100 at 0 seconds to 0 at 5 seconds.
+- Best observed HTTP(S) anonymity contributes 15% (`transparent=0`, `anonymous=50`, `elite=100`).
+
+A proxy without history has no score and is excluded by `--min-score`. A score describes previous flx probes, not a guarantee that the proxy is currently available.
 
 ### GeoIP
 
@@ -150,15 +161,20 @@ flx --config ./custom.toml find
 flx --no-config find
 ```
 
+`[output]` juga menerima `min_score`, `sort = "score"`, `health_file`, dan `no_health`.
+
 ## Library usage
 
 The `Flx` builder mirrors the CLI defaults:
 
 ```rust
-use flx::{Anonymity, Flx, Protocol};
+use flx::{Anonymity, Flx, Protocol, SortOrder};
 
 let proxies = Flx::fetch()
     .types([Protocol::Http(Anonymity::Elite)])
+    .health_file("./health.jsonl")
+    .min_score(75.0)
+    .sort_score(SortOrder::Desc)
     .countries(["US", "DE"])
     .limit(20)
     .collect()
