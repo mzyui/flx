@@ -21,7 +21,7 @@ impl ProxyProvider for FreeProxyWorldProvider {
             (1..=MAX_PAGES)
                 .map(|page| {
                     let url = format!(
-                        "https://freeproxy.world/?type=&anonymity=&country=&speed=&port=&page={}",
+                        "https://www.freeproxy.world/?type=&anonymity=&country=&speed=&port=&page={}",
                         page
                     );
                     Source::http(&url).map(|source| {
