@@ -1,12 +1,12 @@
 # flx
 
-Fast proxy scraper and validator written in Rust. Collects free proxies from 12 primary providers + GitHub raw mirrors, validates them against online judges (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT), filters by anonymity, country, IP type, and response time, and exports in 9 formats. Ships as a CLI (`flx`) and a Rust library.
+Fast proxy scraper and validator written in Rust. Collects free proxies from 12 primary providers + 2 fallback providers, validates them against online judges (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT), filters by anonymity, country, IP type, and response time, and exports in 9 formats. Ships as a CLI (`flx`) and a Rust library.
 
 ![demo](https://vhs.charm.sh/vhs-3tm46j5tEl6LYWePbsAuOw.gif)
 
 ## Features
 
-- Scrape from 12 primary providers + GitHub raw mirrors, or plug in your own plaintext source
+- Scrape from 12 primary providers + 2 fallback providers, or plug in your own plaintext source
 - Validate with end-to-end deadlines over hyper + rustls, with anti-replay judge tokens
 - Filter and sort by protocol, anonymity level, country, IP type (residential / datacenter / mobile), response time, and persistent health score
 - Persistent JSONL health history with reliability, speed, and anonymity scoring
@@ -136,6 +136,7 @@ flx find -c US,DE --exclude-country RU,CN -l 5
 
 ```bash
 flx find --list-providers
+flx find -p proxmint,proxio --exclude-provider stormsia
 flx find -p geonode,proxyscrape --exclude-provider github-raw
 flx find --source-url https://example.com/proxies.txt
 flx find --offline --cache-ttl 30 --refresh-cache

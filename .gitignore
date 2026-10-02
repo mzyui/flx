@@ -13,6 +13,7 @@ target/criterion/
 *.pdb
 
 dev/
+docs/
 
 # Local agent instructions, never committed
 AGENTS.md

@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "flx"
-version = "0.3.0-beta.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
