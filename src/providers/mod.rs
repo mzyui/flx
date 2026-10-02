@@ -43,6 +43,7 @@ mod proxylist_org;
 mod proxynova;
 mod proxyscrape;
 mod spys_one;
+mod stormsia;
 
 /// Provider scraping `free-proxy-list.net` HTML tables.
 pub use free_proxy_list::FreeProxyListProvider;
@@ -70,6 +71,8 @@ pub use proxynova::ProxyNovaProvider;
 pub use proxyscrape::ProxyscrapeProvider;
 /// Provider scraping `spys.one` listings.
 pub use spys_one::SpysOneProvider;
+/// Provider scraping the Stormsia JSON feed.
+pub use stormsia::StormsiaProvider;
 
 /// Scheduling tier used to order provider fetches.
 pub use models::ProviderTier;
@@ -90,6 +93,7 @@ pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
         std::sync::Arc::new(HideMyNameProvider),
         std::sync::Arc::new(SpysOneProvider),
         std::sync::Arc::new(GithubRepoProvider),
+        std::sync::Arc::new(StormsiaProvider),
     ]
 }
 
@@ -345,6 +349,7 @@ pub trait ProxyProvider {
                 ScrapeMode::RegexPairs => parsers::visit_regex_pairs(&body, &mut forward),
                 ScrapeMode::Base64Rows => parsers::visit_base64_rows(&body, &mut forward),
                 ScrapeMode::JsonStringArray => parsers::visit_json_strings(&body, &mut forward)?,
+                ScrapeMode::StormsiaJson => parsers::visit_stormsia_json(&body, &mut forward)?,
                 ScrapeMode::GatherProxyJs => parsers::visit_gatherproxy(&body, &mut forward),
             }
             Ok::<(), anyhow::Error>(())
@@ -368,6 +373,7 @@ pub(crate) fn visit(
         ScrapeMode::RegexPairs => parsers::visit_regex_pairs(body, on_row),
         ScrapeMode::Base64Rows => parsers::visit_base64_rows(body, on_row),
         ScrapeMode::JsonStringArray => parsers::visit_json_strings(body, on_row)?,
+        ScrapeMode::StormsiaJson => parsers::visit_stormsia_json(body, on_row)?,
         ScrapeMode::GatherProxyJs => parsers::visit_gatherproxy(body, on_row),
     }
     Ok(())
@@ -977,9 +983,39 @@ mod tests {
 
     #[test]
     fn all_providers_includes_new_sources() {
-        let names = provider_names(&super::all_providers());
-        for name in ["hproxy", "proxydb", "hidemy.name", "spys.one"] {
+        let providers = super::all_providers();
+        let names = provider_names(&providers);
+        for name in [
+            "hproxy",
+            "proxydb",
+            "hidemy.name",
+            "spys.one",
+            "github-raw",
+            "stormsia",
+        ] {
             assert!(names.contains(&name), "missing provider {name}");
+        }
+        assert!(!names.contains(&"gfp"));
+        assert_eq!(names.len(), 14);
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            names.len()
+        );
+    }
+
+    #[test]
+    fn new_provider_tiers_separate_primary_and_fallback_sources() {
+        let providers = super::all_providers();
+        let primary: [&str; 0] = [];
+        let fallback = ["github-raw", "stormsia"];
+
+        for provider in &providers {
+            if primary.contains(&provider.name()) {
+                assert_eq!(provider.tier(), super::ProviderTier::Primary);
+            }
+            if fallback.contains(&provider.name()) {
+                assert_eq!(provider.tier(), super::ProviderTier::Fallback);
+            }
         }
     }
 }

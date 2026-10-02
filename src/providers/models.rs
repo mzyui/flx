@@ -34,6 +34,8 @@ pub enum ScrapeMode {
     Base64Rows,
     /// JSON array of `ip:port` strings.
     JsonStringArray,
+    /// Stormsia JSON array of `{ protocol, host, port }` rows.
+    StormsiaJson,
     /// GatherProxy `gp.insertPrx({...})` script rows.
     GatherProxyJs,
 }

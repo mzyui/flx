@@ -684,6 +684,70 @@ pub fn visit_base64_rows(body: &str, mut visit: impl FnMut(ParsedProxy) -> bool)
     }
 }
 
+#[derive(Deserialize)]
+struct StormsiaRow<'a> {
+    #[serde(borrow)]
+    protocol: Cow<'a, str>,
+    #[serde(borrow)]
+    host: Cow<'a, str>,
+    #[serde(deserialize_with = "deserialize_port")]
+    port: Option<u16>,
+}
+
+/// Visits Stormsia JSON rows with explicit protocol, host, and port fields.
+///
+/// Invalid rows and unknown protocols are skipped. Returning `false` from
+/// `visit` stops deserialization early.
+pub fn visit_stormsia_json(
+    body: &str,
+    mut visit: impl FnMut(ParsedProxy) -> bool,
+) -> anyhow::Result<()> {
+    let stopped = Cell::new(false);
+
+    struct RowsVisitor<'a> {
+        visit: &'a mut dyn FnMut(ParsedProxy) -> bool,
+        stopped: &'a Cell<bool>,
+    }
+
+    impl<'de> Visitor<'de> for RowsVisitor<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON array of Stormsia proxy rows")
+        }
+
+        fn visit_seq<A>(self, mut rows: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while let Some(row) = rows.next_element::<StormsiaRow<'de>>()? {
+                let Some(protocol) = protocol_from_str(row.protocol.as_ref()) else {
+                    continue;
+                };
+                let (Ok(ip), Some(port)) = (row.host.parse::<Ipv4Addr>(), row.port) else {
+                    continue;
+                };
+                if !(self.visit)((ip, port, Some(protocol))) {
+                    self.stopped.set(true);
+                    return Err(A::Error::custom(VISITOR_STOPPED));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let result = deserializer.deserialize_seq(RowsVisitor {
+        visit: &mut visit,
+        stopped: &stopped,
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(_error) if stopped.get() => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Visits untyped proxies from a JSON array of `ip:port` strings.
 ///
 /// Unparseable strings are skipped; returning `false` from `visit` stops
@@ -815,6 +879,16 @@ fn parse_json_strings(body: &str) -> anyhow::Result<Vec<ParsedProxy>> {
 }
 
 #[cfg(test)]
+fn parse_stormsia(body: &str) -> anyhow::Result<Vec<ParsedProxy>> {
+    let mut rows = Vec::new();
+    visit_stormsia_json(body, |row| {
+        rows.push(row);
+        true
+    })?;
+    Ok(rows)
+}
+
+#[cfg(test)]
 fn parse_gatherproxy(body: &str) -> Vec<ParsedProxy> {
     collect_rows(|visit| visit_gatherproxy(body, visit))
 }
@@ -843,6 +917,60 @@ mod tests {
         let parsed = parse_plaintext("1.2.3.4:0\n5.6.7.8:1080\n");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].1, 1080);
+    }
+
+    #[test]
+    fn stormsia_maps_protocols_and_accepts_numeric_or_string_ports() {
+        let body = r#"[
+            {"protocol":"http","host":"192.0.2.1","port":8080},
+            {"protocol":"https","host":"192.0.2.2","port":"8443"},
+            {"protocol":"socks4","host":"192.0.2.3","port":1080},
+            {"protocol":"socks5","host":"192.0.2.4","port":1081}
+        ]"#;
+        let parsed = parse_stormsia(body).unwrap();
+
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].2, Some(Protocol::Http(Anonymity::Unknown)));
+        assert_eq!(parsed[1].2, Some(Protocol::Https(Anonymity::Unknown)));
+        assert_eq!(parsed[2].2, Some(Protocol::Socks4));
+        assert_eq!(parsed[3].2, Some(Protocol::Socks5));
+        assert_eq!(parsed[1].1, 8443);
+    }
+
+    #[test]
+    fn stormsia_skips_invalid_rows_and_unknown_protocols() {
+        let body = r#"[
+            {"protocol":"http","host":"192.0.2.1","port":8080},
+            {"protocol":"http","host":"not-an-ip","port":8080},
+            {"protocol":"http","host":"192.0.2.2","port":0},
+            {"protocol":"other","host":"192.0.2.3","port":8080},
+            {"protocol":"socks5","host":"192.0.2.4","port":65536}
+        ]"#;
+
+        assert_eq!(parse_stormsia(body).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stormsia_rejects_non_array_json() {
+        assert!(parse_stormsia(r#"{"data":[]}"#).is_err());
+        assert!(parse_stormsia("not json").is_err());
+    }
+
+    #[test]
+    fn stormsia_stops_after_callback_returns_false() {
+        let body = r#"[
+            {"protocol":"http","host":"192.0.2.1","port":8080},
+            INVALID
+        ]"#;
+        let mut visited = 0;
+
+        visit_stormsia_json(body, |_| {
+            visited += 1;
+            false
+        })
+        .unwrap();
+
+        assert_eq!(visited, 1);
     }
 
     #[test]
