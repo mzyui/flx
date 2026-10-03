@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::models::{valid_sources, ScrapeMode, Source};
+use super::models::{valid_sources, JsonRowsConfig, ScrapeMode, Source};
 use super::{ProviderTier, ProxyProvider};
 
 /// Scrapes the Stormsia JSON proxy feed.
@@ -23,7 +23,11 @@ impl ProxyProvider for StormsiaProvider {
     fn sources(&self) -> Vec<Source> {
         valid_sources(vec![Source::all(URL).map(|source| {
             source
-                .with_mode(ScrapeMode::StormsiaJson)
+                .with_mode(ScrapeMode::JsonRows(
+                    JsonRowsConfig::new("", "host", "port")
+                        .and_then(|config| config.with_protocol_path("protocol"))
+                        .expect("static Stormsia JSON schema is valid"),
+                ))
                 .with_timeout(Duration::from_secs(20))
         })])
     }
@@ -42,7 +46,7 @@ mod tests {
         assert_eq!(provider.tier(), ProviderTier::Fallback);
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].url.to_string(), URL);
-        assert_eq!(sources[0].mode, ScrapeMode::StormsiaJson);
+        assert!(matches!(sources[0].mode, ScrapeMode::JsonRows(_)));
         assert_eq!(sources[0].timeout, Duration::from_secs(20));
         assert!(sources[0].default_types.len() > 1);
     }

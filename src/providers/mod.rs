@@ -343,14 +343,13 @@ pub trait ProxyProvider {
 
             match mode {
                 ScrapeMode::Plaintext => parsers::visit_plaintext(&body, &mut forward),
-                ScrapeMode::GeonodeJson => parsers::visit_geonode(&body, &mut forward)?,
-                ScrapeMode::ProxyNovaJson => parsers::visit_proxynova(&body, &mut forward)?,
                 ScrapeMode::HtmlTable => parsers::visit_html_table(&body, &mut forward),
                 ScrapeMode::RegexPairs => parsers::visit_regex_pairs(&body, &mut forward),
                 ScrapeMode::Base64Rows => parsers::visit_base64_rows(&body, &mut forward),
                 ScrapeMode::JsonStringArray => parsers::visit_json_strings(&body, &mut forward)?,
-                ScrapeMode::StormsiaJson => parsers::visit_stormsia_json(&body, &mut forward)?,
-                ScrapeMode::GatherProxyJs => parsers::visit_gatherproxy(&body, &mut forward),
+                ScrapeMode::JsonRows(config) => {
+                    parsers::visit_json_rows(&body, &config, &mut forward)?
+                }
             }
             Ok::<(), anyhow::Error>(())
         })
@@ -367,14 +366,11 @@ pub(crate) fn visit(
 ) -> anyhow::Result<()> {
     match mode {
         ScrapeMode::Plaintext => parsers::visit_plaintext(body, on_row),
-        ScrapeMode::GeonodeJson => parsers::visit_geonode(body, on_row)?,
-        ScrapeMode::ProxyNovaJson => parsers::visit_proxynova(body, on_row)?,
         ScrapeMode::HtmlTable => parsers::visit_html_table(body, on_row),
         ScrapeMode::RegexPairs => parsers::visit_regex_pairs(body, on_row),
         ScrapeMode::Base64Rows => parsers::visit_base64_rows(body, on_row),
         ScrapeMode::JsonStringArray => parsers::visit_json_strings(body, on_row)?,
-        ScrapeMode::StormsiaJson => parsers::visit_stormsia_json(body, on_row)?,
-        ScrapeMode::GatherProxyJs => parsers::visit_gatherproxy(body, on_row),
+        ScrapeMode::JsonRows(config) => parsers::visit_json_rows(body, config, on_row)?,
     }
     Ok(())
 }

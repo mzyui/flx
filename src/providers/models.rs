@@ -17,15 +17,140 @@ pub struct ScrapeContext {
     pub mode: ScrapeMode,
 }
 
+/// Dot-separated path to an object key in a JSON row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JsonPath(String);
+
+impl JsonPath {
+    /// Returns the path segments after validating dot syntax.
+    pub fn parse(path: impl Into<String>) -> anyhow::Result<Self> {
+        let path = path.into();
+        if path.is_empty() {
+            return Ok(Self(path));
+        }
+        if path.split('.').any(str::is_empty) {
+            anyhow::bail!("JSON path contains an empty segment: `{path}`");
+        }
+        Ok(Self(path))
+    }
+
+    /// Returns the original dot-separated path.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Protocol attached to every row when the JSON feed carries none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonFixedProtocol {
+    /// Plain HTTP proxy with unknown anonymity.
+    Http,
+    /// HTTPS proxy with unknown anonymity.
+    Https,
+    /// SOCKS4 proxy.
+    Socks4,
+    /// SOCKS5 proxy.
+    Socks5,
+}
+
+impl JsonFixedProtocol {
+    /// Converts the fixed protocol into a [`Protocol`].
+    pub fn as_protocol(self) -> Protocol {
+        match self {
+            Self::Http => Protocol::Http(Anonymity::Unknown),
+            Self::Https => Protocol::Https(Anonymity::Unknown),
+            Self::Socks4 => Protocol::Socks4,
+            Self::Socks5 => Protocol::Socks5,
+        }
+    }
+}
+/// How the IP field of a JSON row is decoded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JsonIpTransform {
+    /// Plain dotted-quad string.
+    #[default]
+    Plain,
+    /// Charcode-array plus base64 tail (e.g. ProxyNova feeds).
+    JsObfuscated,
+}
+
+/// Schema for streaming JSON rows into proxy candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonRowsConfig {
+    /// Path to the rows array; empty means the JSON root is the array.
+    pub rows_path: JsonPath,
+    /// Path to the IPv4 host field within each row.
+    pub ip_path: JsonPath,
+    /// Path to the port field within each row.
+    pub port_path: JsonPath,
+    /// Optional path to one protocol string within each row.
+    pub protocol_path: Option<JsonPath>,
+    /// Optional path to an array of protocol strings within each row.
+    pub protocols_path: Option<JsonPath>,
+    /// How the IP field is decoded.
+    pub ip_transform: JsonIpTransform,
+    /// Protocol attached to rows carrying no protocol field.
+    pub fixed_protocol: Option<JsonFixedProtocol>,
+}
+impl JsonRowsConfig {
+    /// Creates a JSON row schema with no protocol field.
+    pub fn new(
+        rows_path: impl Into<String>,
+        ip_path: impl Into<String>,
+        port_path: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let ip_path = JsonPath::parse(ip_path)?;
+        let port_path = JsonPath::parse(port_path)?;
+        if ip_path.as_str().is_empty() || port_path.as_str().is_empty() {
+            anyhow::bail!("JSON row field paths cannot be empty");
+        }
+        Ok(Self {
+            rows_path: JsonPath::parse(rows_path)?,
+            ip_path,
+            port_path,
+            protocol_path: None,
+            protocols_path: None,
+            ip_transform: JsonIpTransform::default(),
+            fixed_protocol: None,
+        })
+    }
+
+    /// Sets a single protocol field path.
+    pub fn with_protocol_path(mut self, path: impl Into<String>) -> anyhow::Result<Self> {
+        if self.protocols_path.is_some() {
+            anyhow::bail!("JSON schema cannot use protocol and protocols paths together");
+        }
+        self.protocol_path = Some(JsonPath::parse(path)?);
+        Ok(self)
+    }
+
+    /// Sets a protocol array field path.
+    pub fn with_protocols_path(mut self, path: impl Into<String>) -> anyhow::Result<Self> {
+        if self.protocol_path.is_some() {
+            anyhow::bail!("JSON schema cannot use protocol and protocols paths together");
+        }
+        self.protocols_path = Some(JsonPath::parse(path)?);
+        Ok(self)
+    }
+
+    /// Sets how the IP field is decoded.
+    pub fn with_ip_transform(mut self, transform: JsonIpTransform) -> Self {
+        self.ip_transform = transform;
+        self
+    }
+
+    /// Attaches a fixed protocol to rows carrying no protocol field.
+    pub fn with_fixed_protocol(mut self, protocol: JsonFixedProtocol) -> Self {
+        self.fixed_protocol = Some(protocol);
+        self
+    }
+}
+
 /// Parser selected for a provider response body.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScrapeMode {
     /// One `ip:port` candidate per line.
     Plaintext,
-    /// Geonode `{ data: [...] }` JSON payload.
-    GeonodeJson,
-    /// ProxyNova `{ data: [...] }` JSON payload with obfuscated IPs.
-    ProxyNovaJson,
     /// Generic HTML table with IP/port columns.
     HtmlTable,
     /// Free-form `ip:port` pairs found by regex.
@@ -34,10 +159,8 @@ pub enum ScrapeMode {
     Base64Rows,
     /// JSON array of `ip:port` strings.
     JsonStringArray,
-    /// Stormsia JSON array of `{ protocol, host, port }` rows.
-    StormsiaJson,
-    /// GatherProxy `gp.insertPrx({...})` script rows.
-    GatherProxyJs,
+    /// Schema-driven JSON rows with nested object paths.
+    JsonRows(JsonRowsConfig),
 }
 
 /// Scheduling tier ordering provider fetches.
@@ -168,4 +291,55 @@ pub fn valid_sources(sources: Vec<anyhow::Result<Source>>) -> Vec<Source> {
             source.ok()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JsonFixedProtocol, JsonIpTransform, JsonPath, JsonRowsConfig};
+    use crate::proxy::models::{Anonymity, Protocol};
+
+    #[test]
+    fn json_rows_config_accepts_nested_paths_and_protocol_field() {
+        let config = JsonRowsConfig::new("payload.proxies", "endpoint.host", "endpoint.port")
+            .unwrap()
+            .with_protocol_path("kind")
+            .unwrap();
+
+        assert_eq!(config.rows_path.as_str(), "payload.proxies");
+        assert_eq!(config.ip_path.as_str(), "endpoint.host");
+        assert_eq!(config.port_path.as_str(), "endpoint.port");
+        assert_eq!(config.protocol_path.unwrap().as_str(), "kind");
+    }
+
+    #[test]
+    fn json_path_rejects_empty_segments_but_allows_root_path() {
+        assert!(JsonPath::parse("payload..proxies").is_err());
+        assert!(JsonPath::parse("").is_ok());
+    }
+
+    #[test]
+    fn json_rows_config_rejects_empty_fields_and_protocol_conflicts() {
+        assert!(JsonRowsConfig::new("", "", "port").is_err());
+        let config = JsonRowsConfig::new("", "host", "port")
+            .unwrap()
+            .with_protocol_path("protocol")
+            .unwrap();
+        assert!(config.with_protocols_path("protocols").is_err());
+    }
+
+    #[test]
+    fn json_rows_config_decodes_plain_ips_by_default() {
+        let config = JsonRowsConfig::new("data", "ip", "port").unwrap();
+        assert_eq!(config.ip_transform, JsonIpTransform::Plain);
+        assert_eq!(config.fixed_protocol, None);
+        let config = config
+            .with_ip_transform(JsonIpTransform::JsObfuscated)
+            .with_fixed_protocol(JsonFixedProtocol::Http);
+        assert_eq!(config.ip_transform, JsonIpTransform::JsObfuscated);
+        assert_eq!(config.fixed_protocol, Some(JsonFixedProtocol::Http));
+        assert_eq!(
+            config.fixed_protocol.unwrap().as_protocol(),
+            Protocol::Http(Anonymity::Unknown)
+        );
+    }
 }
