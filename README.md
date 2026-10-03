@@ -1,33 +1,50 @@
 # flx
 
-Fast proxy scraper and validator written in Rust. Collects free proxies from 12 primary providers + 2 fallback providers, validates them against online judges (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT), filters by anonymity, country, IP type, and response time, and exports in 9 formats. Ships as a CLI (`flx`) and a Rust library.
+Fast proxy scraper and validator written in Rust. Scrapes free proxies from 14 providers, validates them against online judges (HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT), filters by anonymity, country, and response time, and exports in 9 formats. Ships as a CLI (`flx`) and a Rust library.
 
 ![demo](https://vhs.charm.sh/vhs-3tm46j5tEl6LYWePbsAuOw.gif)
 
+## Quick start
+
+```bash
+cargo install --git https://github.com/mzyui/flx
+flx geo-update   # one-time GeoIP database download (needed for -c/-g)
+flx find -l 20
+```
+
+Or grab prebuilt binaries from the [releases page](https://github.com/mzyui/flx/releases) (Linux, macOS, Windows, Android/Termux).
+
 ## Features
 
-- Scrape from 12 primary providers + 2 fallback providers, or plug in your own plaintext source
+- Scrape from 12 primary + 2 fallback providers, a file, stdin, or your own plaintext URL
 - Validate with end-to-end deadlines over hyper + rustls, with anti-replay judge tokens
-- Filter and sort by protocol, anonymity level, country, IP type (residential / datacenter / mobile), response time, and persistent health score
-- Persistent JSONL health history with reliability, speed, and anonymity scoring
-- GeoIP via GeoLite2 City + ASN, with a one-command database sync
+- Filter by protocol, anonymity, country, IP type, response time, and persistent health score
+- GeoIP via GeoLite2 City + ASN (`flx geo-update` to sync)
 - 9 output formats including JSON, CSV, PAC, and proxychains config
-- Streaming-first pipeline with backpressure, atomic parse cache, and graceful Ctrl+C finalization
-- Interactive TUI to watch a `find` or `grab` run live with `--tui` (behind the `tui` feature, optional)
-- Optional rotating proxy server (`flx serve`, behind the `serve` feature, experimental)
+- Streaming pipeline with backpressure, parse cache, and graceful Ctrl+C finalization
+- Optional interactive TUI (`--tui`, behind the `tui` feature) and rotating proxy server (`flx serve`, behind the `serve` feature, experimental)
 
 ## Installation
+
+Requires a Rust toolchain (edition 2021). TLS is pure-Rust (rustls) — no OpenSSL needed.
 
 ```bash
 cargo install --git https://github.com/mzyui/flx
 ```
 
-Or build from source:
+Build from source:
 
 ```bash
 git clone https://github.com/mzyui/flx
 cd flx
 cargo install --path .
+```
+
+With optional features:
+
+```bash
+cargo install --path . --features tui    # interactive --tui flag
+cargo install --path . --features serve  # experimental flx serve
 ```
 
 ## Usage
@@ -51,52 +68,20 @@ flx find -f proxies.txt
 cat list.txt | flx find -f -
 ```
 
-### Interactive TUI (optional)
-
-> [!NOTE]
-> Requires the `tui` Cargo feature: `cargo build --features tui` or `cargo install --path . --features tui`. The `--tui` flag is hidden without it.
-
-Add `--tui` to a `find` or `grab` run to watch it live instead of streaming to stdout. All flags apply as usual.
-
-```bash
-flx find --tui -l 20
-flx grab --tui -c US,DE
-```
-
-> [!TIP]
-> Press `?` inside the TUI for the full keymap. Move with arrows or `j`/`k`, live-filter with `/` as you type, sort with `s` / `S`, inspect a row with `Enter`, export with `e`, and exit with `Ctrl+C` (press twice to exit after cancelling a live run). Press `Esc` while filtering to restore the previous query.
-
-The TUI uses a minimalist full-width layout: a compact header, a separated status line, a borderless results table, and a contextual footer. At 60–79 columns it hides lower-priority fields; below `60×12` it shows a terminal-size message. Detail is a rich drill-down view opened with `Enter` or `d`, showing endpoint, protocols, location, performance, and recent failure metadata; `Esc` returns without losing the selected row. `e` opens an export-format chooser before asking for the destination path. Mouse scrolling and row selection are optional keyboard-equivalent shortcuts; configuration remains controlled by the normal CLI flags and config file.
-
-> [!NOTE]
-> `--tui` needs an interactive terminal and only works with `find` and `grab`. It uses a dynamic-height inline viewport (12–30 rows based on terminal height), so the shell scrollback remains visible and the TUI does not switch to the alternate screen.
-
-### Serve (beta)
-
-> [!WARNING]
-> Experimental and disabled by default. Build with `cargo build --features serve` to enable it. Release binaries hide `serve` until it stabilizes.
-
-Expose the validated pool as a local rotating endpoint. Every validation flag applies, the pool revalidates in the background and drops dead proxies.
-
-```bash
-cargo build --features serve
-./target/debug/flx serve --port 8080
-flx serve --port 9000 --strategy random --min-ready 10
-```
-
 ### Protocol types
 
-Validate HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT:80, CONNECT:25. Combine with `+`, pin anonymity with `:`, cap per-type with `=n`.
+Validate HTTP, HTTPS, SOCKS4, SOCKS5, CONNECT:80, CONNECT:25.
 
-```bash
-flx find -f proxies.txt HTTP SOCKS5 HTTPS
-flx find HTTP+HTTPS HTTP:Elite
-flx find HTTP=8 HTTPS=2
-```
+| Syntax   | Meaning                                | Example               |
+|----------|----------------------------------------|-----------------------|
+| `TYPE`   | validate this protocol                 | `flx find HTTP SOCKS5` |
+| `A+B`    | AND-group: endpoint must pass both     | `flx find HTTP+HTTPS` |
+| `TYPE:X` | pin anonymity level                    | `flx find HTTP:Elite` |
+| `TYPE=n` | cap results for this type (not in `+`) | `flx find HTTP=8 HTTPS=2` |
 
 ### Output formats
 
-`text`, `json`, `json-lines`, `pretty-json`, `csv`, `prefix`, `pac`, `proxychains`, and the human-readable default.
+`text`, `json`, `json-lines`, `pretty-json`, `csv`, `prefix`, `pac`, `proxychains`, and the human-readable `default`.
 
 ```bash
 flx find -l 5 -f json
@@ -105,6 +90,8 @@ flx find -l 5 -f proxychains > /etc/proxychains.conf
 flx find -l 5 -f pac -o proxy.pac
 ```
 
+When `-f` is `default`: `-o out.json|jsonl|csv|pac` infers the format from the extension, otherwise a TTY gets the human-readable table and a pipe gets `json-lines`.
+
 ### Filters and sorting
 
 ```bash
@@ -112,10 +99,11 @@ flx find -a elite --levels anonymous elite
 flx find --max-response-time 2 --min-response-time 0.1 --exclude-type SOCKS4
 flx find -s response-time --order desc --shuffle
 flx find --min-score 75 --sort score --order desc
-flx find --min-score 75 --health-file ./health.jsonl --format json-lines
 ```
 
-`flx` stores health history by default at `<data-dir>/flx/health/health.jsonl`; use `--health-file` for another path or `--no-health` to disable it. Scores range from 0 to 100:
+### Health scores
+
+`flx` stores probe history by default at `<data-dir>/flx/health/health.jsonl`; use `--health-file` for another path or `--no-health` to disable it. Scores range from 0 to 100:
 
 - Reliability contributes 60% (`successful probes / all probes`).
 - Speed contributes 25% and decreases linearly from 100 at 0 seconds to 0 at 5 seconds.
@@ -125,7 +113,7 @@ A proxy without history has no score and is excluded by `--min-score`. A score d
 
 ### GeoIP
 
-`-c` filters by country, `-g` annotates without filtering. Every lookup also carries ASN data and an IP-type classification.
+`-c` filters by country, `-g` annotates without filtering. Every lookup also carries ASN data and an IP-type classification (residential / datacenter / mobile).
 
 ```bash
 flx geo-update
@@ -134,9 +122,10 @@ flx find -c US,DE --exclude-country RU,CN -l 5
 
 ### Providers and cache
 
+12 primary providers (`proxyscrape`, `openproxylist`, `geonode`, `free-proxy-list`, `freeproxy-world`, `proxylist-org`, `my-proxy`, `proxynova`, `hproxy`, `proxydb`, `hidemy.name`, `spys.one`) plus 2 fallbacks (`github-raw`, `stormsia`) used when primaries come up short.
+
 ```bash
 flx find --list-providers
-flx find -p proxmint,proxio --exclude-provider stormsia
 flx find -p geonode,proxyscrape --exclude-provider github-raw
 flx find --source-url https://example.com/proxies.txt
 flx find --offline --cache-ttl 30 --refresh-cache
@@ -148,6 +137,27 @@ flx find --offline --cache-ttl 30 --refresh-cache
 flx find -m 1000 --timeout 5 --max-attempts 3
 flx find --support-cookies --support-referer --no-verify-tls
 flx find --report-failures failures.jsonl
+```
+
+### Interactive TUI
+
+Requires the `tui` Cargo feature (`cargo build --features tui`). Add `--tui` to a `find` or `grab` run to watch it live; all flags apply as usual. Needs an interactive terminal.
+
+```bash
+flx find --tui -l 20
+flx grab --tui -c US,DE
+```
+
+Press `?` inside the TUI for the full keymap (`/` filter, `s`/`S` sort, `Enter` drill-down, `e` export, `Ctrl+C` exit).
+
+### Serve (experimental)
+
+Disabled by default — build with `--features serve` to enable. Exposes the validated pool as a local rotating endpoint; every validation flag applies, and the pool revalidates in the background while dropping dead proxies.
+
+```bash
+cargo build --features serve
+./target/debug/flx serve --port 8080
+./target/debug/flx serve --port 9000 --strategy random --min-ready 10
 ```
 
 ### Config file
@@ -162,7 +172,22 @@ flx --config ./custom.toml find
 flx --no-config find
 ```
 
-`[output]` juga menerima `min_score`, `sort = "score"`, `health_file`, dan `no_health`.
+Minimal example:
+
+```toml
+[fetch]
+countries = ["US", "DE"]
+
+[output]
+format = "json-lines"
+limit = 50
+
+[validate]
+types = ["HTTP:Elite", "SOCKS5"]
+timeout = 5
+```
+
+`[output]` also accepts `min_score`, `sort = "score"`, `health_file`, and `no_health`. Run `flx config init` for the full commented template.
 
 ## Library usage
 
@@ -186,11 +211,14 @@ A guided walkthrough of every sample lives in [`examples/README.md`](examples/RE
 
 ## Development
 
-Requires a Rust toolchain (edition 2021). TLS is pure-Rust (rustls).
-
 ```bash
 cargo build
 cargo test
+cargo test --all-features
 cargo clippy --all-targets --all-features
 cargo fmt
 ```
+
+## License
+
+flx is licensed under the MIT license. See the [`LICENSE`](LICENSE) file for more information.
