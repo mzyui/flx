@@ -118,6 +118,70 @@ pub struct JsonDoc {
     items: AtomicUsize,
 }
 
+/// File sink that drops a poisoned `tokio::fs::File` instead of panicking.
+///
+/// A write racing runtime shutdown leaves the inner file unusable; the next
+/// write on it would panic inside Tokio. Reopening keeps later passes (such
+/// as the chained JSON fallback) on a fresh handle.
+struct OutputFile {
+    path: std::path::PathBuf,
+    append: bool,
+    writer: tokio::io::BufWriter<tokio::fs::File>,
+}
+
+impl OutputFile {
+    async fn open(path: &std::path::Path, append: bool) -> anyhow::Result<Self> {
+        let mut open = tokio::fs::OpenOptions::new();
+        open.write(true).create(true);
+        if append {
+            open.append(true);
+        } else {
+            open.truncate(true);
+        }
+        let file = open
+            .open(path)
+            .await
+            .with_context(|| format!("failed to open output file {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            append,
+            writer: tokio::io::BufWriter::new(file),
+        })
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> anyhow::Result<()> {
+        if let Err(error) = self.writer.write_all(buf).await {
+            let error = anyhow::Error::new(error).context("failed to write proxy to output file");
+            self.reopen_on_shutdown(&error).await?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) {
+        if let Err(error) = self.writer.flush().await {
+            let error = anyhow::Error::new(error);
+            let _ = self.reopen_on_shutdown(&error).await;
+        }
+    }
+
+    async fn reopen_on_shutdown(&mut self, error: &anyhow::Error) -> anyhow::Result<()> {
+        if let Some(file) = flx::file_util::reopen_after_shutdown(&self.path, error).await? {
+            if self.append {
+                self.writer = tokio::io::BufWriter::new(file);
+            } else {
+                let mut open = tokio::fs::OpenOptions::new();
+                open.write(true).append(true);
+                let file = open.open(&self.path).await.with_context(|| {
+                    format!("failed to reopen output file {}", self.path.display())
+                })?;
+                self.writer = tokio::io::BufWriter::new(file);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl JsonDoc {
     pub fn items(&self) -> usize {
         self.items.load(Ordering::Relaxed)
@@ -254,20 +318,7 @@ where
         .as_ref()
         .is_some_and(|chain| !chain.leave_open);
     let mut output_file = match options.output_file.as_ref() {
-        Some(file_path) => {
-            let mut open = tokio::fs::OpenOptions::new();
-            open.write(true).create(true);
-            if options.append || continuing {
-                open.append(true);
-            } else {
-                open.truncate(true);
-            }
-            let file = open
-                .open(file_path)
-                .await
-                .with_context(|| format!("failed to open output file {}", file_path.display()))?;
-            Some(tokio::io::BufWriter::new(file))
-        }
+        Some(file_path) => Some(OutputFile::open(file_path, options.append || continuing).await?),
         None => None,
     };
     let appending_to_existing = options.append
@@ -377,11 +428,9 @@ where
         }
         if !cancelled {
             let pac = render_pac(&proxies);
-            if let Some(ref mut file) = output_file {
+            if let Some(file) = &mut output_file {
                 if let Err(error) = file.write_all(pac.as_bytes()).await {
-                    return Err(
-                        anyhow::Error::new(error).context("failed to write PAC to output file")
-                    );
+                    return Err(error.context("failed to write PAC to output file"));
                 }
             } else {
                 guard.before_write();
@@ -396,8 +445,8 @@ where
                 guard.after_write();
             }
         }
-        if let Some(file) = output_file.as_mut() {
-            let _ = file.flush().await;
+        if let Some(file) = &mut output_file {
+            file.flush().await;
         }
         if cancelled {
             return Ok(RunOutcome::Cancelled);
@@ -413,11 +462,9 @@ where
 
     if _csv && finalize.emit_csv_header && !appending_to_existing {
         buf.extend_from_slice(b"ip,port,type,response_time,country,ip_type,asn,aso\n");
-        if let Some(ref mut file) = output_file {
+        if let Some(file) = &mut output_file {
             if let Err(error) = file.write_all(&buf).await {
-                write_error = Some(
-                    anyhow::Error::new(error).context("failed to write CSV header to output file"),
-                );
+                write_error = Some(error.context("failed to write CSV header to output file"));
             }
         } else {
             guard.before_write();
@@ -513,12 +560,9 @@ where
                 };
 
                 if emitted {
-                    if let Some(ref mut file) = output_file {
+                    if let Some(file) = &mut output_file {
                         if let Err(error) = file.write_all(&buf).await {
-                            write_error = Some(
-                                anyhow::Error::new(error)
-                                    .context("failed to write proxy to output file"),
-                            );
+                            write_error = Some(error);
                             break;
                         }
                     } else {
@@ -582,8 +626,8 @@ where
         }
         guard.after_write();
     }
-    if let Some(file) = output_file.as_mut() {
-        let _ = file.flush().await;
+    if let Some(file) = &mut output_file {
+        file.flush().await;
     }
     let _ = stdout.flush();
 
@@ -598,7 +642,7 @@ where
 }
 
 async fn finalize_json_output(
-    output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
+    output_file: &mut Option<OutputFile>,
     stdout: &mut std::io::StdoutLock<'static>,
     item_count: usize,
     suppress_empty_json: bool,
@@ -617,14 +661,12 @@ async fn finalize_json_output(
 }
 
 async fn write_output(
-    output_file: &mut Option<tokio::io::BufWriter<tokio::fs::File>>,
+    output_file: &mut Option<OutputFile>,
     stdout: &mut std::io::StdoutLock<'static>,
     content: &str,
 ) -> anyhow::Result<()> {
-    if let Some(ref mut file) = output_file {
-        file.write_all(content.as_bytes())
-            .await
-            .context("failed to write proxy to output file")?;
+    if let Some(file) = output_file {
+        file.write_all(content.as_bytes()).await?;
     } else {
         stdout
             .write_all(content.as_bytes())
@@ -644,20 +686,10 @@ pub async fn close_chained_json(options: &OutputOptions, item_count: usize) -> a
     }
     let closer: &[u8] = if item_count > 0 { b"\n]\n" } else { b"[]\n" };
     let mut stdout = std::io::stdout().lock();
-    if let Some(ref file_path) = options.output_file {
-        let mut file = tokio::io::BufWriter::new(
-            tokio::fs::OpenOptions::new()
-                .write(true)
-                .append(true)
-                .create(true)
-                .open(file_path)
-                .await
-                .with_context(|| format!("failed to open output file {}", file_path.display()))?,
-        );
-        file.write_all(closer)
-            .await
-            .context("failed to write proxy to output file")?;
-        file.flush().await?;
+    if let Some(file_path) = &options.output_file {
+        let mut file = OutputFile::open(file_path, true).await?;
+        file.write_all(closer).await?;
+        file.flush().await;
     } else {
         stdout
             .write_all(closer)

@@ -1228,14 +1228,14 @@ async fn write_failures(
     truncate: bool,
 ) {
     use tokio::io::AsyncWriteExt;
-    let file = tokio::fs::OpenOptions::new()
+    let open = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(truncate)
         .append(!truncate)
         .open(path)
         .await;
-    let mut file = match file {
+    let file = match open {
         Ok(file) => file,
         Err(error) => {
             #[cfg(feature = "log")]
@@ -1244,12 +1244,17 @@ async fn write_failures(
             return;
         }
     };
-    let mut writer = tokio::io::BufWriter::new(&mut file);
+    let mut writer = tokio::io::BufWriter::new(file);
     while let Some(failure) = rx.recv().await {
         let line = serde_json::to_string(&failure).unwrap_or_default();
-        if !line.is_empty() {
-            let _ = writer.write_all(line.as_bytes()).await;
-            let _ = writer.write_all(b"\n").await;
+        if line.is_empty() {
+            continue;
+        }
+        if writer.write_all(line.as_bytes()).await.is_err() {
+            return;
+        }
+        if writer.write_all(b"\n").await.is_err() {
+            return;
         }
     }
     let _ = writer.flush().await;

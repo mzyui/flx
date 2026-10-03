@@ -46,6 +46,7 @@
 pub mod base_dirs;
 pub mod error;
 pub mod fetcher;
+pub mod file_util;
 pub mod filters;
 pub mod geolookup;
 pub mod health;

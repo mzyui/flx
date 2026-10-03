@@ -19,6 +19,10 @@ const DEFAULT_FILE_NAME: &str = "health.jsonl";
 const MAX_RECORD_BYTES: usize = 16 * 1024;
 
 /// Persistent health history for proxy endpoints.
+///
+/// The file handle is reopened on demand: a write racing runtime shutdown
+/// poisons the `tokio::fs::File` it hit, so the poisoned handle is dropped
+/// and replaced instead of reused.
 #[derive(Clone)]
 pub struct HealthStore {
     path: Arc<PathBuf>,
@@ -189,19 +193,31 @@ impl HealthStore {
             anyhow::bail!("health record exceeds {MAX_RECORD_BYTES} bytes");
         }
         body.push(b'\n');
-        {
-            let mut writer = self.writer.lock().await;
-            writer
-                .write_all(&body)
-                .await
-                .context("failed to append health record")?;
-            writer
-                .flush()
-                .await
-                .context("failed to flush health record")?;
+        if let Err(error) = self.append(&body).await {
+            if let Some(replacement) =
+                crate::file_util::reopen_after_shutdown(&self.path, &error).await?
+            {
+                *self.writer.lock().await = replacement;
+                self.append(&body).await?;
+            } else {
+                return Err(error);
+            }
         }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         apply_record(&mut state, &record);
+        Ok(())
+    }
+
+    async fn append(&self, body: &[u8]) -> Result<()> {
+        let mut writer = self.writer.lock().await;
+        writer
+            .write_all(body)
+            .await
+            .context("failed to append health record")?;
+        writer
+            .flush()
+            .await
+            .context("failed to flush health record")?;
         Ok(())
     }
 }

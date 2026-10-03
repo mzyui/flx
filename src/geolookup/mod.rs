@@ -190,9 +190,13 @@ where
                 );
             }
             progress(chunk.len());
-            file.write_all(&chunk)
-                .await
-                .with_context(|| format!("failed to write to {}", temporary_path.display()))?;
+            if let Err(error) = file.write_all(&chunk).await {
+                if crate::file_util::is_background_task_failed(&error) {
+                    return Err(anyhow::Error::new(error)).context("GeoLite2 download aborted");
+                }
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("failed to write to {}", temporary_path.display()));
+            }
         }
 
         file.sync_all()
