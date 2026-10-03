@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["IpType","SyncOutcome"],"fn":["data_dir","download_database","install_download_observer","sync_database"],"mod":["models"],"struct":["DownloadProgress","GeoLookup"]};
