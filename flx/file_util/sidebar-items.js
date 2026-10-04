@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["is_background_task_failed","is_shutdown_cause","open_append","reopen_after_shutdown"]};

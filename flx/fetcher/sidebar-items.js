@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_CACHE_TTL_MINUTES","DEFAULT_CONCURRENCY_LIMIT","DEFAULT_HOST_CONCURRENCY_LIMIT","PRIMARY_PHASE_TIMEOUT"],"enum":["FetchStage"],"struct":["Config","ProxyFetcher"]};
