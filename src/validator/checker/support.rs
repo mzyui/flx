@@ -313,6 +313,9 @@ pub(crate) async fn support_http(
             let mut request = Request::get(&target.url)
                 .header(USER_AGENT, useragent)
                 .header("X-Fluxy-Token", &target.request_token);
+            if let Some(auth) = proxy.auth() {
+                request = request.header(hyper::header::PROXY_AUTHORIZATION, auth.basic_value());
+            }
             request = request.header(hyper::header::COOKIE, "cookie=ok");
             request = request.header(hyper::header::REFERER, "https://google.com/");
             let req = match request.body(Empty::<Bytes>::new()) {
@@ -324,13 +327,15 @@ pub(crate) async fn support_http(
                 }
             };
 
+            let auth = proxy.auth().cloned();
+            let auth_ref = auth.as_ref();
             let response = match if target.url.starts_with("https://") {
                 proxy
-                    .send_request(req, Some(HttpsNegotiator), per_request, insecure)
+                    .send_with_auth(req, Some(HttpsNegotiator), auth_ref, per_request, insecure)
                     .await
             } else {
                 proxy
-                    .send_request(req, Some(HttpNegotiator), per_request, insecure)
+                    .send_with_auth(req, Some(HttpNegotiator), auth_ref, per_request, insecure)
                     .await
             } {
                 Ok(response) => response,
@@ -959,6 +964,64 @@ mod tests {
             .unwrap();
 
         assert!(result.driver.is_some());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_proxy_authorization_reaches_the_proxy() {
+        use crate::proxy::models::ProxyAuth;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let mut received = Vec::new();
+            loop {
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                received.extend_from_slice(&buf[..n]);
+                if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&received).into_owned();
+            assert!(
+                text.contains("proxy-authorization: Basic dXNlcjpwYXNz"),
+                "proxy must forward Basic credentials, got: {text}"
+            );
+            let mut token = String::new();
+            for line in text.split('\n') {
+                let (name, value) = line.split_once(':').unwrap_or(("", ""));
+                if name.trim().eq_ignore_ascii_case("x-fluxy-token") {
+                    token = value.trim().to_owned();
+                    break;
+                }
+            }
+            let body = format!("HTTP_X_FLUXY_TOKEN = {token}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        let pool = JudgePool::from_targets(Vec::from([std::sync::Arc::new(
+            ValidationTarget::online("http://127.0.0.1:9/fluxy-test-token").unwrap(),
+        )]));
+        let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), address.port());
+        proxy.set_auth(Some(ProxyAuth::new("user", "pass")));
+        let params = super::super::super::WorkParams {
+            max_attempts: 1,
+            request_timeout: Duration::from_millis(500),
+            insecure: false,
+            support_cookies: false,
+            support_referer: false,
+            retry_delay: std::time::Duration::ZERO,
+        };
+        let result = support_http(&mut proxy, &pool, &params).await.unwrap();
+        assert!(result.is_some(), "authed HTTP proxy must validate");
         server.await.unwrap();
     }
 }

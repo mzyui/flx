@@ -292,6 +292,83 @@ impl ProxyType {
     }
 }
 
+/// Proxy authentication credentials, when the endpoint requires them.
+///
+/// `password` is the `Basic` secret for HTTP(S) and the RFC 1929 password
+/// for SOCKS5. SOCKS4 has no password field, so only `username` is sent
+/// there as `USERID`.
+#[derive(Clone)]
+pub struct ProxyAuth {
+    /// Login sent to the proxy.
+    pub username: Arc<str>,
+    /// Secret sent to the proxy; empty when unused.
+    pub password: Arc<str>,
+}
+
+impl ProxyAuth {
+    /// Creates credentials from a username and password.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use flx::proxy::models::ProxyAuth;
+    ///
+    /// let auth = ProxyAuth::new("user", "pass");
+    /// assert_eq!(auth.username.as_ref(), "user");
+    /// ```
+    pub fn new(username: impl Into<Arc<str>>, password: impl Into<Arc<str>>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    /// Encodes credentials as an RFC 7617 `Basic` header value.
+    pub fn basic_value(&self) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let mut raw = Vec::with_capacity(
+            self.username
+                .len()
+                .saturating_add(self.password.len())
+                .saturating_add(1),
+        );
+        raw.extend_from_slice(self.username.as_bytes());
+        raw.push(b':');
+        raw.extend_from_slice(self.password.as_bytes());
+        let mut value =
+            String::with_capacity("Basic ".len().saturating_add(raw.len().div_ceil(3) * 4));
+        value.push_str("Basic ");
+        STANDARD.encode_string(raw, &mut value);
+        value
+    }
+
+    /// Splits credentials into RFC 1929 `UNAME`/`PASSWD` byte fields.
+    ///
+    /// Returns `None` when either field is empty or exceeds the 255-byte
+    /// single-octet length limit.
+    pub fn socks5_user_pass(&self) -> Option<(&[u8], &[u8])> {
+        let user = self.username.as_bytes();
+        let pass = self.password.as_bytes();
+        if user.is_empty() || user.len() > u8::MAX as usize {
+            return None;
+        }
+        if pass.is_empty() || pass.len() > u8::MAX as usize {
+            return None;
+        }
+        Some((user, pass))
+    }
+}
+
+impl std::fmt::Debug for ProxyAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyAuth")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Validated proxy endpoint with geo and timing metadata.
 ///
 /// Parse from `ip:port` or scheme-prefixed text; bare lines leave
@@ -319,6 +396,8 @@ pub struct Proxy {
     pub expected_types: Arc<[Protocol]>,
     /// Protocols that passed validation.
     pub proxy_types: Vec<ProxyType>,
+    /// Credentials sent during validation; `None` means anonymous.
+    pub auth: Option<ProxyAuth>,
     pub(crate) health_score: Option<HealthScore>,
     pub(crate) text: Arc<str>,
 }
@@ -368,6 +447,7 @@ impl Proxy {
             runtimes: RuntimeStats::default(),
             expected_types: Arc::from([]),
             proxy_types: Vec::new(),
+            auth: None,
             health_score: None,
             text: Arc::from(text.as_ref()),
         }
@@ -392,6 +472,26 @@ impl Proxy {
         let mut proxy = Self::new(ip, port);
         proxy.expected_types = expected_types;
         proxy
+    }
+
+    /// Attaches authentication credentials to this endpoint.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use flx::{Proxy, proxy::models::ProxyAuth};
+    ///
+    /// let mut proxy: Proxy = "1.2.3.4:8080".parse().unwrap();
+    /// proxy.set_auth(Some(ProxyAuth::new("user", "pass")));
+    /// assert!(proxy.auth().is_some());
+    /// ```
+    pub fn set_auth(&mut self, auth: Option<ProxyAuth>) {
+        self.auth = auth;
+    }
+
+    /// Returns the authentication credentials, when present.
+    pub fn auth(&self) -> Option<&ProxyAuth> {
+        self.auth.as_ref()
     }
 
     /// Report fastest response time, or 0 when unsampled.
@@ -421,6 +521,7 @@ impl Proxy {
             runtimes: self.runtimes,
             expected_types: Arc::from([]),
             proxy_types: Vec::new(),
+            auth: self.auth.clone(),
             health_score: self.health_score,
             text: Arc::clone(&self.text),
         }
@@ -513,7 +614,10 @@ impl Display for Proxy {
 impl FromStr for Proxy {
     type Err = ProxyParseError;
 
-    /// Parse proxy from "1.2.3.4:8080" or scheme-prefixed text.
+    /// Parse proxy from `ip:port`, `scheme://ip:port`, or `scheme://user:pass@ip:port`.
+    ///
+    /// Userinfo uses the last `@` as separator so `@` may appear in the
+    /// password; the username must be non-empty but the password may be.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
 
@@ -529,7 +633,13 @@ impl FromStr for Proxy {
             (None, s)
         };
 
-        let (ip, port) = crate::providers::parsers::parse_pair(rest)
+        let (userinfo, endpoint) = match rest.rsplit_once('@') {
+            Some((userinfo, endpoint)) if !userinfo.is_empty() => (Some(userinfo), endpoint),
+            Some(_) => return Err(ProxyParseError::MissingSeparator(s.to_string())),
+            None => (None, rest),
+        };
+
+        let (ip, port) = crate::providers::parsers::parse_pair(endpoint)
             .ok_or_else(|| ProxyParseError::MissingSeparator(s.to_string()))?;
 
         let expected_types: Arc<[Protocol]> =
@@ -538,13 +648,24 @@ impl FromStr for Proxy {
                 None => Arc::from([]),
             };
 
-        Ok(Proxy::with_expected_types(ip, port, expected_types))
+        let mut proxy = Proxy::with_expected_types(ip, port, expected_types);
+        if let Some(userinfo) = userinfo {
+            let (username, password) = match userinfo.split_once(':') {
+                Some((username, password)) => (username, password),
+                None => (userinfo, ""),
+            };
+            if username.is_empty() {
+                return Err(ProxyParseError::MissingSeparator(s.to_string()));
+            }
+            proxy.set_auth(Some(ProxyAuth::new(username, password)));
+        }
+        Ok(proxy)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Anonymity, Protocol, Proxy, ProxyType};
+    use super::{Anonymity, Protocol, Proxy, ProxyAuth, ProxyType};
     use std::{net::Ipv4Addr, sync::Arc};
 
     #[test]
@@ -575,6 +696,27 @@ mod tests {
         assert!(probe.expected_types.is_empty());
         assert!(std::sync::Arc::ptr_eq(&probe.geo, &proxy.geo));
         assert_eq!(probe.as_text(), proxy.as_text());
+    }
+
+    #[test]
+    fn auth_defaults_to_none_and_probe_keeps_credentials() {
+        let mut proxy = Proxy::new(Ipv4Addr::new(192, 0, 2, 70), 8080);
+        assert!(proxy.auth().is_none());
+        proxy.set_auth(Some(ProxyAuth::new("user", "pass")));
+        let probe = proxy.validation_probe();
+        assert_eq!(probe.auth().unwrap().username.as_ref(), "user");
+        assert!(std::sync::Arc::ptr_eq(
+            &probe.auth().unwrap().username,
+            &proxy.auth().unwrap().username
+        ));
+    }
+
+    #[test]
+    fn auth_debug_redacts_password() {
+        let auth = ProxyAuth::new("user", "s3cret");
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("user"));
+        assert!(!rendered.contains("s3cret"));
     }
 
     #[test]
@@ -795,5 +937,67 @@ mod tests {
     #[test]
     fn from_str_fails_on_invalid_ip() {
         assert!("999.999.999.999:8080".parse::<Proxy>().is_err());
+    }
+
+    #[test]
+    fn from_str_parses_userinfo_with_scheme() {
+        let proxy: Proxy = "http://user:pass@1.2.3.4:8080".parse().unwrap();
+        assert_eq!(proxy.ip, Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(proxy.port, 8080);
+        assert_eq!(
+            proxy.expected_types.as_ref(),
+            &[Protocol::Http(Anonymity::Unknown)]
+        );
+        let auth = proxy.auth().expect("userinfo must be stored");
+        assert_eq!(auth.username.as_ref(), "user");
+        assert_eq!(auth.password.as_ref(), "pass");
+        assert_eq!(proxy.as_text(), "1.2.3.4:8080");
+    }
+
+    #[test]
+    fn from_str_parses_userinfo_without_scheme() {
+        let proxy: Proxy = "user:pass@5.6.7.8:3128".parse().unwrap();
+        assert_eq!(proxy.ip, Ipv4Addr::new(5, 6, 7, 8));
+        assert_eq!(proxy.port, 3128);
+        assert!(proxy.expected_types.is_empty());
+        let auth = proxy.auth().expect("userinfo must be stored");
+        assert_eq!(auth.username.as_ref(), "user");
+        assert_eq!(auth.password.as_ref(), "pass");
+    }
+
+    #[test]
+    fn from_str_keeps_colon_and_at_in_password() {
+        let proxy: Proxy = "socks5://user:p@ss:w0rd@10.0.0.1:1080".parse().unwrap();
+        let auth = proxy.auth().expect("userinfo must be stored");
+        assert_eq!(auth.username.as_ref(), "user");
+        assert_eq!(auth.password.as_ref(), "p@ss:w0rd");
+        assert_eq!(proxy.as_text(), "10.0.0.1:1080");
+    }
+
+    #[test]
+    fn from_str_rejects_empty_username() {
+        assert!(":pass@1.2.3.4:8080".parse::<Proxy>().is_err());
+        assert!("http://@1.2.3.4:8080".parse::<Proxy>().is_err());
+    }
+
+    #[test]
+    fn basic_value_encodes_rfc7617() {
+        let auth = ProxyAuth::new("user", "pass");
+        assert_eq!(auth.basic_value(), "Basic dXNlcjpwYXNz");
+    }
+    #[test]
+    fn socks5_credentials_reject_overlong_fields() {
+        let long = "x".repeat(256);
+        assert!(ProxyAuth::new(long.as_str(), "pass")
+            .socks5_user_pass()
+            .is_none());
+        assert!(ProxyAuth::new("user", long.as_str())
+            .socks5_user_pass()
+            .is_none());
+        assert!(ProxyAuth::new("", "pass").socks5_user_pass().is_none());
+        let auth = ProxyAuth::new("user", "pass");
+        let (user, pass) = auth.socks5_user_pass().unwrap();
+        assert_eq!(user, b"user");
+        assert_eq!(pass, b"pass");
     }
 }

@@ -92,7 +92,7 @@ pub use providers::models::{
     JsonFixedProtocol, JsonPath, JsonRowsConfig, ProviderTier, ScrapeMode, Source,
 };
 pub use providers::ProxyProvider;
-pub use proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
+pub use proxy::models::{Anonymity, Protocol, Proxy, ProxyAuth, ProxyType, RuntimeStats};
 #[cfg(feature = "serve")]
 pub use rotator::{Rotator, RotatorPool, ServeEvent, ServeOptions, Strategy};
 pub use validator::{
@@ -106,9 +106,9 @@ pub mod prelude {
         all_providers, load_proxy_files, sync_database, Anonymity, FetcherConfig, Flx, FlxError,
         GeoData, GeoLookup, HealthScore, HealthStats, HealthStore, IpType, JsonFixedProtocol,
         JsonPath, JsonRowsConfig, JudgeHealthReport, PauseGate, ProbeGate, Protocol, Proxy,
-        ProxyFetcher, ProxyParseError, ProxySource, ProxyStreamExt, ProxyType, ProxyValidator,
-        RuntimeStats, ScrapeMode, SortKey, SortOrder, Source, SyncOutcome, ValidationProgress,
-        ValidationRun, ValidatorConfig,
+        ProxyAuth, ProxyFetcher, ProxyParseError, ProxySource, ProxyStreamExt, ProxyType,
+        ProxyValidator, RuntimeStats, ScrapeMode, SortKey, SortOrder, Source, SyncOutcome,
+        ValidationProgress, ValidationRun, ValidatorConfig,
     };
 }
 

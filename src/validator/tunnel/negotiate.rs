@@ -26,14 +26,21 @@ fn write_request<'a>(buf: &'a mut [u8], args: std::fmt::Arguments<'_>) -> Cow<'a
 pub(super) async fn negotiate_http_connect(
     stream: &mut BufReader<TcpStream>,
     authority: &str,
+    auth: Option<&crate::proxy::models::ProxyAuth>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 1024];
-    let request = write_request(
-        &mut buf,
-        format_args!(
-            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    let request = match auth {
+        Some(auth) => Cow::Owned(format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: {}\r\n\r\n",
+            auth.basic_value()
+        )),
+        None => write_request(
+            &mut buf,
+            format_args!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+            ),
         ),
-    );
+    };
     stream.write_all(request.as_bytes()).await?;
 
     let response = read_http_headers(stream).await?;
@@ -47,22 +54,29 @@ pub(super) async fn negotiate_http_connect(
 pub(super) async fn negotiate_socks4(
     stream: &mut BufReader<TcpStream>,
     target: &JudgeTarget,
+    auth: Option<&crate::proxy::models::ProxyAuth>,
 ) -> anyhow::Result<()> {
     let ip = target.host.parse::<Ipv4Addr>();
-    let mut request = Vec::with_capacity(10 + target.host.len());
+    let user_id: &[u8] = auth.map_or(b"", |auth| auth.username.as_bytes());
+    if user_id.len() > u8::MAX as usize {
+        anyhow::bail!("SOCKS4 USERID exceeds 255 bytes");
+    }
+    let mut request = Vec::with_capacity(10 + user_id.len() + target.host.len());
     request.extend_from_slice(&[4, 1]);
     request.extend_from_slice(&target.port.to_be_bytes());
     match ip {
-        Ok(ip) => request.extend_from_slice(&ip.octets()),
+        Ok(ip) => {
+            request.extend_from_slice(&ip.octets());
+            request.extend_from_slice(user_id);
+            request.push(0);
+        }
         Err(_) => {
             request.extend_from_slice(&Ipv4Addr::new(0, 0, 0, 1).octets());
+            request.extend_from_slice(user_id);
             request.push(0);
             request.extend_from_slice(target.host.as_bytes());
             request.push(0);
         }
-    }
-    if ip.is_ok() {
-        request.push(0);
     }
     stream.write_all(&request).await?;
 
@@ -77,12 +91,39 @@ pub(super) async fn negotiate_socks4(
 pub(super) async fn negotiate_socks5(
     stream: &mut BufReader<TcpStream>,
     target: &JudgeTarget,
+    auth: Option<&crate::proxy::models::ProxyAuth>,
 ) -> anyhow::Result<()> {
-    stream.write_all(&[5, 1, 0]).await?;
+    let credentials = auth
+        .map(|auth| {
+            auth.socks5_user_pass()
+                .context("SOCKS5 username/password must be 1-255 bytes each")
+        })
+        .transpose()?;
+    if credentials.is_some() {
+        stream.write_all(&[5, 2, 0, 2]).await?;
+    } else {
+        stream.write_all(&[5, 1, 0]).await?;
+    }
     let mut method = [0u8; 2];
     stream.read_exact(&mut method).await?;
-    if method != [5, 0] {
-        anyhow::bail!("SOCKS5 proxy did not accept unauthenticated mode");
+    match (method, credentials) {
+        ([5, 0], None) => {}
+        ([5, 2], Some((user, pass))) => {
+            let mut auth_request = Vec::with_capacity(user.len() + pass.len() + 3);
+            auth_request.push(1);
+            auth_request.push(user.len() as u8);
+            auth_request.extend_from_slice(user);
+            auth_request.push(pass.len() as u8);
+            auth_request.extend_from_slice(pass);
+            stream.write_all(&auth_request).await?;
+            let mut auth_response = [0u8; 2];
+            stream.read_exact(&mut auth_response).await?;
+            if auth_response != [1, 0] {
+                anyhow::bail!("SOCKS5 username/password rejected");
+            }
+        }
+        ([_, 0xff], _) => anyhow::bail!("SOCKS5 proxy requires authentication"),
+        (method, _) => anyhow::bail!("SOCKS5 proxy did not accept auth method {method:?}"),
     }
 
     let mut request = Vec::with_capacity(22 + target.host.len());

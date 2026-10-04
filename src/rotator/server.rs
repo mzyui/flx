@@ -427,7 +427,7 @@ async fn open_upstream(
             let handshake_start = Instant::now();
             time::timeout(
                 remaining()?,
-                Socks4Negotiator.negotiate(&mut stream, proxy_host, &uri),
+                Socks4Negotiator.negotiate_with_auth(&mut stream, proxy_host, &uri, proxy.auth()),
             )
             .await
             .with_context(|| format!("SOCKS4 handshake with {proxy_host} timed out"))??;
@@ -442,7 +442,7 @@ async fn open_upstream(
             let handshake_start = Instant::now();
             time::timeout(
                 remaining()?,
-                Socks5Negotiator.negotiate(&mut stream, proxy_host, &uri),
+                Socks5Negotiator.negotiate_with_auth(&mut stream, proxy_host, &uri, proxy.auth()),
             )
             .await
             .with_context(|| format!("SOCKS5 handshake with {proxy_host} timed out"))??;
@@ -457,7 +457,7 @@ async fn open_upstream(
             let handshake_start = Instant::now();
             time::timeout(
                 remaining()?,
-                HttpsNegotiator.negotiate(&mut stream, proxy_host, &uri),
+                HttpsNegotiator.negotiate_with_auth(&mut stream, proxy_host, &uri, proxy.auth()),
             )
             .await
             .with_context(|| format!("CONNECT handshake with {proxy_host} timed out"))??;
@@ -472,7 +472,14 @@ async fn open_upstream(
         }
         _ if request.tunnel => {
             let handshake_start = Instant::now();
-            let code = connect_http(&mut stream, &request.host, request.port, remaining()?).await?;
+            let code = connect_http(
+                &mut stream,
+                &request.host,
+                request.port,
+                proxy.auth(),
+                remaining()?,
+            )
+            .await?;
             trace(
                 options,
                 id,
@@ -508,6 +515,7 @@ async fn connect_http(
     stream: &mut TcpStream,
     host: &str,
     port: u16,
+    auth: Option<&crate::proxy::models::ProxyAuth>,
     budget: std::time::Duration,
 ) -> anyhow::Result<u16> {
     let authority = if host.contains(':') {
@@ -515,9 +523,15 @@ async fn connect_http(
     } else {
         format!("{host}:{port}")
     };
-    let request = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
-    );
+    let request = match auth {
+        Some(auth) => format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: {}\r\n\r\n",
+            auth.basic_value()
+        ),
+        None => format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+        ),
+    };
     let handshake = async {
         stream.write_all(request.as_bytes()).await?;
         let mut response = Vec::with_capacity(128);
@@ -704,6 +718,7 @@ mod tests {
             &mut stream,
             "127.0.0.1",
             443,
+            None,
             std::time::Duration::from_secs(5),
         )
         .await

@@ -56,12 +56,31 @@ impl NegotiatorTrait for Socks5Negotiator {
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
-        _proxy_host: &str,
+        proxy_host: &str,
         uri: &hyper::Uri,
     ) -> anyhow::Result<()> {
-        let handshake_packet = [5, 1, 0];
+        self.negotiate_with_auth(stream, proxy_host, uri, None)
+            .await
+    }
 
-        stream.write_all(&handshake_packet).await?;
+    async fn negotiate_with_auth(
+        &self,
+        stream: &mut TcpStream,
+        _proxy_host: &str,
+        uri: &hyper::Uri,
+        auth: Option<&crate::proxy::models::ProxyAuth>,
+    ) -> anyhow::Result<()> {
+        let credentials = auth
+            .map(|auth| {
+                auth.socks5_user_pass()
+                    .context("SOCKS5 username/password must be 1-255 bytes each")
+            })
+            .transpose()?;
+        if credentials.is_some() {
+            stream.write_all(&[5, 2, 0, 2]).await?;
+        } else {
+            stream.write_all(&[5, 1, 0]).await?;
+        }
 
         let mut response_buf = [0; 2];
         stream.read_exact(&mut response_buf).await?;
@@ -69,11 +88,24 @@ impl NegotiatorTrait for Socks5Negotiator {
         if response_buf[0] != 0x05 {
             anyhow::bail!("InvalidData: invalid response version");
         }
-        if response_buf[1] == 0xff {
-            anyhow::bail!("PermissionDenied: authentication is required");
-        }
-        if response_buf[1] != 0x00 {
-            anyhow::bail!("InvalidData: invalid response data");
+        match (response_buf[1], credentials) {
+            (0x00, None) => {}
+            (0x02, Some((user, pass))) => {
+                let mut auth_request = Vec::with_capacity(user.len() + pass.len() + 3);
+                auth_request.push(1);
+                auth_request.push(user.len() as u8);
+                auth_request.extend_from_slice(user);
+                auth_request.push(pass.len() as u8);
+                auth_request.extend_from_slice(pass);
+                stream.write_all(&auth_request).await?;
+                let mut auth_response = [0u8; 2];
+                stream.read_exact(&mut auth_response).await?;
+                if auth_response != [1, 0] {
+                    anyhow::bail!("PermissionDenied: SOCKS5 username/password rejected");
+                }
+            }
+            (0xff, _) => anyhow::bail!("PermissionDenied: authentication is required"),
+            (method, _) => anyhow::bail!("InvalidData: unsupported SOCKS5 method {method:#04x}"),
         }
         let host = uri.host().context("SOCKS5 target URI has no host")?;
         let port = uri

@@ -228,10 +228,10 @@ async fn probe_once(
     time::timeout_at(deadline, async {
         match protocol {
             Protocol::Https(_) | Protocol::Connect(_) => {
-                negotiate_http_connect(&mut stream, authority).await
+                negotiate_http_connect(&mut stream, authority, proxy.auth()).await
             }
-            Protocol::Socks4 => negotiate_socks4(&mut stream, target).await,
-            Protocol::Socks5 => negotiate_socks5(&mut stream, target).await,
+            Protocol::Socks4 => negotiate_socks4(&mut stream, target, proxy.auth()).await,
+            Protocol::Socks5 => negotiate_socks5(&mut stream, target, proxy.auth()).await,
             Protocol::Http(_) => anyhow::bail!("HTTP must be validated by support_http"),
         }
     })
@@ -701,5 +701,210 @@ mod tests {
         assert!(!probe_with_echo(false, true, true, false).await);
         assert!(!probe_with_echo(true, false, false, true).await);
         assert!(!probe_with_echo(false, false, true, true).await);
+    }
+
+    #[tokio::test]
+    async fn connect_sends_proxy_authorization_when_authed() {
+        use crate::proxy::models::ProxyAuth;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await.unwrap();
+            assert!(
+                request
+                    .windows(b"Proxy-Authorization: Basic dXNlcjpwYXNz".len())
+                    .any(|w| w == b"Proxy-Authorization: Basic dXNlcjpwYXNz"),
+                "CONNECT must carry Basic credentials"
+            );
+            serve_successful_protocol_after_connect(stream).await;
+        });
+
+        async fn serve_successful_protocol_after_connect(mut stream: TcpStream) {
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let request = read_headers(&mut stream).await.unwrap();
+            assert!(request.starts_with(b"GET /fluxy-test-token HTTP/1.1"));
+            let body = b"/fluxy-test-token";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+        }
+
+        let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), address.port());
+        proxy.set_auth(Some(ProxyAuth::new("user", "pass")));
+        let target = JudgeTarget::from_validation_target(&ValidationTarget {
+            url: JUDGE_URL.to_owned(),
+            response_marker: "fluxy-test-token".to_owned(),
+            request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = time::timeout(
+            Duration::from_secs(1),
+            probe_once(
+                &mut proxy,
+                &Protocol::Connect(9),
+                &target,
+                time::Instant::now() + Duration::from_secs(1),
+                &test_params(Duration::from_secs(1)),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "authed CONNECT must pass: {result:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_rfc1929_exchange_passes_with_credentials() {
+        use crate::proxy::models::ProxyAuth;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 4];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 2, 0, 2], "must offer user/pass method");
+            stream.write_all(&[5, 2]).await.unwrap();
+            let mut auth_head = [0u8; 2];
+            stream.read_exact(&mut auth_head).await.unwrap();
+            assert_eq!(auth_head[0], 1);
+            let mut user = vec![0u8; usize::from(auth_head[1])];
+            stream.read_exact(&mut user).await.unwrap();
+            let mut pass_len = [0u8; 1];
+            stream.read_exact(&mut pass_len).await.unwrap();
+            let mut pass = vec![0u8; usize::from(pass_len[0])];
+            stream.read_exact(&mut pass).await.unwrap();
+            assert_eq!(user, b"user");
+            assert_eq!(pass, b"pass");
+            stream.write_all(&[1, 0]).await.unwrap();
+            let mut request = [0u8; 10];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 1]);
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 9])
+                .await
+                .unwrap();
+            let request = read_headers(&mut stream).await.unwrap();
+            assert!(request.starts_with(b"GET /fluxy-test-token HTTP/1.1"));
+            let body = b"/fluxy-test-token";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), address.port());
+        proxy.set_auth(Some(ProxyAuth::new("user", "pass")));
+        let target = JudgeTarget::from_validation_target(&ValidationTarget {
+            url: JUDGE_URL.to_owned(),
+            response_marker: "fluxy-test-token".to_owned(),
+            request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = time::timeout(
+            Duration::from_secs(1),
+            probe_once(
+                &mut proxy,
+                &Protocol::Socks5,
+                &target,
+                time::Instant::now() + Duration::from_secs(1),
+                &test_params(Duration::from_secs(1)),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "authed SOCKS5 must pass: {result:?}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks4_sends_username_as_userid() {
+        use crate::proxy::models::ProxyAuth;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 8];
+            stream.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head[..2], &[4, 1]);
+            let mut user_id = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).await.unwrap();
+                if byte[0] == 0 {
+                    break;
+                }
+                user_id.push(byte[0]);
+            }
+            assert_eq!(user_id, b"alice", "SOCKS4 must send username as USERID");
+            stream
+                .write_all(&[0, 90, 0, 9, 127, 0, 0, 1])
+                .await
+                .unwrap();
+            let request = read_headers(&mut stream).await.unwrap();
+            assert!(request.starts_with(b"GET /fluxy-test-token HTTP/1.1"));
+            let body = b"/fluxy-test-token";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+
+        let mut proxy = Proxy::new("127.0.0.1".parse().unwrap(), address.port());
+        proxy.set_auth(Some(ProxyAuth::new("alice", "ignored")));
+        let target = JudgeTarget::from_validation_target(&ValidationTarget {
+            url: JUDGE_URL.to_owned(),
+            response_marker: "fluxy-test-token".to_owned(),
+            request_token: "fluxy-test-token".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = time::timeout(
+            Duration::from_secs(1),
+            probe_once(
+                &mut proxy,
+                &Protocol::Socks4,
+                &target,
+                time::Instant::now() + Duration::from_secs(1),
+                &test_params(Duration::from_secs(1)),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "authed SOCKS4 must pass: {result:?}"
+        );
+        server.await.unwrap();
     }
 }

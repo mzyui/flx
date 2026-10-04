@@ -212,6 +212,9 @@ fn classify_failure(error: &anyhow::Error, protocol: Protocol) -> String {
         || text.contains("rejected request")
         || text.contains("did not accept")
         || text.contains("did not forward")
+        || text.contains("rejected")
+        || text.contains("authentication")
+        || text.contains("proxy-authorization")
     {
         "rejected".to_owned()
     } else {

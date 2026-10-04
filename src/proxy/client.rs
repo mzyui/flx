@@ -284,6 +284,34 @@ pub trait ProxyClient {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
         N: NegotiatorTrait + Sync + Send,
     {
+        self.send_with_auth(req, negotiator, None, timeout, insecure)
+            .await
+    }
+
+    /// Connects with proxy credentials, runs the handshake, then sends the request.
+    ///
+    /// `auth` selects the per-protocol exchange: `Basic` on `CONNECT` for
+    /// HTTPS, RFC 1929 username/password for SOCKS5, `USERID` for SOCKS4.
+    /// Plain HTTP proxies receive the credentials as a `Proxy-Authorization`
+    /// header, which the caller sets on `req` via [`Proxy::proxy_auth_header`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when connecting, negotiating, or sending times out or fails.
+    async fn send_with_auth<B, N>(
+        &mut self,
+        req: Request<B>,
+        negotiator: Option<N>,
+        auth: Option<&crate::proxy::models::ProxyAuth>,
+        timeout: Duration,
+        insecure: bool,
+    ) -> anyhow::Result<ProxyRuntimes<Response<Incoming>>>
+    where
+        B: Body + 'static + Debug + Send,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        N: NegotiatorTrait + Sync + Send,
+    {
         let deadline = time::Instant::now() + timeout;
 
         let remaining = deadline
@@ -301,7 +329,7 @@ pub trait ProxyClient {
                 .with_context(|| format!("proxy negotiation with {} timed out", proxy_host))?;
             time::timeout(
                 remaining,
-                negotiator.negotiate(&mut stream, &proxy_host, req.uri()),
+                negotiator.negotiate_with_auth(&mut stream, &proxy_host, req.uri(), auth),
             )
             .await
             .with_context(|| format!("proxy negotiation with {} timed out", proxy_host))?

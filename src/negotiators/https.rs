@@ -23,13 +23,23 @@ impl HttpsNegotiator {
         crate::write_to_buffer(buf, args)
     }
 
-    fn write_connect_request<'a>(buf: &'a mut [u8], authority: &str) -> Cow<'a, str> {
-        crate::write_to_buffer(
-            buf,
-            format_args!(
-                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
+    fn write_connect_request<'a>(
+        buf: &'a mut [u8],
+        authority: &str,
+        auth: Option<&crate::proxy::models::ProxyAuth>,
+    ) -> Cow<'a, str> {
+        match auth {
+            Some(auth) => Cow::Owned(format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\nProxy-Authorization: {}\r\n\r\n",
+                auth.basic_value()
+            )),
+            None => crate::write_to_buffer(
+                buf,
+                format_args!(
+                    "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
+                ),
             ),
-        )
+        }
     }
 }
 
@@ -41,13 +51,23 @@ impl NegotiatorTrait for HttpsNegotiator {
         proxy_host: &str,
         uri: &Uri,
     ) -> anyhow::Result<()> {
+        self.negotiate_with_auth(stream, proxy_host, uri, None)
+            .await
+    }
+
+    async fn negotiate_with_auth(
+        &self,
+        stream: &mut TcpStream,
+        proxy_host: &str,
+        uri: &Uri,
+        auth: Option<&crate::proxy::models::ProxyAuth>,
+    ) -> anyhow::Result<()> {
         if let Some(host) = uri.host() {
             let port = uri.port_u16().unwrap_or(443);
             let mut authority_buf = [0u8; 256];
             let authority = Self::write_authority(&mut authority_buf, host, port);
             let mut request_buf = [0u8; 1024];
-            let connect_request = Self::write_connect_request(&mut request_buf, &authority);
-
+            let connect_request = Self::write_connect_request(&mut request_buf, &authority, auth);
             if !uri.scheme().is_some_and(|s| s.as_str() == "https") {
                 anyhow::bail!("Scheme is empty or not https");
             }

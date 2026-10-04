@@ -15,17 +15,18 @@ use super::NegotiatorTrait;
 pub struct Socks4Negotiator;
 
 impl Socks4Negotiator {
-    fn build_connect_request<'a>(buf: &'a mut [u8], host: &str, port: u16) -> Cow<'a, [u8]> {
-        let total = 10 + host.len();
+    fn build_connect_request<'a>(
+        buf: &'a mut [u8],
+        host: &str,
+        port: u16,
+        user_id: &[u8],
+    ) -> Cow<'a, [u8]> {
+        let total = 10 + user_id.len() + host.len();
         if total > buf.len() {
-            let mut packet = Vec::with_capacity(total);
-            packet.extend_from_slice(&[4u8, 1u8]);
-            packet.extend_from_slice(&port.to_be_bytes());
-            packet.extend_from_slice(&[0, 0, 0, 1]);
-            packet.push(0u8);
-            packet.extend_from_slice(host.as_bytes());
-            packet.push(0u8);
-            return Cow::Owned(packet);
+            return Cow::Owned(Self::owned_request(host, port, user_id));
+        }
+        if host.parse::<std::net::Ipv4Addr>().is_ok() && 9 + user_id.len() > buf.len() {
+            return Cow::Owned(Self::owned_request(host, port, user_id));
         }
 
         let mut len = 0usize;
@@ -37,12 +38,16 @@ impl Socks4Negotiator {
             Ok(ip) => {
                 buf[len..len + 4].copy_from_slice(&ip.octets());
                 len += 4;
+                buf[len..len + user_id.len()].copy_from_slice(user_id);
+                len += user_id.len();
                 buf[len] = 0u8;
                 len += 1;
             }
             Err(_) => {
                 buf[len..len + 4].copy_from_slice(&[0, 0, 0, 1]);
                 len += 4;
+                buf[len..len + user_id.len()].copy_from_slice(user_id);
+                len += user_id.len();
                 buf[len] = 0u8;
                 len += 1;
                 buf[len..len + host.len()].copy_from_slice(host.as_bytes());
@@ -53,6 +58,27 @@ impl Socks4Negotiator {
         }
         Cow::Borrowed(&buf[..len])
     }
+
+    fn owned_request(host: &str, port: u16, user_id: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(10 + user_id.len() + host.len());
+        packet.extend_from_slice(&[4u8, 1u8]);
+        packet.extend_from_slice(&port.to_be_bytes());
+        match host.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => {
+                packet.extend_from_slice(&ip.octets());
+                packet.extend_from_slice(user_id);
+                packet.push(0u8);
+            }
+            Err(_) => {
+                packet.extend_from_slice(&[0, 0, 0, 1]);
+                packet.extend_from_slice(user_id);
+                packet.push(0u8);
+                packet.extend_from_slice(host.as_bytes());
+                packet.push(0u8);
+            }
+        }
+        packet
+    }
 }
 
 #[async_trait]
@@ -60,8 +86,19 @@ impl NegotiatorTrait for Socks4Negotiator {
     async fn negotiate(
         &self,
         stream: &mut TcpStream,
+        proxy_host: &str,
+        uri: &Uri,
+    ) -> anyhow::Result<()> {
+        self.negotiate_with_auth(stream, proxy_host, uri, None)
+            .await
+    }
+
+    async fn negotiate_with_auth(
+        &self,
+        stream: &mut TcpStream,
         _proxy_host: &str,
         uri: &Uri,
+        auth: Option<&crate::proxy::models::ProxyAuth>,
     ) -> anyhow::Result<()> {
         let host = uri.host().context("SOCKS4 target URI has no host")?;
         let port = uri
@@ -73,8 +110,12 @@ impl NegotiatorTrait for Socks4Negotiator {
             })
             .context("SOCKS4 target URI has no port")?;
 
+        let user_id: &[u8] = auth.map_or(b"", |auth| auth.username.as_bytes());
+        if user_id.len() > u8::MAX as usize {
+            anyhow::bail!("SOCKS4 USERID exceeds 255 bytes");
+        }
         let mut packet_buf = [0u8; 512];
-        let packet = Self::build_connect_request(&mut packet_buf, host, port);
+        let packet = Self::build_connect_request(&mut packet_buf, host, port, user_id);
 
         stream.write_all(&packet).await?;
 
