@@ -24,14 +24,27 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_REF: ${{ env.RELEASE_REF }}
         run: |
           TAG="${RELEASE_REF#refs/tags/}"
-          cat > /tmp/release-notes.md <<'EOF'
-          Fast proxy scraper & validator.
+          PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          if [ -n "$PREV" ]; then RANGE="$PREV..$TAG"; else RANGE="$TAG"; fi
+          if git-cliff "$RANGE" --tag "$TAG" --config cliff.toml > /tmp/changelog.md 2>/tmp/cliff-err.log; then
+            cp /tmp/changelog.md /tmp/release-notes.md
+          else
+            cat /tmp/cliff-err.log || true
+            printf 'Fast proxy scraper & validator.\n\n' > /tmp/release-notes.md
+          fi
+          cat >> /tmp/release-notes.md <<'EOF'
 
           ## Assets
           | File | Platform |
