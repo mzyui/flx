@@ -7,6 +7,7 @@ use std::{
     borrow::Cow,
     collections::{HashSet, VecDeque},
     io::Write,
+    net::Ipv4Addr,
     sync::Arc,
     time::Duration,
 };
@@ -92,8 +93,8 @@ pub fn all_providers() -> Vec<std::sync::Arc<dyn ProxyProvider + Send + Sync>> {
         std::sync::Arc::new(ProxyDbProvider),
         std::sync::Arc::new(HideMyNameProvider),
         std::sync::Arc::new(SpysOneProvider),
-        std::sync::Arc::new(GithubRepoProvider),
         std::sync::Arc::new(StormsiaProvider),
+        std::sync::Arc::new(GithubRepoProvider),
     ]
 }
 
@@ -159,6 +160,14 @@ pub trait ProxyProvider {
 
     /// Source URLs scraped for this provider with their modes and timeouts.
     fn sources(&self) -> Vec<Source>;
+
+    /// Row-IP decoder used for this provider's JSON sources.
+    ///
+    /// Returned as a plain `fn` so row parsing stays `'static` inside
+    /// `spawn_blocking`; parses plain dotted-quads by default.
+    fn ip_decoder(&self) -> fn(&str) -> Option<Ipv4Addr> {
+        parsers::decode_plain_ip
+    }
 
     /// Downloads `url` as UTF-8 text, following redirects within `timeout`.
     ///
@@ -326,6 +335,7 @@ pub trait ProxyProvider {
     ) -> anyhow::Result<()> {
         let default_types = ctx.default_types;
         let mode = ctx.mode;
+        let decode_ip = self.ip_decoder();
         tokio::task::spawn_blocking(move || {
             let mut receiver_closed = false;
             let mut forward = |(ip, port, protocol): parsers::ParsedProxy| {
@@ -348,7 +358,7 @@ pub trait ProxyProvider {
                 ScrapeMode::Base64Rows => parsers::visit_base64_rows(&body, &mut forward),
                 ScrapeMode::JsonStringArray => parsers::visit_json_strings(&body, &mut forward)?,
                 ScrapeMode::JsonRows(config) => {
-                    parsers::visit_json_rows(&body, &config, &mut forward)?
+                    parsers::visit_json_rows_with(&body, &config, decode_ip, &mut forward)?
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -362,6 +372,7 @@ pub trait ProxyProvider {
 pub(crate) fn visit(
     mode: &ScrapeMode,
     body: &str,
+    decode_ip: fn(&str) -> Option<Ipv4Addr>,
     on_row: &mut dyn FnMut(parsers::ParsedProxy) -> bool,
 ) -> anyhow::Result<()> {
     match mode {
@@ -370,7 +381,9 @@ pub(crate) fn visit(
         ScrapeMode::RegexPairs => parsers::visit_regex_pairs(body, on_row),
         ScrapeMode::Base64Rows => parsers::visit_base64_rows(body, on_row),
         ScrapeMode::JsonStringArray => parsers::visit_json_strings(body, on_row)?,
-        ScrapeMode::JsonRows(config) => parsers::visit_json_rows(body, config, on_row)?,
+        ScrapeMode::JsonRows(config) => {
+            parsers::visit_json_rows_with(body, config, decode_ip, on_row)?
+        }
     }
     Ok(())
 }
@@ -909,6 +922,7 @@ mod tests {
         super::visit(
             &super::ScrapeMode::Plaintext,
             "1.2.3.4:8080\n5.6.7.8:3128\n",
+            super::parsers::decode_plain_ip,
             &mut |row| {
                 seen.push(row);
                 true
@@ -925,6 +939,7 @@ mod tests {
         super::visit(
             &super::ScrapeMode::Plaintext,
             "1.2.3.4:8080\n5.6.7.8:3128\n",
+            super::parsers::decode_plain_ip,
             &mut |_| {
                 seen += 1;
                 false

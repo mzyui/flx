@@ -89,7 +89,7 @@ pub use geolookup::{
 pub use health::{HealthScore, HealthStats, HealthStore};
 pub use providers::all_providers;
 pub use providers::models::{
-    JsonFixedProtocol, JsonIpTransform, JsonPath, JsonRowsConfig, ProviderTier, ScrapeMode, Source,
+    JsonFixedProtocol, JsonPath, JsonRowsConfig, ProviderTier, ScrapeMode, Source,
 };
 pub use providers::ProxyProvider;
 pub use proxy::models::{Anonymity, Protocol, Proxy, ProxyType, RuntimeStats};
@@ -105,10 +105,10 @@ pub mod prelude {
     pub use crate::{
         all_providers, load_proxy_files, sync_database, Anonymity, FetcherConfig, Flx, FlxError,
         GeoData, GeoLookup, HealthScore, HealthStats, HealthStore, IpType, JsonFixedProtocol,
-        JsonIpTransform, JsonPath, JsonRowsConfig, JudgeHealthReport, PauseGate, ProbeGate,
-        Protocol, Proxy, ProxyFetcher, ProxyParseError, ProxySource, ProxyStreamExt, ProxyType,
-        ProxyValidator, RuntimeStats, ScrapeMode, SortKey, SortOrder, Source, SyncOutcome,
-        ValidationProgress, ValidationRun, ValidatorConfig,
+        JsonPath, JsonRowsConfig, JudgeHealthReport, PauseGate, ProbeGate, Protocol, Proxy,
+        ProxyFetcher, ProxyParseError, ProxySource, ProxyStreamExt, ProxyType, ProxyValidator,
+        RuntimeStats, ScrapeMode, SortKey, SortOrder, Source, SyncOutcome, ValidationProgress,
+        ValidationRun, ValidatorConfig,
     };
 }
 

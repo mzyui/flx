@@ -64,15 +64,6 @@ impl JsonFixedProtocol {
         }
     }
 }
-/// How the IP field of a JSON row is decoded.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum JsonIpTransform {
-    /// Plain dotted-quad string.
-    #[default]
-    Plain,
-    /// Charcode-array plus base64 tail (e.g. ProxyNova feeds).
-    JsObfuscated,
-}
 
 /// Schema for streaming JSON rows into proxy candidates.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,8 +78,6 @@ pub struct JsonRowsConfig {
     pub protocol_path: Option<JsonPath>,
     /// Optional path to an array of protocol strings within each row.
     pub protocols_path: Option<JsonPath>,
-    /// How the IP field is decoded.
-    pub ip_transform: JsonIpTransform,
     /// Protocol attached to rows carrying no protocol field.
     pub fixed_protocol: Option<JsonFixedProtocol>,
 }
@@ -110,7 +99,6 @@ impl JsonRowsConfig {
             port_path,
             protocol_path: None,
             protocols_path: None,
-            ip_transform: JsonIpTransform::default(),
             fixed_protocol: None,
         })
     }
@@ -131,12 +119,6 @@ impl JsonRowsConfig {
         }
         self.protocols_path = Some(JsonPath::parse(path)?);
         Ok(self)
-    }
-
-    /// Sets how the IP field is decoded.
-    pub fn with_ip_transform(mut self, transform: JsonIpTransform) -> Self {
-        self.ip_transform = transform;
-        self
     }
 
     /// Attaches a fixed protocol to rows carrying no protocol field.
@@ -295,7 +277,7 @@ pub fn valid_sources(sources: Vec<anyhow::Result<Source>>) -> Vec<Source> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonFixedProtocol, JsonIpTransform, JsonPath, JsonRowsConfig};
+    use super::{JsonFixedProtocol, JsonPath, JsonRowsConfig};
     use crate::proxy::models::{Anonymity, Protocol};
 
     #[test]
@@ -328,14 +310,10 @@ mod tests {
     }
 
     #[test]
-    fn json_rows_config_decodes_plain_ips_by_default() {
+    fn json_rows_config_has_no_fixed_protocol_by_default() {
         let config = JsonRowsConfig::new("data", "ip", "port").unwrap();
-        assert_eq!(config.ip_transform, JsonIpTransform::Plain);
         assert_eq!(config.fixed_protocol, None);
-        let config = config
-            .with_ip_transform(JsonIpTransform::JsObfuscated)
-            .with_fixed_protocol(JsonFixedProtocol::Http);
-        assert_eq!(config.ip_transform, JsonIpTransform::JsObfuscated);
+        let config = config.with_fixed_protocol(JsonFixedProtocol::Http);
         assert_eq!(config.fixed_protocol, Some(JsonFixedProtocol::Http));
         assert_eq!(
             config.fixed_protocol.unwrap().as_protocol(),

@@ -233,6 +233,7 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
     }
     let url = source.url.to_string();
     let expected_types = Arc::clone(&source.default_types);
+    let decode_ip = provider.ip_decoder();
 
     let cached = match ctx.settings.fetch_cache.as_ref() {
         Some(fetch_cache) => fetch_cache.load_rows(&url).await,
@@ -311,7 +312,7 @@ pub(crate) async fn do_work(job: FetchJob, ctx: PhaseContext) -> anyhow::Result<
                     closed = tx.blocking_send(proxy).is_err();
                     !closed
                 };
-                visit(&mode, body.as_ref(), &mut forward)?;
+                visit(&mode, body.as_ref(), decode_ip, &mut forward)?;
                 Ok::<_, anyhow::Error>((rows, !closed))
             })
             .await

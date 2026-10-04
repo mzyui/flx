@@ -9,77 +9,25 @@ use serde::{
 };
 
 use crate::{
-    providers::models::{JsonIpTransform, JsonRowsConfig},
+    providers::models::JsonRowsConfig,
     proxy::models::{Anonymity, Protocol},
 };
+
+/// Decodes a plain dotted-quad IP field.
+pub fn decode_plain_ip(raw: &str) -> Option<Ipv4Addr> {
+    raw.trim().parse().ok()
+}
 
 /// One parsed proxy row: address, port, and optional advertised protocol.
 pub type ParsedProxy = (Ipv4Addr, u16, Option<Protocol>);
 const VISITOR_STOPPED: &str = "flx parser visitor stopped";
-const OBFUSCATED_IP_BUFFER_LEN: usize = 64;
 const BASE64_ROW_BUFFER_LEN: usize = 256;
-
-static RE_JS_CHARCODE_OFFSET: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"code\s*-\s*(\d+)").unwrap());
-
-static RE_JS_ATOB_HALF: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"atob\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)"#).unwrap());
 
 static RE_IP_PORT_PAIR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\b").unwrap());
 
 static RE_PROXY_CALL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Proxy\('([A-Za-z0-9+/=]+)'\)").unwrap());
-
-fn decode_js_ip(raw: &str) -> Option<Ipv4Addr> {
-    let raw = raw.trim();
-    if let Ok(ip) = raw.parse::<Ipv4Addr>() {
-        return Some(ip);
-    }
-
-    let mut buffer = [0u8; OBFUSCATED_IP_BUFFER_LEN];
-    let mut len = 0usize;
-
-    if let Some(start) = raw.find('[') {
-        if let Some(end) = raw[start..].find(']').map(|i| start + i) {
-            let offset: i64 = RE_JS_CHARCODE_OFFSET
-                .captures(raw)
-                .and_then(|caps| caps.get(1)?.as_str().parse().ok())
-                .unwrap_or(0);
-
-            for token in raw[start + 1..end].split(',') {
-                let Ok(code) = token.trim().parse::<i64>() else {
-                    continue;
-                };
-                let Some(value) = code.checked_sub(offset).and_then(|v| u32::try_from(v).ok())
-                else {
-                    continue;
-                };
-                let Some(ch) = char::from_u32(value) else {
-                    continue;
-                };
-                if buffer.len() - len < 4 {
-                    return None;
-                }
-                len += ch.encode_utf8(&mut buffer[len..]).len();
-            }
-        }
-    }
-
-    if let Some(caps) = RE_JS_ATOB_HALF.captures(raw) {
-        if let Some(text) = caps.get(1) {
-            if let Ok(written) = BASE64.decode_slice(text.as_str(), &mut buffer[len..]) {
-                len += written;
-            }
-        }
-    }
-
-    std::str::from_utf8(&buffer[..len])
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
 
 static TABLE_SELECTOR: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("table").expect("static table selector is valid"));
@@ -387,11 +335,14 @@ struct CompiledJsonRows {
     port_path: Vec<String>,
     protocol_path: Option<Vec<String>>,
     protocols_path: Option<Vec<String>>,
-    ip_transform: JsonIpTransform,
+    decode_ip: fn(&str) -> Option<Ipv4Addr>,
     fixed_protocol: Option<Protocol>,
 }
 
-fn compile_json_rows(config: &JsonRowsConfig) -> anyhow::Result<CompiledJsonRows> {
+fn compile_json_rows(
+    config: &JsonRowsConfig,
+    decode_ip: fn(&str) -> Option<Ipv4Addr>,
+) -> anyhow::Result<CompiledJsonRows> {
     let split = |path: &crate::providers::models::JsonPath| {
         path.as_str()
             .split('.')
@@ -411,7 +362,7 @@ fn compile_json_rows(config: &JsonRowsConfig) -> anyhow::Result<CompiledJsonRows
         port_path,
         protocol_path: config.protocol_path.as_ref().map(split),
         protocols_path: config.protocols_path.as_ref().map(split),
-        ip_transform: config.ip_transform,
+        decode_ip,
         fixed_protocol: config.fixed_protocol.map(|protocol| protocol.as_protocol()),
     })
 }
@@ -436,13 +387,10 @@ fn visit_json_row(
     schema: &CompiledJsonRows,
     visit: &mut dyn FnMut(ParsedProxy) -> bool,
 ) -> bool {
-    let transform = schema.ip_transform;
+    let decode_ip = schema.decode_ip;
     let Some(ip) = json_path(row, &schema.ip_path)
         .and_then(serde_json::Value::as_str)
-        .and_then(|ip| match transform {
-            JsonIpTransform::Plain => ip.trim().parse::<Ipv4Addr>().ok(),
-            JsonIpTransform::JsObfuscated => decode_js_ip(ip),
-        })
+        .and_then(decode_ip)
     else {
         return true;
     };
@@ -598,9 +546,19 @@ where
 pub fn visit_json_rows(
     body: &str,
     config: &JsonRowsConfig,
+    visit: impl FnMut(ParsedProxy) -> bool,
+) -> anyhow::Result<()> {
+    visit_json_rows_with(body, config, decode_plain_ip, visit)
+}
+
+/// Visits JSON rows with a provider-supplied IP decoder.
+pub fn visit_json_rows_with(
+    body: &str,
+    config: &JsonRowsConfig,
+    decode_ip: fn(&str) -> Option<Ipv4Addr>,
     mut visit: impl FnMut(ParsedProxy) -> bool,
 ) -> anyhow::Result<()> {
-    let schema = compile_json_rows(config)?;
+    let schema = compile_json_rows(config, decode_ip)?;
     let stopped = Cell::new(false);
     let mut deserializer = serde_json::Deserializer::from_str(body);
     let result = visit_json_rows_path(
@@ -839,14 +797,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let obfuscated = JsonRowsConfig::new("data", "ip", "port")
-            .map(|config| config.with_ip_transform(JsonIpTransform::JsObfuscated))
-            .unwrap();
-        assert!(
-            parse_json_rows(r#"{"data":[{"ip":"1.2.3.4","port":0}]}"#, &obfuscated)
-                .unwrap()
-                .is_empty()
-        );
         assert!(parse_regex_pairs("1.2.3.4:0").is_empty());
         assert!(parse_json_strings(r#"["1.2.3.4:0"]"#).unwrap().is_empty());
         let body = r#"<table><tr><th>IP</th><th>Port</th></tr>
@@ -878,11 +828,6 @@ mod tests {
                 ("13.14.15.16".into(), 80),
             ]
         );
-    }
-
-    #[test]
-    fn js_obfuscated_ip_ignores_char_codes_that_overflow_the_offset() {
-        assert!(decode_js_ip("[-9223372036854775808].map(code => fromCharCode(code-1))").is_none());
     }
 
     #[test]
@@ -931,74 +876,16 @@ mod tests {
     }
 
     #[test]
-    fn json_rows_decodes_js_obfuscated_ip_halves() {
-        let body = r#"{"data":[{"ip":"[51,49,51,47,50,52,56,47,57,47].map((code) => String.fromCharCode(code-1)).join(\"\").concat(atob(\"MTQ4\"))","port":8080}]}"#;
-        let config = JsonRowsConfig::new("data", "ip", "port")
-            .map(|config| config.with_ip_transform(JsonIpTransform::JsObfuscated))
-            .unwrap();
-        let parsed = parse_json_rows(body, &config).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].0.to_string(), "202.137.8.148");
-        assert_eq!(parsed[0].1, 8080);
-        assert_eq!(parsed[0].2, None);
-    }
-
-    #[test]
     fn json_rows_attaches_fixed_protocol_to_untyped_rows() {
         let body = r#"{"data":[{"ip":"1.2.3.4","port":3128}]}"#;
         let config = JsonRowsConfig::new("data", "ip", "port")
             .map(|config| {
-                config
-                    .with_ip_transform(JsonIpTransform::JsObfuscated)
-                    .with_fixed_protocol(crate::providers::models::JsonFixedProtocol::Http)
+                config.with_fixed_protocol(crate::providers::models::JsonFixedProtocol::Http)
             })
             .unwrap();
         let parsed = parse_json_rows(body, &config).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].2, Some(Protocol::Http(Anonymity::Unknown)));
-    }
-
-    #[test]
-    fn js_obfuscated_ip_passes_through_plain_ip() {
-        let body = r#"{"data":[{"ip":"1.2.3.4","port":"3128"}]}"#;
-        let config = JsonRowsConfig::new("data", "ip", "port")
-            .map(|config| config.with_ip_transform(JsonIpTransform::JsObfuscated))
-            .unwrap();
-        let parsed = parse_json_rows(body, &config).unwrap();
-        assert_eq!(parsed[0].0.to_string(), "1.2.3.4");
-        assert_eq!(parsed[0].1, 3128);
-    }
-
-    #[test]
-    fn js_obfuscated_ip_skips_rows_with_null_or_missing_ports() {
-        let body = r#"{"data":[
-            {"ip":"1.2.3.4","port":null},
-            {"ip":"5.6.7.8"},
-            {"ip":"9.10.11.12","port":true},
-            {"ip":"13.14.15.16","port":8080}
-        ]}"#;
-        let config = JsonRowsConfig::new("data", "ip", "port")
-            .map(|config| config.with_ip_transform(JsonIpTransform::JsObfuscated))
-            .unwrap();
-        let parsed = parse_json_rows(body, &config).unwrap();
-        assert_eq!(
-            parsed
-                .iter()
-                .map(|(ip, port, _)| (ip.to_string(), *port))
-                .collect::<Vec<_>>(),
-            vec![("13.14.15.16".to_string(), 8080)]
-        );
-    }
-
-    #[test]
-    fn js_obfuscated_ip_skips_rows_with_missing_ip() {
-        let body = r#"{"data":[{"port":8080},{"ip":"1.2.3.4","port":3128}]}"#;
-        let config = JsonRowsConfig::new("data", "ip", "port")
-            .map(|config| config.with_ip_transform(JsonIpTransform::JsObfuscated))
-            .unwrap();
-        let parsed = parse_json_rows(body, &config).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].0.to_string(), "1.2.3.4");
     }
 
     #[test]
